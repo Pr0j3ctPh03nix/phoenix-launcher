@@ -1,5 +1,5 @@
 /* ================================================================
-   Project Phoenix Updater — minimal
+   Phoenix Launcher — minimal
    Near-black ground, one quiet column, hairline structure.
    Meaning in color only: gold = action, verdigris = settled,
    terracotta = error. Inter for text, JetBrains Mono for data.
@@ -192,7 +192,7 @@ body {
 
 .link {
   background: none; border: none; cursor: pointer; padding: 0.25rem 0.125rem;
-  font-family: "Inter", sans-serif; font-size: 0.78125rem; font-weight: 500; color: var(--text-mute);
+  font-family: "Inter", sans-serif; font-size: 0.84375rem; font-weight: 500; color: var(--text-mute);
   transition: color 0.15s;
 }
 .link:hover { color: var(--terra); }
@@ -244,9 +244,12 @@ input::placeholder { color: #4d4941; }
 /* ---- what's new ---- */
 .whatsnew-version {
   font-family: "Mono", monospace; font-size: 0.75rem; color: var(--gold-soft);
-  padding-top: 1.625rem; padding-bottom: 0.25rem;
+  padding-bottom: 0.25rem;
 }
-.notes-area { flex: 1; min-height: 0; overflow-y: auto; padding-top: 0.5rem; padding-right: 0.875rem; }
+/* every version after the first gets a separator */
+.notes + .whatsnew-version { margin-top: 1.625rem; padding-top: 1.25rem; border-top: 1px solid var(--line); }
+.notes-loading { margin-top: 1.375rem; }
+.notes-area { flex: 1; min-height: 0; overflow-y: auto; padding-top: 1.625rem; padding-right: 0.875rem; }
 .notes { -webkit-user-select: text; user-select: text; cursor: text; }
 .notes h4 {
   font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase;
@@ -283,8 +286,9 @@ input::placeholder { color: #4d4941; }
 /* ---- segmented control ---- */
 .seg { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: 0.4375rem; overflow: hidden; width: max-content; }
 .seg-btn {
-  height: 2.25rem; padding: 0 1.125rem; background: transparent; border: none; cursor: pointer;
-  font-family: "Inter", sans-serif; font-size: 0.78125rem; font-weight: 600; color: var(--text-dim);
+  /* matches .btn height (minus the .seg frame's own border) and font */
+  height: calc(2.75rem - 2px); padding: 0 1.375rem; background: transparent; border: none; cursor: pointer;
+  font-family: "Inter", sans-serif; font-size: 0.84375rem; font-weight: 600; color: var(--text-dim);
   transition: background 0.15s, color 0.15s;
 }
 .seg-btn + .seg-btn { border-left: 1px solid var(--line); }
@@ -401,13 +405,31 @@ input::placeholder { color: #4d4941; }
 .switch.on::after { left: calc(100% - 1rem); background: var(--gold); }
 
 /* ---- autoexec editor ---- */
-.editor {
-  flex: 1; min-height: 0; margin-top: 1.25rem; resize: none;
+/* the wrap owns the frame; textarea (transparent text, visible caret) sits exactly over the
+   highlighted pre — identical font/padding/whitespace so the glyphs line up 1:1 */
+.editor-wrap {
+  position: relative; flex: 1; min-height: 0; margin-top: 1.25rem;
   background: var(--bg-2); border: 1px solid var(--line); border-radius: 0.4375rem;
-  color: var(--text); font-family: "Mono", monospace; font-size: 0.78125rem; line-height: 1.55;
-  padding: 0.875rem 1rem; -webkit-user-select: text; user-select: text; cursor: text;
+  overflow: hidden; transition: border-color 0.15s;
 }
-.editor:focus { outline: none; border-color: rgba(201, 168, 106, 0.5); }
+.editor-wrap:focus-within { border-color: rgba(201, 168, 106, 0.5); }
+.editor, .editor-hl {
+  position: absolute; inset: 0; margin: 0; padding: 0.875rem 1rem; overflow: auto;
+  font-family: "Mono", monospace; font-size: 0.78125rem; line-height: 1.55;
+  white-space: pre; word-break: normal; overflow-wrap: normal; tab-size: 4;
+}
+.editor {
+  resize: none; background: transparent; border: none;
+  color: transparent; caret-color: var(--text);
+  -webkit-user-select: text; user-select: text; cursor: text;
+}
+.editor:focus { outline: none; }
+.editor::selection { background: rgba(201, 168, 106, 0.22); }
+.editor-hl { pointer-events: none; color: #c2bcb1; scrollbar-width: none; }
+.editor-hl::-webkit-scrollbar { display: none; }
+.hl-cmd { color: var(--gold-soft); }
+.hl-str { color: var(--verd); }
+.hl-com { color: var(--text-mute); font-style: italic; }
 #ae-msg { margin-top: 0.875rem; }
 .dirty { display: inline-flex; align-items: center; gap: 0.4375rem; font-size: 0.6875rem; font-weight: 600; color: var(--gold-soft); }
 .dirty.hidden { display: none; }

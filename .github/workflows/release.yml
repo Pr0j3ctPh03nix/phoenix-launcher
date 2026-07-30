@@ -32,6 +32,10 @@ jobs:
 
       - name: Build (tauri bundle)
         run: bun run tauri build
+        env:
+          # read-only token for the private staging dist repo, baked into the binary at build
+          # time (config.rs). Absent secret -> no token baked, private repos need a user token.
+          PHOENIX_BAKED_TOKEN: ${{ secrets.PHOENIX_BAKED_TOKEN }}
 
       - name: Upload build artifacts (manual runs)
         if: github.event_name == 'workflow_dispatch'

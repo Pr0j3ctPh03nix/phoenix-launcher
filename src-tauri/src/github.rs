@@ -52,6 +52,20 @@ fn api_url(repo: &str, tag: Option<&str>) -> String {
     }
 }
 
+/// List releases, newest first (GitHub's order). One page, up to 100 — plenty for this project.
+pub fn fetch_releases(repo: &str, token: Option<&str>) -> Result<Vec<Release>> {
+    let mut req = agent(5)
+        .get(&format!("https://api.github.com/repos/{repo}/releases?per_page=100"))
+        .set("User-Agent", UA)
+        .set("Accept", "application/vnd.github+json")
+        .set("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(t) = token {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    let resp = req.call().map_err(net_err)?;
+    resp.into_json().context("parsing the releases JSON")
+}
+
 /// Fetch a release by tag (or the latest). `token` is only required for private repos.
 pub fn fetch_release(repo: &str, tag: Option<&str>, token: Option<&str>) -> Result<Release> {
     let mut req = agent(5)

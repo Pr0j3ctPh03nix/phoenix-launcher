@@ -40,6 +40,9 @@ struct CachedManifest {
 #[derive(Default)]
 struct AppState {
     manifest_cache: Mutex<Option<CachedManifest>>,
+    /// The "What's new" history per source repo: (repo, entries newest first). Invalidated when a
+    /// check sees a tag the cached history doesn't start with, or the repo changes.
+    notes_cache: Mutex<Option<(String, Vec<engine::NotesEntry>)>>,
     autofind_cancel: Arc<AtomicBool>,
     autofind_running: AtomicBool,
 }
@@ -99,6 +102,14 @@ struct CheckView {
     primary_action: String, // "check" | "apply"
     can_play: bool,
     can_uninstall: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NotesEntryView {
+    tag: String,
+    version: String,
+    notes: String,
 }
 
 #[derive(Serialize)]
@@ -292,6 +303,17 @@ async fn check(state: tauri::State<'_, Arc<AppState>>) -> Result<CheckView, Stri
             tag_name: release.tag_name.clone(),
             manifest: manifest.clone(),
         });
+        // drop a stale notes history (new release since it was fetched, or another repo)
+        {
+            let mut guard = st.notes_cache.lock().unwrap();
+            let fresh = guard.as_ref().is_some_and(|(repo, entries)| {
+                *repo == settings.source_repo
+                    && entries.first().is_some_and(|e| e.tag == release.tag_name)
+            });
+            if !fresh {
+                *guard = None;
+            }
+        }
         let r = engine::evaluate(&settings, &release.tag_name, &manifest)
             .map_err(|e| format!("{e:#}"))?;
         Ok(build_check_view(r))
@@ -317,6 +339,42 @@ async fn replan(state: tauri::State<'_, Arc<AppState>>) -> Result<CheckView, Str
         };
         let r = engine::evaluate(&settings, &tag_name, &manifest).map_err(|e| format!("{e:#}"))?;
         Ok(build_check_view(r))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// The full "What's new" history (every release's notes, newest first). Cached per repo — the
+/// first call walks each release's manifest.json; later opens are instant.
+#[tauri::command]
+async fn release_notes(
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<Vec<NotesEntryView>, String> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let settings = Settings::load();
+        let to_views = |entries: &[engine::NotesEntry]| {
+            entries
+                .iter()
+                .map(|e| NotesEntryView {
+                    tag: e.tag.clone(),
+                    version: e.version.clone(),
+                    notes: e.notes.clone(),
+                })
+                .collect::<Vec<_>>()
+        };
+        {
+            let guard = st.notes_cache.lock().unwrap();
+            if let Some((repo, entries)) = guard.as_ref() {
+                if *repo == settings.source_repo {
+                    return Ok(to_views(entries));
+                }
+            }
+        }
+        let entries = engine::fetch_notes_history(&settings).map_err(|e| format!("{e:#}"))?;
+        let views = to_views(&entries);
+        *st.notes_cache.lock().unwrap() = Some((settings.source_repo, entries));
+        Ok(views)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -471,6 +529,7 @@ fn run_gui() {
             game_dir_status,
             check,
             replan,
+            release_notes,
             apply,
             uninstall,
             play,

@@ -65,6 +65,33 @@ pub fn fetch(settings: &Settings, tag: Option<&str>) -> Result<(github::Release,
     Ok((release, manifest))
 }
 
+/// One release's "What's new" entry, for the version-history view.
+#[derive(Debug, Clone)]
+pub struct NotesEntry {
+    pub tag: String,
+    pub version: String,
+    pub notes: String,
+}
+
+/// The full "What's new" history: every release's manifest notes, newest first (GitHub's release
+/// order). Releases without a manifest.json, with an unparsable manifest, or with empty notes are
+/// skipped — a single bad release must not sink the whole history.
+pub fn fetch_notes_history(settings: &Settings) -> Result<Vec<NotesEntry>> {
+    let token = settings.token.as_deref();
+    let releases =
+        github::fetch_releases(&settings.source_repo, token).context("listing releases")?;
+    let mut out = Vec::new();
+    for rel in &releases {
+        let Some(asset) = rel.asset("manifest.json") else { continue };
+        let Ok(bytes) = github::download_asset(asset, token) else { continue };
+        let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) else { continue };
+        if let Some(notes) = m.notes.filter(|n| !n.trim().is_empty()) {
+            out.push(NotesEntry { tag: rel.tag_name.clone(), version: m.version, notes });
+        }
+    }
+    Ok(out)
+}
+
 /// The effective selection for one option: the user's value if it is valid for this manifest,
 /// else the manifest default.
 fn effective_selection(

@@ -9,7 +9,7 @@ framework-agnostic; Tauri is only the shell.
 
 ## Where it fits
 
-This repo (`Pr0j3ctPh03nix/auto-updater`, public) is the **updater app** only. It does **not** contain
+This repo (`Pr0j3ctPh03nix/phoenix-launcher`, public) is the **updater app** only. It does **not** contain
 the shim. What it installs lives in a separate **dist repo** whose CI builds `winmm.dll` and publishes
 a Release described by a `manifest.json`:
 

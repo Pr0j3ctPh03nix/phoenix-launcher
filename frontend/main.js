@@ -506,6 +506,32 @@ function setAeDirty(d) {
   $("ae-dirty").classList.toggle("hidden", !d);
 }
 
+// Source cfg highlight: `<command> <value…>` per line, `//` comments, "quoted" values.
+function hlAutoexec(text) {
+  const lines = text.split(/\r?\n/).map((line) => {
+    const ci = line.indexOf("//");
+    const code = ci >= 0 ? line.slice(0, ci) : line;
+    const com = ci >= 0 ? `<span class="hl-com">${escHtml(line.slice(ci))}</span>` : "";
+    const m = code.match(/^(\s*)(\S*)([\s\S]*)$/);
+    let html = m[1];
+    if (m[2]) html += `<span class="hl-cmd">${escHtml(m[2])}</span>`;
+    // the value part: quoted runs colored, the rest plain
+    m[3].replace(/("[^"]*"?)|([^"]+)/g, (_, str, plain) => {
+      html += str ? `<span class="hl-str">${escHtml(str)}</span>` : escHtml(plain);
+    });
+    return html + com;
+  });
+  return lines.join("\n") + "\n"; // trailing newline keeps pre/textarea heights in step
+}
+
+function refreshAeHl() {
+  const ta = $("ae-text");
+  const hl = $("ae-hl");
+  hl.innerHTML = hlAutoexec(ta.value);
+  hl.scrollTop = ta.scrollTop;
+  hl.scrollLeft = ta.scrollLeft;
+}
+
 async function openAutoexec() {
   try {
     $("ae-text").value = await invoke("read_autoexec");
@@ -513,6 +539,7 @@ async function openAutoexec() {
     $("ae-text").value = "";
     setAeMsg(String(e));
   }
+  refreshAeHl();
   setAeDirty(false);
   setAeMsg(null);
   showView("autoexec");
@@ -529,14 +556,47 @@ async function saveAutoexec() {
 }
 
 // ---- what's new ----
-function openWhatsNew() {
+// One version section: mono version line + rendered notes.
+function notesSection(version, notes) {
+  const frag = document.createDocumentFragment();
+  const h = document.createElement("div");
+  h.className = "whatsnew-version";
+  h.textContent = version;
+  const n = document.createElement("div");
+  n.className = "notes";
+  n.innerHTML = renderNotes(notes);
+  frag.append(h, n);
+  return frag;
+}
+
+let wnSeq = 0; // drops a stale history fetch when the view was reopened meanwhile
+
+async function openWhatsNew() {
   const v = state.lastCheck;
   if (!v?.notes) return;
-  $("whatsnew-version").textContent = v.version;
+  const seq = ++wnSeq;
   const body = $("notes-body");
-  body.innerHTML = renderNotes(v.notes);
+  // instant first paint: the current release's notes, history swaps in when it arrives
+  body.innerHTML = "";
+  body.append(notesSection(v.version, v.notes));
+  const loading = document.createElement("div");
+  loading.className = "hint notes-loading";
+  loading.textContent = t("wn.loading");
+  body.append(loading);
   body.parentElement.scrollTop = 0;
   showView("whatsnew");
+  try {
+    const all = await invoke("release_notes"); // cached backend-side after the first fetch
+    if (seq !== wnSeq) return;
+    if (all.length) {
+      body.innerHTML = "";
+      for (const e of all) body.append(notesSection(e.version, e.notes));
+    } else {
+      loading.remove(); // no history found — keep the current release's notes
+    }
+  } catch (e) {
+    if (seq === wnSeq) loading.remove(); // offline etc. — current release's notes stay up
+  }
 }
 
 // ---- wire ----
@@ -580,7 +640,13 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-$("ae-text").addEventListener("input", () => setAeDirty(true));
+$("ae-text").addEventListener("input", () => { setAeDirty(true); refreshAeHl(); });
+$("ae-text").addEventListener("scroll", () => {
+  const ta = $("ae-text");
+  const hl = $("ae-hl");
+  hl.scrollTop = ta.scrollTop;
+  hl.scrollLeft = ta.scrollLeft;
+});
 
 // changelog links open in the default browser (webview must not navigate away)
 $("notes-body").addEventListener("click", (e) => {

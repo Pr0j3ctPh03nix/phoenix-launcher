@@ -187,7 +187,12 @@
           <span class="dirty hidden" id="ae-dirty"><span class="dirty-dot"></span><span data-i18n="ae.unsaved"></span></span>
         </header>
 
-        <textarea id="ae-text" class="editor" spellcheck="false"></textarea>
+        <!-- highlight overlay: the pre carries the colored copy, the textarea's own text is
+             transparent (caret stays visible); scroll is synced from JS -->
+        <div class="editor-wrap">
+          <pre id="ae-hl" class="editor-hl" aria-hidden="true"></pre>
+          <textarea id="ae-text" class="editor" spellcheck="false" wrap="off"></textarea>
+        </div>
 
         <div class="msg" id="ae-msg" hidden></div>
 
@@ -206,10 +211,8 @@
           <span class="brand"><span class="brand-dot"></span><span data-i18n="head.whatsnew"></span></span>
         </header>
 
-        <div class="whatsnew-version" id="whatsnew-version"></div>
-
         <div class="notes-area">
-          <div class="notes" id="notes-body"></div>
+          <div id="notes-body"></div>
         </div>
 
         <footer class="actions">

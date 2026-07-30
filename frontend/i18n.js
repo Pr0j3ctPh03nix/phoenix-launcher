@@ -85,6 +85,7 @@ const I18N = {
 
     "opt.hint": "Changes apply on the next install or update.",
     "ae.unsaved": "unsaved changes",
+    "wn.loading": "Loading earlier versions…",
   },
   ru: {
     "status.notChecked": "Не проверено",
@@ -168,6 +169,7 @@ const I18N = {
 
     "opt.hint": "Изменения применятся при следующей установке или обновлении.",
     "ae.unsaved": "есть несохранённые изменения",
+    "wn.loading": "Загружаю предыдущие версии…",
   },
 };
 
