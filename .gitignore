@@ -1,0 +1,14 @@
+# Rust / Tauri build output
+/src-tauri/target/
+/src-tauri/gen/
+
+# Node
+/node_modules/
+
+# Generated decoy game folder for local testing (see dev/make_decoy.sh)
+/dev/decoy_game/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
