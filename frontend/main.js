@@ -2,6 +2,10 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const $ = (id) => document.getElementById(id);
 
+// Internal knob: the Advanced settings block (source repo / access token). Off = not rendered at
+// all; the baked-in defaults apply. Flip to true for maintainer builds.
+const SHOW_ADVANCED = false;
+
 const state = {
   busy: false,
   lastCheck: null,     // last CheckView
@@ -279,6 +283,7 @@ async function openSettings() {
   updateTokenPlaceholder();
   setSeg($("seg-renderer"), state.renderer);
   setSeg($("seg-lang"), LANG);
+  $("advanced").classList.toggle("hidden", !SHOW_ADVANCED);
   $("advanced").open = false;
   setSettingsMsg(null);
   showView("settings");

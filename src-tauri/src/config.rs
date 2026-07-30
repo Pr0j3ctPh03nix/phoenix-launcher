@@ -5,9 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Baked default source repo — the public distribution. Settings override it (e.g. to a private
-/// staging repo, which also needs `token`).
-pub const DEFAULT_REPO: &str = "Pr0j3ctPh03nix/client-dist";
+/// Baked default source repo. Settings override it (Advanced is hidden behind SHOW_ADVANCED in
+/// the frontend, so for now this is effectively fixed).
+pub const DEFAULT_REPO: &str = "Pr0j3ctPh03nix/client-dist-staging";
+
+/// Read-only token for the private staging repo, injected at BUILD time:
+///     PHOENIX_BAKED_TOKEN=github_pat_... bun run tauri build
+/// Deliberately not a source literal — a committed github_pat_ gets blocked/revoked by GitHub
+/// secret scanning on push. A user-saved token still wins over this.
+const BAKED_TOKEN: Option<&str> = option_env!("PHOENIX_BAKED_TOKEN");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
@@ -63,6 +69,14 @@ impl Settings {
     }
 
     pub fn load() -> Self {
+        let mut s = Self::load_raw();
+        if s.token.is_none() {
+            s.token = BAKED_TOKEN.map(String::from);
+        }
+        s
+    }
+
+    fn load_raw() -> Self {
         let Some(p) = Self::config_path() else { return Self::default() };
         let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
         match serde_json::from_str(&text) {
