@@ -58,7 +58,7 @@ impl Default for Settings {
 
 impl Settings {
     pub fn config_path() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "ProjectPhoenix", "PhoenixUpdater")
+        directories::ProjectDirs::from("", "ProjectPhoenix", "PhoenixLauncher")
             .map(|d| d.config_dir().join("settings.json"))
     }
 

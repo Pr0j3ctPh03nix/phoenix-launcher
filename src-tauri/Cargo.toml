@@ -1,8 +1,8 @@
 [package]
-name = "phoenix-updater"
+name = "phoenix-launcher"
 version = "0.1.0"
 edition = "2021"
-description = "Project Phoenix Dota 2 client auto-updater"
+description = "Project Phoenix Dota 2 client launcher and updater"
 license = "GPL-3.0-only"
 
 [build-dependencies]

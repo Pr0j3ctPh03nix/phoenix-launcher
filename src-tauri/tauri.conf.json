@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Project Phoenix Updater",
+  "productName": "Phoenix Launcher",
   "version": "0.1.0",
-  "identifier": "com.projectphoenix.updater",
+  "identifier": "com.projectphoenix.launcher",
   "build": {
     "frontendDist": "../frontend"
   },
@@ -11,7 +11,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Project Phoenix Updater",
+        "title": "Phoenix Launcher",
         "width": 750,
         "height": 700,
         "minWidth": 560,

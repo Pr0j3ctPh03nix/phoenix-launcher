@@ -1,4 +1,4 @@
-# Project Phoenix Updater
+# Project Phoenix Launcher
 
 A Windows desktop app that keeps a **Dota 2 6.88 (build 1805)** install patched with the Project
 Phoenix client shim. It downloads the latest release from a GitHub "dist" repo, verifies it, and

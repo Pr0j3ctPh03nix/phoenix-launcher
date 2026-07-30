@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
-const UA: &str = concat!("phoenix-updater/", env!("CARGO_PKG_VERSION"));
+const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per socket read/write op — detects stalls without capping total transfer time of large assets.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);

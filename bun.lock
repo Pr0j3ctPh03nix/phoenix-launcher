@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "phoenix-updater",
+      "name": "phoenix-launcher",
       "devDependencies": {
         "@tauri-apps/cli": "^2",
       },
