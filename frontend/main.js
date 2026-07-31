@@ -586,7 +586,7 @@ async function openWhatsNew() {
   body.parentElement.scrollTop = 0;
   showView("whatsnew");
   try {
-    const all = await invoke("release_notes"); // cached backend-side after the first fetch
+    const all = await invoke("release_notes"); // cached backend-side (memory + disk), instant after first fetch
     if (seq !== wnSeq) return;
     if (all.length) {
       body.innerHTML = "";

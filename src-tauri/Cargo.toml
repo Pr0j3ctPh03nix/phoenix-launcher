@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-launcher"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Project Phoenix Dota 2 client launcher and updater"
 license = "GPL-3.0-only"
@@ -22,6 +22,14 @@ winreg = "0.52"
 
 [profile.release]
 opt-level = "s"
-lto = true
-codegen-units = 1
+# thin LTO + parallel codegen: near-identical exe size, but the final LTO/link step goes from a
+# serial re-optimization of every crate to a parallel one — the dominant cost of a release build
+# (locally and in CI, where fat LTO defeated most of the rust-cache benefit).
+lto = "thin"
+codegen-units = 16
 strip = true
+
+# Faster dev builds: full debug info (the default) spends serious time writing huge PDBs;
+# line tables keep usable backtraces/panic locations.
+[profile.dev]
+debug = "line-tables-only"

@@ -40,9 +40,9 @@ struct CachedManifest {
 #[derive(Default)]
 struct AppState {
     manifest_cache: Mutex<Option<CachedManifest>>,
-    /// The "What's new" history per source repo: (repo, entries newest first). Invalidated when a
-    /// check sees a tag the cached history doesn't start with, or the repo changes.
-    notes_cache: Mutex<Option<(String, Vec<engine::NotesEntry>)>>,
+    /// The "What's new" history (also persisted to disk by the engine). `release_notes` validates
+    /// freshness itself against the last checked tag, so nothing here needs invalidating.
+    notes_cache: Mutex<Option<engine::NotesCache>>,
     autofind_cancel: Arc<AtomicBool>,
     autofind_running: AtomicBool,
 }
@@ -303,17 +303,6 @@ async fn check(state: tauri::State<'_, Arc<AppState>>) -> Result<CheckView, Stri
             tag_name: release.tag_name.clone(),
             manifest: manifest.clone(),
         });
-        // drop a stale notes history (new release since it was fetched, or another repo)
-        {
-            let mut guard = st.notes_cache.lock().unwrap();
-            let fresh = guard.as_ref().is_some_and(|(repo, entries)| {
-                *repo == settings.source_repo
-                    && entries.first().is_some_and(|e| e.tag == release.tag_name)
-            });
-            if !fresh {
-                *guard = None;
-            }
-        }
         let r = engine::evaluate(&settings, &release.tag_name, &manifest)
             .map_err(|e| format!("{e:#}"))?;
         Ok(build_check_view(r))
@@ -344,8 +333,9 @@ async fn replan(state: tauri::State<'_, Arc<AppState>>) -> Result<CheckView, Str
     .map_err(|e| e.to_string())?
 }
 
-/// The full "What's new" history (every release's notes, newest first). Cached per repo — the
-/// first call walks each release's manifest.json; later opens are instant.
+/// The full "What's new" history (every release's notes, newest first). Cached in memory AND on
+/// disk, keyed by the last checked tag — reopens are instant across app restarts; a new release
+/// triggers an incremental rebuild (only unseen tags download a manifest).
 #[tauri::command]
 async fn release_notes(
     state: tauri::State<'_, Arc<AppState>>,
@@ -363,17 +353,56 @@ async fn release_notes(
                 })
                 .collect::<Vec<_>>()
         };
+        // freshness key: the tag the last check saw for this repo (None = accept any cached
+        // history — the UI only opens this view after a successful check anyway)
+        let current_tag: Option<String> = st
+            .manifest_cache
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|c| c.repo == settings.source_repo)
+            .map(|c| c.tag_name.clone());
+        let fresh = |c: &engine::NotesCache| {
+            c.repo == settings.source_repo
+                && current_tag.as_ref().map_or(true, |t| *t == c.latest_tag)
+        };
+        // memory first, then disk (survives restarts); a stale same-repo cache still seeds the
+        // incremental rebuild
+        let mut known: Vec<engine::NotesEntry> = Vec::new();
         {
             let guard = st.notes_cache.lock().unwrap();
-            if let Some((repo, entries)) = guard.as_ref() {
-                if *repo == settings.source_repo {
-                    return Ok(to_views(entries));
+            if let Some(c) = guard.as_ref() {
+                if fresh(c) {
+                    return Ok(to_views(&c.entries));
+                }
+                if c.repo == settings.source_repo {
+                    known = c.entries.clone();
                 }
             }
         }
-        let entries = engine::fetch_notes_history(&settings).map_err(|e| format!("{e:#}"))?;
-        let views = to_views(&entries);
-        *st.notes_cache.lock().unwrap() = Some((settings.source_repo, entries));
+        if known.is_empty() {
+            if let Some(c) = engine::NotesCache::load() {
+                if fresh(&c) {
+                    let views = to_views(&c.entries);
+                    *st.notes_cache.lock().unwrap() = Some(c);
+                    return Ok(views);
+                }
+                if c.repo == settings.source_repo {
+                    known = c.entries;
+                }
+            }
+        }
+        let mut cache =
+            engine::fetch_notes_history(&settings, &known).map_err(|e| format!("{e:#}"))?;
+        // key the cache to the checked tag, not the release list's first item — those differ when
+        // the newest release is a prerelease (check follows /releases/latest), and a mismatch
+        // would refetch on every open
+        if let Some(t) = current_tag {
+            cache.latest_tag = t;
+        }
+        cache.save();
+        let views = to_views(&cache.entries);
+        *st.notes_cache.lock().unwrap() = Some(cache);
         Ok(views)
     })
     .await

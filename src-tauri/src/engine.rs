@@ -3,6 +3,7 @@
 //! surface over this; `install` (in install.rs) reuses `fetch`, `resolve` and `plan`.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -66,30 +67,77 @@ pub fn fetch(settings: &Settings, tag: Option<&str>) -> Result<(github::Release,
 }
 
 /// One release's "What's new" entry, for the version-history view.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotesEntry {
     pub tag: String,
     pub version: String,
     pub notes: String,
 }
 
+/// The notes history plus its freshness key. Persisted to disk (next to settings.json) so
+/// "What's new" opens instantly across app restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotesCache {
+    pub repo: String,
+    /// The repo's latest release tag when this history was built. The freshness key — the first
+    /// entry's tag can't serve, since the latest release may carry no notes.
+    pub latest_tag: String,
+    pub entries: Vec<NotesEntry>,
+}
+
+fn notes_cache_path() -> Option<PathBuf> {
+    Settings::config_path().map(|p| p.with_file_name("notes_cache.json"))
+}
+
+impl NotesCache {
+    /// Best-effort disk load; None on any miss or parse failure.
+    pub fn load() -> Option<Self> {
+        let text = std::fs::read_to_string(notes_cache_path()?).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Best-effort disk save; a failure only costs a refetch next launch.
+    pub fn save(&self) {
+        let Some(p) = notes_cache_path() else { return };
+        if let Some(parent) = p.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string(self) {
+            let _ = std::fs::write(p, json);
+        }
+    }
+}
+
 /// The full "What's new" history: every release's manifest notes, newest first (GitHub's release
-/// order). Releases without a manifest.json, with an unparsable manifest, or with empty notes are
-/// skipped — a single bad release must not sink the whole history.
-pub fn fetch_notes_history(settings: &Settings) -> Result<Vec<NotesEntry>> {
+/// order). Incremental: a release whose tag appears in `known` keeps its cached entry with no
+/// manifest download — only unseen tags cost a round trip. (Releases whose manifest carried no
+/// notes are not in `known` and re-download on each rebuild; rebuilds only happen on a new
+/// release, so that stays cheap.) Releases without a manifest.json, with an unparsable manifest,
+/// or with empty notes are skipped — a single bad release must not sink the whole history.
+pub fn fetch_notes_history(settings: &Settings, known: &[NotesEntry]) -> Result<NotesCache> {
     let token = settings.token.as_deref();
     let releases =
         github::fetch_releases(&settings.source_repo, token).context("listing releases")?;
-    let mut out = Vec::new();
+    let by_tag: BTreeMap<&str, &NotesEntry> =
+        known.iter().map(|e| (e.tag.as_str(), e)).collect();
+    let mut entries = Vec::new();
     for rel in &releases {
+        if let Some(e) = by_tag.get(rel.tag_name.as_str()) {
+            entries.push((*e).clone());
+            continue;
+        }
         let Some(asset) = rel.asset("manifest.json") else { continue };
         let Ok(bytes) = github::download_asset(asset, token) else { continue };
         let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) else { continue };
         if let Some(notes) = m.notes.filter(|n| !n.trim().is_empty()) {
-            out.push(NotesEntry { tag: rel.tag_name.clone(), version: m.version, notes });
+            entries.push(NotesEntry { tag: rel.tag_name.clone(), version: m.version, notes });
         }
     }
-    Ok(out)
+    Ok(NotesCache {
+        repo: settings.source_repo.clone(),
+        latest_tag: releases.first().map(|r| r.tag_name.clone()).unwrap_or_default(),
+        entries,
+    })
 }
 
 /// The effective selection for one option: the user's value if it is valid for this manifest,

@@ -31,6 +31,23 @@
   --terra:     #d47767;   /* error */
 
   --ease: cubic-bezier(0.16, 0.7, 0.3, 1);
+
+  /* ---- structural rhythm: retune the whole column from here ----
+     Every view pulls from these, so switching views never shifts content. */
+  --gap-head: 1.75rem;    /* header -> first content, identical in every view */
+  --band:     1.5rem;     /* content -> footer actions */
+  --gutter:   0.875rem;   /* right inset of a scroll area; its head matches, so the
+                             column's right edge holds with or without a scrollbar */
+  --marker:     0.8125rem;  /* dot slot: sized to the widest marker (the busy spinner), so
+                               swapping dot <-> spinner never nudges the text */
+  --marker-gap: 0.5625rem;  /* slot -> text. Brand and status share both, so their dots sit on
+                               one axis and their text on one left edge. */
+  --ctl-h:    2.75rem;    /* one control height: buttons, inputs, segments */
+  --btn-min:  9.5rem;     /* solid + ghost share it, so paired buttons match */
+
+  --r-sm: 0.375rem;       /* radii scale */
+  --r:    0.4375rem;
+  --r-lg: 0.625rem;
 }
 
 /* Fluid base: grows with the window, so type + spacing scale together.
@@ -70,7 +87,10 @@ body {
   display: grid; place-items: center;
   background: radial-gradient(130% 120% at 50% 0%, #17141c 0%, #100e15 46%, var(--bg) 100%);
 }
-.app { width: 100%; height: 100%; max-width: 44rem; max-height: 43rem; }
+/* Viewport-derived size, NOT height:100% — a percentage height on this centered grid item
+   resolves against auto in WebView2, so only the max-height applied and the app overflowed the
+   window (clipped Back button). vw/vh are always definite. The 2.5rem keeps air at the edges. */
+.app { width: min(44rem, 100vw - 1rem); height: min(43rem, 100vh - 1rem); }
 
 .view {
   height: 100%; padding: 2rem 2.125rem 1.625rem;
@@ -88,10 +108,21 @@ body {
    button on main is the tallest thing), so content starts at the same y. */
 .head { display: flex; align-items: center; justify-content: space-between; min-height: 2rem; }
 .brand {
-  display: inline-flex; align-items: center; gap: 0.5625rem;
+  display: inline-flex; align-items: center; gap: var(--marker-gap);
   font-size: 0.75rem; font-weight: 600; letter-spacing: 0.2125rem; color: var(--text-dim);
 }
-.brand-dot { width: 0.3125rem; height: 0.3125rem; border-radius: 50%; background: var(--gold); box-shadow: 0 0 8px rgba(201, 168, 106, 0.5); }
+/* Dots are drawn by ::after inside a --marker-wide slot. Brand and status share that slot and
+   --marker-gap, so the two dots sit on one center axis and the brand text and the status word
+   start on one left edge — one column, not two. */
+.brand-dot, .status-dot { width: var(--marker); flex: none; display: grid; place-items: center; }
+.brand-dot::after, .status-dot::after {
+  content: ""; border-radius: 50%;
+  transition: background 0.2s, box-shadow 0.2s;
+}
+.brand-dot::after {
+  width: 0.3125rem; height: 0.3125rem;
+  background: var(--gold); box-shadow: 0 0 8px rgba(201, 168, 106, 0.5);
+}
 
 .icon-btn {
   width: 2rem; height: 2rem; border-radius: 0.4375rem; display: grid; place-items: center;
@@ -109,11 +140,10 @@ body {
 .head-actions { display: flex; align-items: center; gap: 0.375rem; }
 
 /* ---- status: the quiet hero ---- */
-.status { display: flex; align-items: flex-start; gap: 0.8125rem; padding: 1.875rem 0 1.625rem; }
-.status-dot {
-  width: 0.5625rem; height: 0.5625rem; border-radius: 50%; margin-top: 0.6875rem; flex: none;
-  background: var(--text-mute); transition: background 0.2s, box-shadow 0.2s;
-}
+.status { display: flex; align-items: flex-start; gap: var(--marker-gap); padding: var(--gap-head) 0 var(--band); }
+/* the slot is fixed-width, so swapping the dot for the busy spinner never shifts the text */
+.status-dot { margin-top: 0.6875rem; }
+.status-dot::after { width: 0.5625rem; height: 0.5625rem; background: var(--text-mute); }
 .status-lines { min-width: 0; }
 .status-word {
   font-size: 1.8125rem; font-weight: 600; letter-spacing: -0.025rem; line-height: 1.1; color: var(--text);
@@ -123,29 +153,33 @@ body {
   margin-top: 0.5625rem; line-height: 1.4; word-break: break-word;
 }
 
-.status[data-kind="ok"]     .status-dot  { background: var(--verd);  box-shadow: 0 0 10px rgba(98, 208, 180, 0.55); }
+.status[data-kind="ok"]     .status-dot::after { background: var(--verd);  box-shadow: 0 0 10px rgba(98, 208, 180, 0.55); }
 .status[data-kind="ok"]     .status-word { color: var(--verd); }
-.status[data-kind="update"] .status-dot  { background: var(--gold-soft); box-shadow: 0 0 10px rgba(230, 207, 152, 0.5); }
+.status[data-kind="update"] .status-dot::after { background: var(--gold-soft); box-shadow: 0 0 10px rgba(230, 207, 152, 0.5); }
 .status[data-kind="update"] .status-word { color: var(--gold-soft); }
-.status[data-kind="error"]  .status-dot  { background: var(--terra); box-shadow: 0 0 10px rgba(212, 119, 103, 0.5); }
+.status[data-kind="error"]  .status-dot::after { background: var(--terra); box-shadow: 0 0 10px rgba(212, 119, 103, 0.5); }
 .status[data-kind="error"]  .status-word { color: var(--terra); }
-.status[data-kind="busy"]   .status-dot  {
-  width: 0.8125rem; height: 0.8125rem; margin-top: 0.5625rem; background: transparent;
+.status[data-kind="busy"]   .status-dot { margin-top: 0.5625rem; }
+.status[data-kind="busy"]   .status-dot::after {
+  box-sizing: border-box;   /* `*` does not match pseudo-elements — set it here */
+  width: 0.8125rem; height: 0.8125rem; background: transparent;
   border: 2px solid rgba(201, 168, 106, 0.25); border-top-color: var(--gold-soft);
-  border-radius: 50%; animation: spin 0.7s linear infinite;
+  box-shadow: none; animation: spin 0.7s linear infinite;
 }
 .status[data-kind="busy"]   .status-word { color: var(--gold-soft); }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ---- files ---- */
+/* the head carries the scroll area's gutter too, so its right-aligned count sits directly
+   over the rows' right-aligned state instead of hanging one gutter further out */
 .files-head {
   display: flex; align-items: baseline; justify-content: space-between;
-  padding-bottom: 0.75rem; border-bottom: 1px solid var(--line);
+  padding-bottom: 0.75rem; padding-right: var(--gutter); border-bottom: 1px solid var(--line);
 }
-.eyebrow { font-size: 0.65625rem; font-weight: 600; letter-spacing: 0.1125rem; text-transform: uppercase; color: var(--text-dim); }
+.eyebrow { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase; color: var(--text-dim); }
 .files-count { font-family: "Mono", monospace; font-size: 0.71875rem; color: var(--text-mute); }
 
-.files-area { flex: 1; min-height: 0; overflow-y: auto; position: relative; padding-right: 0.875rem; }
+.files-area { flex: 1; min-height: 0; overflow-y: auto; position: relative; padding-right: var(--gutter); }
 .files-empty {
   position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
   color: var(--text-mute); font-size: 0.78125rem;
@@ -166,15 +200,18 @@ body {
 .fstate.remove  { color: var(--terra); }
 
 /* ---- actions ---- */
+/* No rule above the footer. The file list already closes itself with its own last hairline,
+   so a second rule here read as a stray empty row; every other view ends in a bordered box,
+   a section rule, or plain air, and is better off with just the gap. */
 .actions {
-  display: flex; align-items: center; gap: 0.875rem;
-  padding-top: 1.25rem; margin-top: 0.25rem; border-top: 1px solid var(--line);
+  display: flex; align-items: center; gap: 0.75rem;
+  padding-top: var(--band);
 }
 .actions-aux { margin-left: auto; display: flex; align-items: center; gap: 1rem; }
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center;
-  height: 2.75rem; min-width: 10.75rem; padding: 0 1.5rem; border-radius: 0.4375rem;
+  height: var(--ctl-h); min-width: var(--btn-min); padding: 0 1.5rem; border-radius: var(--r);
   font-family: "Inter", sans-serif; font-size: 0.84375rem; font-weight: 600; letter-spacing: 0.0125rem;
   color: #1a1409; background: var(--gold); border: 1px solid var(--gold); cursor: pointer;
   white-space: nowrap; line-height: 1;
@@ -184,11 +221,11 @@ body {
 .btn:active { transform: translateY(1px); }
 .btn:disabled { opacity: 0.45; cursor: default; }
 
-.btn.ghost {
-  min-width: 0; color: var(--gold-soft); background: transparent; border-color: var(--line);
-}
+/* ghost keeps the shared min-width so a solid + ghost pair reads as one unit */
+.btn.ghost { color: var(--gold-soft); background: transparent; border-color: var(--line); }
 .btn.ghost:not(:disabled):hover { background: rgba(201, 168, 106, 0.06); border-color: var(--gold); }
-.btn.inline { height: 2.75rem; padding: 0 1.125rem; }
+/* inline ghosts sit in a row of inputs — they size to their label instead */
+.btn.inline { min-width: 0; height: var(--ctl-h); padding: 0 1.125rem; }
 
 .link {
   background: none; border: none; cursor: pointer; padding: 0.25rem 0.125rem;
@@ -200,21 +237,24 @@ body {
 .link:disabled { opacity: 0.5; pointer-events: none; }
 .link.hidden { display: none; }
 
+/* the install path is a caption under the actions, not a third row of controls — it gets its
+   own air so the footer reads as [rule of air] buttons [smaller air] path */
 .path {
   font-family: "Mono", monospace; font-size: 0.6875rem; color: var(--text-mute);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 0.875rem; margin-top: 0.875rem;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 0.875rem;
+  margin-top: 1.125rem;
 }
 
 /* ---- settings ---- */
-.fields { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 1.375rem; padding-top: 1.875rem; padding-right: 0.875rem; overflow-y: auto; }
+.fields { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 1.375rem; padding-top: var(--gap-head); padding-right: var(--gutter); overflow-y: auto; }
 .field { display: flex; flex-direction: column; gap: 0.5rem; }
-.label { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.075rem; text-transform: uppercase; color: var(--text-dim); }
+.label { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase; color: var(--text-dim); }
 .hint { font-size: 0.71875rem; color: var(--text-mute); }
 .hint code { font-family: "Mono", monospace; color: var(--gold-soft); }
 .row { display: flex; gap: 0.5rem; }
 input[type="text"], input[type="password"] {
-  width: 100%; height: 2.75rem; padding: 0 0.875rem;
-  background: var(--bg-2); border: 1px solid var(--line); border-radius: 0.4375rem;
+  width: 100%; height: var(--ctl-h); padding: 0 0.875rem;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r);
   color: var(--text); font-family: "Inter", sans-serif; font-size: 0.84375rem;
   -webkit-user-select: text; user-select: text; cursor: text;
   transition: border-color 0.15s, box-shadow 0.15s;
@@ -223,7 +263,7 @@ input:focus { outline: none; border-color: rgba(201, 168, 106, 0.5); box-shadow:
 input::placeholder { color: #4d4941; }
 .msg {
   font-size: 0.78125rem; font-weight: 600; color: var(--terra);
-  padding: 0.625rem 0.75rem; border-left: 2px solid var(--terra); background: rgba(212, 119, 103, 0.07); border-radius: 0 0.3125rem 0.3125rem 0;
+  padding: 0.625rem 0.75rem; border-left: 2px solid var(--terra); background: rgba(212, 119, 103, 0.07); border-radius: 0 var(--r-sm) var(--r-sm) 0;
 }
 .msg[hidden] { display: none; }
 
@@ -247,9 +287,9 @@ input::placeholder { color: #4d4941; }
   padding-bottom: 0.25rem;
 }
 /* every version after the first gets a separator */
-.notes + .whatsnew-version { margin-top: 1.625rem; padding-top: 1.25rem; border-top: 1px solid var(--line); }
+.notes + .whatsnew-version { margin-top: var(--band); padding-top: 1.25rem; border-top: 1px solid var(--line); }
 .notes-loading { margin-top: 1.375rem; }
-.notes-area { flex: 1; min-height: 0; overflow-y: auto; padding-top: 1.625rem; padding-right: 0.875rem; }
+.notes-area { flex: 1; min-height: 0; overflow-y: auto; padding-top: var(--gap-head); padding-right: var(--gutter); }
 .notes { -webkit-user-select: text; user-select: text; cursor: text; }
 .notes h4 {
   font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase;
@@ -279,15 +319,15 @@ input::placeholder { color: #4d4941; }
 .notes a:hover { border-bottom-color: var(--gold-soft); }
 .notes pre {
   margin: 0.625rem 0; padding: 0.75rem 0.875rem; overflow-x: auto;
-  background: var(--bg-2); border: 1px solid var(--line); border-radius: 0.4375rem;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r);
 }
 .notes pre code { font-size: 0.75rem; color: #c2bcb1; line-height: 1.55; }
 
 /* ---- segmented control ---- */
-.seg { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: 0.4375rem; overflow: hidden; width: max-content; }
+.seg { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; width: max-content; }
 .seg-btn {
   /* matches .btn height (minus the .seg frame's own border) and font */
-  height: calc(2.75rem - 2px); padding: 0 1.375rem; background: transparent; border: none; cursor: pointer;
+  height: calc(var(--ctl-h) - 2px); padding: 0 1.375rem; background: transparent; border: none; cursor: pointer;
   font-family: "Inter", sans-serif; font-size: 0.84375rem; font-weight: 600; color: var(--text-dim);
   transition: background 0.15s, color 0.15s;
 }
@@ -313,10 +353,10 @@ input::placeholder { color: #4d4941; }
 .advanced-body { display: flex; flex-direction: column; gap: 1.375rem; padding-top: 1.125rem; }
 
 /* ---- setup ---- */
-.setup-hero { padding-top: 2.25rem; }
+.setup-hero { padding-top: var(--gap-head); }
 .setup-title { font-size: 1.8125rem; font-weight: 600; letter-spacing: -0.025rem; }
 .setup-text { margin-top: 0.75rem; font-size: 0.84375rem; line-height: 1.5; color: var(--text-dim); max-width: 30rem; }
-.setup-spacer { flex: 1; }
+.setup-spacer { flex: 1; min-height: var(--band); }
 #setup-msg { margin-top: 1.25rem; }
 
 /* ---- modal (autofind) ---- */
@@ -328,13 +368,14 @@ input::placeholder { color: #4d4941; }
 .modal-card {
   width: min(30rem, calc(100vw - 4rem)); max-height: min(28rem, calc(100vh - 4rem));
   display: flex; flex-direction: column;
-  background: var(--surface); border: 1px solid var(--line); border-radius: 0.625rem;
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
   padding: 1.5rem 1.625rem 1.375rem; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
 }
 .modal-card > div:not(.hidden) { display: flex; flex-direction: column; min-height: 0; }
-.modal-title { font-size: 0.75rem; font-weight: 600; letter-spacing: 0.15rem; text-transform: uppercase; color: var(--gold-soft); margin-bottom: 0.875rem; }
+/* same micro-caps role as .eyebrow / .label, in the accent */
+.modal-title { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase; color: var(--gold-soft); margin-bottom: 0.875rem; }
 .modal-text { font-size: 0.84375rem; line-height: 1.55; color: var(--text); }
-.modal-actions { display: flex; gap: 0.75rem; margin-top: 1.375rem; }
+.modal-actions { display: flex; gap: 0.75rem; margin-top: var(--band); }
 
 .spinner {
   width: 1rem; height: 1rem; flex: none; border-radius: 50%;
@@ -349,7 +390,7 @@ input::placeholder { color: #4d4941; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; direction: rtl; text-align: left;
 }
 
-.cands-head { padding-bottom: 0.625rem; border-bottom: 1px solid var(--line); }
+.cands-head { padding-bottom: 0.625rem; padding-right: 0.75rem; border-bottom: 1px solid var(--line); }
 .cands-area { flex: 1; min-height: 4rem; overflow-y: auto; padding-right: 0.75rem; }
 .cands-empty { padding: 1.25rem 0; color: var(--text-mute); font-size: 0.78125rem; }
 .cands { list-style: none; }
@@ -365,15 +406,17 @@ input::placeholder { color: #4d4941; }
 .cand-build { font-size: 0.6875rem; font-weight: 600; color: var(--text-mute); margin-top: 0.1875rem; }
 
 /* ---- customization ---- */
-.opt-hint { padding: 0.875rem 0 0.375rem; }
-.opts-area { flex: 1; min-height: 0; overflow-y: auto; padding-top: 0.5rem; padding-right: 0.875rem; }
+/* the hint occupies the same head gap the other views use, so the first group starts on the
+   shared content line */
+.opt-hint { padding: var(--gap-head) var(--gutter) 0.625rem 0; }
+.opts-area { flex: 1; min-height: 0; overflow-y: auto; padding-right: var(--gutter); }
 .opt-group { padding: 1rem 0 1.125rem; border-bottom: 1px solid var(--line-soft); }
 .opt-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 .opt-title { font-size: 0.875rem; font-weight: 600; color: var(--text); }
 .opt-group .hint { margin-top: 0.375rem; }
 .opt-variants { display: flex; flex-direction: column; gap: 0.125rem; margin-top: 0.75rem; }
 .variant {
-  display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0.625rem; border-radius: 0.375rem;
+  display: flex; align-items: center; gap: 0.75rem; padding: 0.5rem 0.625rem; border-radius: var(--r-sm);
   background: transparent; border: 1px solid transparent; cursor: pointer; text-align: left;
   font-family: "Inter", sans-serif; font-size: 0.8125rem; color: var(--text-dim);
   transition: background 0.15s, color 0.15s;
@@ -408,8 +451,8 @@ input::placeholder { color: #4d4941; }
 /* the wrap owns the frame; textarea (transparent text, visible caret) sits exactly over the
    highlighted pre — identical font/padding/whitespace so the glyphs line up 1:1 */
 .editor-wrap {
-  position: relative; flex: 1; min-height: 0; margin-top: 1.25rem;
-  background: var(--bg-2); border: 1px solid var(--line); border-radius: 0.4375rem;
+  position: relative; flex: 1; min-height: 0; margin-top: var(--gap-head);
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r);
   overflow: hidden; transition: border-color 0.15s;
 }
 .editor-wrap:focus-within { border-color: rgba(201, 168, 106, 0.5); }

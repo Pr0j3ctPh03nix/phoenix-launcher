@@ -1,0 +1,4 @@
+# Dev-loop speed. rust-lld ships with rustc and links several times faster than MSVC link.exe —
+# linking the binary is the dominant per-iteration cost of `tauri dev` / `cargo run`.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
