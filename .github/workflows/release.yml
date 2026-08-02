@@ -14,6 +14,12 @@ on:
 permissions:
   contents: write
 
+# re-pushing the same tag (or re-dispatching on the same ref) cancels the stale run instead of
+# letting duplicate full builds run to completion
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
@@ -27,6 +33,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # a failed build still caches the deps that did compile — a retry resumes instead of
+          # starting from zero
+          cache-on-failure: true
 
       - name: Install frontend deps
         run: bun install
