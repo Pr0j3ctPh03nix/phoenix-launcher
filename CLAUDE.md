@@ -13,8 +13,10 @@ This repo (`Pr0j3ctPh03nix/phoenix-launcher`, public) is the **updater app** onl
 the shim. What it installs lives in a separate **dist repo** whose CI builds `winmm.dll` and publishes
 a Release described by a `manifest.json`:
 
-- `Pr0j3ctPh03nix/client-dist` — public, the default source (baked as `DEFAULT_REPO` in `config.rs`).
-- `Pr0j3ctPh03nix/client-dist-staging` — private, for testing releases (needs a token).
+- `Pr0j3ctPh03nix/client-dist-staging` — private; the current default source (baked as
+  `DEFAULT_REPO` in `config.rs`). Builds authenticate with a read-only token baked at build time
+  (`PHOENIX_BAKED_TOKEN`, see `config.rs`); a user-saved token still wins.
+- `Pr0j3ctPh03nix/client-dist` — public, for the eventual public release.
 
 The updater is **data-driven**: the file list, install destinations, download URLs, and the
 install-identity gate all come from the manifest. It hardcodes none of them. Change what ships, or
@@ -24,21 +26,30 @@ the target game build, by editing the dist repo + cutting a release — the upda
 
     src-tauri/            Rust
       src/
-        main.rs           Tauri command layer (wraps the engine) + a headless CLI for testing
-        config.rs         Settings: source_repo / game_dir / token, persisted via `directories`
-        github.rs         GitHub Releases client (public no-auth + private token, same code path)
-        manifest.rs       manifest.json types
+        main.rs           binary wiring only: module tree, Tauri builder, command registration
+        cmd/              Tauri command layer, one module per domain (settings/update/notes/
+                          launch/autofind/misc); AppState lives in cmd/mod.rs
+        views.rs          the webview wire contract (view structs, camelCase) + CmdError
+                          {kind,message} + build_check_view (UI-hint derivation)
+        cli.rs            headless CLI (check/install/uninstall) for engine testing
+        config.rs         Settings (schema-versioned, serialized Settings::update writes)
+        downloader.rs     the network seam: Downloader trait + Release/Asset + NetKind error
+                          marker + an in-memory fake for tests
+        github.rs         GitHub Releases Downloader impl (public no-auth + private token)
+        manifest.rs       manifest.json types (incl. min_launcher compat gate)
         steaminf.rs       reads game/dota/steam.inf ClientVersion (info only, no gating)
-        verify.rs         sha256 of files / bytes
-        engine.rs         fetch + resolve (options -> effective file set) + plan (diff, incl.
-                          orphan Remove) + read-only `check` / offline `evaluate`; unit tests
-        install.rs        install (2-phase, rollback, orphan removal) + uninstall (revert to stock)
-        state.rs          per-install record, stored in the game folder
+        verify.rs         sha256 of files / bytes ((size,mtime)-memoized)
+        engine.rs         fetch (with the min_launcher gate) + resolve (options -> effective
+                          file set) + plan (diff, incl. orphan Remove) + read-only `check` /
+                          offline `evaluate` + OpProgress ticks; unit tests
+        install.rs        install (game-running interlock, 2-phase, parallel resumable
+                          downloads, rollback, orphan removal) + uninstall; unit tests
+        state.rs          per-install record, stored in the game folder (corrupt -> quarantine)
         launch.rs         spawns dota2.exe with base options + renderer flag + user extras
         autofind.rs       game-folder scan: Steam libraries (registry/vdf) then all drives
       tauri.conf.json     window + bundle config
       capabilities/       Tauri 2 permissions
-    frontend/             static HTML/CSS/JS (no bundler); fonts + phoenix image bundled here
+    frontend/             static HTML/CSS/JS (no bundler); fonts bundled here
       i18n.js             EN/RU string tables; static DOM via data-i18n, dynamic via t()
     dev/make_decoy.sh     builds a fake game folder for safe testing
 
@@ -66,9 +77,35 @@ uninstall against a **decoy**, never a real game install.
 
 ## How it works
 
+- **Downloader seam**: the engine never touches HTTP directly. `downloader.rs` holds the
+  `Downloader` trait (+ `Release`/`Asset` types, the `NetKind` error marker, and an in-memory
+  fake used by the install/engine tests); `github.rs` is the production impl. A new transport
+  (mirror, resumable downloads) slots in without engine changes.
+- **Error envelope**: every command fails with `CmdError {kind, message}` (views.rs). `kind` is
+  classified from the anyhow chain (`network` / `auth` / `notFound` / `io` / `tooOld` /
+  `internal`); the frontend displays `message` today and can react to `kind` later.
+- **Progress**: long engine ops emit `OpProgress` ticks through a `Progress` sink; the `apply`
+  command forwards them to the webview as the `op-progress` event (`autofind` has its own
+  `autofind-progress` event). CLI/tests pass `None`.
+- **Compat gate**: a manifest may carry `min_launcher` (semver). Older launchers refuse it with
+  a typed `TooOld` error (wire kind `tooOld`) instead of silently misinstalling a format they
+  don't understand. Old manifests without the field are unaffected.
+- **Game-running interlock**: install and uninstall first probe every file they're about to
+  touch for write access (an open without truncating). A sharing violation means the game holds
+  it open (loaded DLLs, mmapped VPKs) → typed `GameRunning` error, wire kind `gameRunning`,
+  before a single byte is downloaded. std does NOT map sharing violations to PermissionDenied —
+  `is_in_use` matches the raw Windows codes (5/32/33).
+- **Downloads**: phase 1a fetches unique-by-hash files into the content-addressed cache with a
+  4-worker pool (files are independent by construction); staging copies stay sequential so
+  commit is unchanged. An interrupted download keeps its `.part`; the next run resumes it via a
+  Range request (the returned sha covers the whole file — the prefix is re-hashed). A hash
+  mismatch deletes the `.part` (corrupt bytes can't resume). File-granularity resume comes free
+  from the cache itself.
 - **Settings** persist to the OS config dir (`directories` crate); the GitHub token is never sent
-  back to the UI (only a `hasToken` flag). Also persisted: `language` (en/ru), `launch_extra`,
-  `renderer` (dx11/dx9), and `selections` (manifest option id -> variant id or bool).
+  back to the UI (only a `hasToken` flag, and it reflects a user-saved token only). The build-time
+  baked token is merged at the point of use (`Settings::token()`), never into the persisted
+  struct — a settings save can't write it to disk. Also persisted: `language` (en/ru),
+  `launch_extra`, `renderer` (dx11/dx9), and `selections` (manifest option id -> variant id or bool).
 - **Manifest options (v2)**: top-level `options[]` — `kind:"choice"` (N `variants` sharing one
   `dest`, `default` = variant id) and `kind:"toggle"` (`files[]` installed when on, `default` =
   bool). Labels are plain strings or `{"en":…,"ru":…}` maps. `engine::resolve()` materializes the
@@ -98,8 +135,15 @@ uninstall against a **decoy**, never a real game install.
   1. download every changed file, verify sha256 **and** size, into `<game>/.phoenix-staging/`;
   2. commit: back up each existing target, atomically move the staged file in, create
      `winmm_orig.dll`, apply the manifest `remove[]`, write state. Any phase-2 failure rolls back.
+  A **no-op install still heals**: when every resolved file already hash-matches, install writes
+  the state file and creates a missing `winmm_orig.dll` anyway — a lost/corrupt
+  `.phoenix-state.json` can never wedge the folder into "up to date but not installed" (the UI
+  offers Apply for exactly this case: `primary_action` is `apply` when `changes == 0 &&
+  !installed`).
 - **uninstall** reverts to stock from `<game>/.phoenix-state.json`: restore a preserved vanilla
   original if one exists, else delete our file; delete `winmm_orig.dll` only if *we* created it.
+  A corrupt state file is quarantined to `.phoenix-state.json.bak` on load (treated as
+  not-installed) rather than silently misread.
 
 ## Invariants & gotchas — do not break these
 
@@ -123,16 +167,21 @@ uninstall against a **decoy**, never a real game install.
 
 ## Design (frontend)
 
-"The Keeper's Console" — dark warm charcoal, **antique gold** as the one accent, over a blurred
-phoenix aura behind the wordmark. Meaningful color: **gold = action/attention**, **verdigris
-(`#62d0b4`) = settled/up-to-date**, **terracotta = error**. Fonts (bundled, `@font-face`): Marcellus
-(wordmark), Inter (UI), JetBrains Mono (paths/data). Engraved cards, a struck-gold-seal primary
-button, a hexagon-trace startup loader. Keep it minimal — one bold element (the phoenix), everything
-else quiet. Tunable knobs are commented in `style.css` (phoenix blur/opacity, mask).
+Minimal by decision: near-black ground (`#0f0d12`), one quiet centered column, hairline structure.
+Meaning lives in color only: **gold = action/attention**, **verdigris (`#62d0b4`) =
+settled/up-to-date**, **terracotta = error**. Fonts (bundled, `@font-face`): Inter (UI) and
+JetBrains Mono (paths/data). Sizing is fluid — everything is rem and the root font-size clamps on
+vmin, so the whole UI scales with the window. Structural rhythm tokens (`--gap-head`, `--band`,
+`--gutter`, `--marker`, `--ctl-h`, `--btn-min`) live in `:root` — retune the whole column from
+there. Ring-spinner loader, staggered `.rise` reveal on main, `prefers-reduced-motion` honored.
 
 ## Editing conventions
 
-- The **engine** (config/github/manifest/install/state/steaminf/verify/engine) stays UI-agnostic and
-  pure Rust — no Tauri types in it. Tauri view structs + the derivation of UI hints live in `main.rs`.
+- The **engine** (config/downloader/github/manifest/install/state/steaminf/verify/engine) stays
+  UI-agnostic and pure Rust — no Tauri types in it, network only through the `Downloader` trait.
+  Tauri commands live in `cmd/`, the wire contract (view structs, `CmdError`, UI-hint derivation)
+  in `views.rs`.
+- Settings writes go through `Settings::update` (load → mutate → save, serialized), never a
+  hand-rolled load/save pair in a command.
 - Prefer adding to the manifest over hardcoding in the updater. The updater should stay a dumb,
   data-driven installer.

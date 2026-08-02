@@ -10,6 +10,11 @@ pub struct Manifest {
     /// manifests written before this field are still accepted.
     #[serde(default)]
     pub notes: Option<String>,
+    /// Oldest launcher version allowed to install this release (semver string, e.g. "1.2.0").
+    /// Set it when a manifest change is NOT backward-compatible — older launchers then refuse
+    /// with a clear "update the launcher" error instead of silently misinstalling.
+    #[serde(default)]
+    pub min_launcher: Option<String>,
     pub files: Vec<FileEntry>,
     #[serde(default)]
     pub remove: Vec<RemoveEntry>,

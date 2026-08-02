@@ -1,4 +1,4 @@
-const { invoke } = window.__TAURI__.core;
+﻿const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const $ = (id) => document.getElementById(id);
 
@@ -12,14 +12,14 @@ const state = {
   primaryMode: "check", // "check" | "apply" | "play"
   hasToken: false,
   renderer: "dx11",
-  afTarget: null,      // "setup" | "settings" — where an autofind pick lands
+  afTarget: null,      // "setup" | "settings" вЂ” where an autofind pick lands
   afUnlisten: null,
   aeDirty: false,
 };
 
 // ---- markdown-lite: the notes are trusted (our own manifest) but escape anyway, then apply the
 // changelog subset: headings, bullet + ordered lists, ``` fences, **bold**, *italic*, `code`,
-// [links](https://…). No raw HTML from the source ever reaches innerHTML; links go through the
+// [links](https://вЂ¦). No raw HTML from the source ever reaches innerHTML; links go through the
 // open_url command (http/https only). ----
 function escHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -33,7 +33,7 @@ function renderNotes(md) {
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, url) =>
       /^https?:\/\//i.test(url) ? `<a href="#" data-url="${url}">${txt}</a>` : txt);
     s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    // single-* italics only — _underscores_ stay literal (file_names are common in changelogs)
+    // single-* italics only вЂ” _underscores_ stay literal (file_names are common in changelogs)
     s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
     return s.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[i]}</code>`);
   };
@@ -90,6 +90,10 @@ function setIdleStatus() {
 
 function statusFor(v) {
   if (v.changes === 0) {
+    if (!v.installed) {
+      // files all hash-match but no install state вЂ” Apply runs the no-op heal (rewrites state)
+      return [t("status.notInstalled"), "update", t("detail.okMeta", { version: v.version })];
+    }
     return [t("status.upToDate"), "ok", t("detail.okMeta", { version: v.version })];
   }
   return [
@@ -148,15 +152,24 @@ function applyCheck(v) {
   pl.textContent = v.gameDir;
   pl.title = v.gameDir;
 
-  $("btn-whatsnew").classList.toggle("hidden", !v.notes);
+  // always offered once checked: the history view serves older releases' notes even when the
+  // latest release carries none (the backend is built for exactly that case)
+  $("btn-whatsnew").classList.remove("hidden");
   $("btn-customize").classList.toggle("hidden", !(v.options && v.options.length));
 
   state.primaryMode = v.primaryAction === "apply" ? "apply" : v.canPlay ? "play" : "check";
   renderPrimary();
 }
 
+// Command failures arrive as {kind, message} envelopes (CmdError); tolerate bare strings too.
+// `kind` is for reacting (later: token prompts on "auth", update nudges on "tooOld") вЂ” for now
+// everything displays the message.
+function errText(e) {
+  return (e && typeof e === "object" && "message" in e) ? e.message : String(e);
+}
+
 function onError(e) {
-  setStatus(t("status.error"), "error", String(e));
+  setStatus(t("status.error"), "error", errText(e));
 }
 
 // ---- actions ----
@@ -183,12 +196,23 @@ async function doReplan() {
 async function doApply() {
   state.busy = true; renderPrimary();
   setStatus(t("status.working"), "busy", t("detail.installing"));
+  // the engine streams phase-1 progress as op-progress events: "file k of n · path · MB/MB"
+  let unlisten = null;
   try {
+    unlisten = await listen("op-progress", (ev) => {
+      const p = ev.payload;
+      if (p.op !== "install" || !p.item) return;
+      let d = t("detail.dl", { i: p.current, n: p.total, item: p.item });
+      if (p.bytesTotal) d += ` · ${(p.bytesDone / 1048576).toFixed(1)}/${(p.bytesTotal / 1048576).toFixed(1)} MB`;
+      setStatus(t("status.working"), "busy", d);
+    });
     await invoke("apply");
     await doCheck(); // refresh -> up to date, Play unlocks
   } catch (e) {
     onError(e);
     state.busy = false; renderPrimary();
+  } finally {
+    if (unlisten) unlisten();
   }
 }
 
@@ -302,7 +326,7 @@ async function saveSettings() {
     showView("main");
     setStatus(t("status.saved"), "ok", "");
   } catch (e) {
-    setSettingsMsg(String(e));
+    setSettingsMsg(errText(e));
   }
 }
 
@@ -311,7 +335,7 @@ async function browseInto(input) {
     const dir = await invoke("browse_folder");
     if (dir) input.value = dir;
   } catch (e) {
-    setSettingsMsg(String(e));
+    setSettingsMsg(errText(e));
   }
 }
 
@@ -325,7 +349,7 @@ async function adoptGameDir(path) {
   try {
     await invoke("set_game_dir", { path });
   } catch (e) {
-    setSetupMsg(String(e));
+    setSetupMsg(errText(e));
     return;
   }
   closeAutofind();
@@ -339,7 +363,7 @@ async function setupBrowse() {
     const dir = await invoke("browse_folder");
     if (dir) adoptGameDir(dir); // any folder is accepted
   } catch (e) {
-    setSetupMsg(String(e));
+    setSetupMsg(errText(e));
   }
 }
 
@@ -372,9 +396,12 @@ async function runAutofind() {
   try {
     found = await invoke("autofind_start");
   } catch (e) {
-    // scan failed outright — show empty results rather than a dead modal
+    // scan failed outright вЂ” show empty results rather than a dead modal
   }
   if (state.afUnlisten) { state.afUnlisten(); state.afUnlisten = null; }
+  // the modal was closed mid-scan (Escape) вЂ” discard the results instead of staging them
+  // under a hidden modal
+  if ($("af-modal").classList.contains("hidden")) return;
   renderCandidates(found);
   afStage("results");
 }
@@ -413,7 +440,25 @@ function renderCandidates(found) {
 
 function cancelAutofind() {
   invoke("autofind_cancel").catch(() => {});
-  // the running scan returns what it found so far; results stage follows from runAutofind()
+  // Stop button: the running scan returns what it found so far; results stage follows from
+  // runAutofind(). (Escape cancels AND closes вЂ” runAutofind then discards the results.)
+}
+
+// ---- confirm modal (destructive actions: uninstall, discard autoexec changes) ----
+let cfResolve = null;
+function confirmDialog({ title, text, confirm }) {
+  $("cf-title").textContent = title;
+  $("cf-text").textContent = text;
+  $("btn-cf-ok").textContent = confirm;
+  $("cf-modal").classList.remove("hidden");
+  return new Promise((resolve) => { cfResolve = resolve; });
+}
+function settleConfirm(v) {
+  if ($("cf-modal").classList.contains("hidden")) return;
+  $("cf-modal").classList.add("hidden");
+  const r = cfResolve;
+  cfResolve = null;
+  if (r) r(v);
 }
 
 // ---- customization ----
@@ -506,10 +551,17 @@ function setAeDirty(d) {
   $("ae-dirty").classList.toggle("hidden", !d);
 }
 
-// Source cfg highlight: `<command> <value…>` per line, `//` comments, "quoted" values.
+// Source cfg highlight: `<command> <valueвЂ¦>` per line, `//` comments, "quoted" values.
 function hlAutoexec(text) {
   const lines = text.split(/\r?\n/).map((line) => {
-    const ci = line.indexOf("//");
+    // a comment starts at the first // OUTSIDE quotes (a // inside a quoted value, e.g. a
+    // URL, stays value)
+    let ci = -1;
+    let quoted = false;
+    for (let i = 0; i < line.length - 1; i++) {
+      if (line[i] === '"') quoted = !quoted;
+      else if (!quoted && line[i] === "/" && line[i + 1] === "/") { ci = i; break; }
+    }
     const code = ci >= 0 ? line.slice(0, ci) : line;
     const com = ci >= 0 ? `<span class="hl-com">${escHtml(line.slice(ci))}</span>` : "";
     const m = code.match(/^(\s*)(\S*)([\s\S]*)$/);
@@ -537,7 +589,7 @@ async function openAutoexec() {
     $("ae-text").value = await invoke("read_autoexec");
   } catch (e) {
     $("ae-text").value = "";
-    setAeMsg(String(e));
+    setAeMsg(errText(e));
   }
   refreshAeHl();
   setAeDirty(false);
@@ -551,8 +603,21 @@ async function saveAutoexec() {
     setAeDirty(false);
     setAeMsg(null);
   } catch (e) {
-    setAeMsg(String(e));
+    setAeMsg(errText(e));
   }
+}
+
+async function maybeCloseAutoexec() {
+  if (state.aeDirty) {
+    const ok = await confirmDialog({
+      title: t("cf.discardTitle"),
+      text: t("cf.discardText"),
+      confirm: t("cf.discardConfirm"),
+    });
+    if (!ok) return;
+    setAeDirty(false);
+  }
+  showView("settings");
 }
 
 // ---- what's new ----
@@ -573,12 +638,12 @@ let wnSeq = 0; // drops a stale history fetch when the view was reopened meanwhi
 
 async function openWhatsNew() {
   const v = state.lastCheck;
-  if (!v?.notes) return;
+  if (!v) return;
   const seq = ++wnSeq;
   const body = $("notes-body");
-  // instant first paint: the current release's notes, history swaps in when it arrives
+  // instant first paint: the current release's notes (if any), history swaps in when it arrives
   body.innerHTML = "";
-  body.append(notesSection(v.version, v.notes));
+  if (v.notes) body.append(notesSection(v.version, v.notes));
   const loading = document.createElement("div");
   loading.className = "hint notes-loading";
   loading.textContent = t("wn.loading");
@@ -588,21 +653,35 @@ async function openWhatsNew() {
   try {
     const all = await invoke("release_notes"); // cached backend-side (memory + disk), instant after first fetch
     if (seq !== wnSeq) return;
+    body.innerHTML = "";
     if (all.length) {
-      body.innerHTML = "";
       for (const e of all) body.append(notesSection(e.version, e.notes));
+    } else if (v.notes) {
+      body.append(notesSection(v.version, v.notes)); // no history вЂ” keep the current release's notes
     } else {
-      loading.remove(); // no history found — keep the current release's notes
+      const none = document.createElement("div");
+      none.className = "hint notes-loading";
+      none.textContent = t("wn.none");
+      body.append(none);
     }
   } catch (e) {
-    if (seq === wnSeq) loading.remove(); // offline etc. — current release's notes stay up
+    // offline etc. вЂ” the current release's notes (if any) stay up; say why the rest is missing
+    if (seq === wnSeq) loading.textContent = errText(e);
   }
 }
 
 // ---- wire ----
 $("btn-primary").addEventListener("click", onPrimary);
 $("btn-check").addEventListener("click", () => !state.busy && doCheck());
-$("btn-uninstall").addEventListener("click", () => !state.busy && doUninstall());
+$("btn-uninstall").addEventListener("click", async () => {
+  if (state.busy) return;
+  const ok = await confirmDialog({
+    title: t("cf.uninstallTitle"),
+    text: t("cf.uninstallText"),
+    confirm: t("cf.uninstallConfirm"),
+  });
+  if (ok) doUninstall();
+});
 $("btn-settings").addEventListener("click", () => !state.busy && openSettings());
 $("btn-whatsnew").addEventListener("click", () => !state.busy && openWhatsNew());
 $("btn-customize").addEventListener("click", () => { if (!state.busy) { renderOptions(); showView("options"); } });
@@ -620,20 +699,23 @@ $("btn-af-cancel").addEventListener("click", cancelAutofind);
 $("btn-af-done").addEventListener("click", closeAutofind);
 $("btn-autoexec").addEventListener("click", openAutoexec);
 $("btn-ae-save").addEventListener("click", saveAutoexec);
-$("btn-ae-close").addEventListener("click", () => showView("settings"));
+$("btn-ae-close").addEventListener("click", maybeCloseAutoexec);
+$("btn-cf-ok").addEventListener("click", () => settleConfirm(true));
+$("btn-cf-cancel").addEventListener("click", () => settleConfirm(false));
 wireSeg($("seg-lang"), (l) => switchLang(l));
 wireSeg($("seg-renderer"));
 
-// Escape backs out; Enter in settings commits the save.
+// Escape backs out (topmost layer first); Enter in settings commits the save.
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
+    if (!$("cf-modal").classList.contains("hidden")) { settleConfirm(false); return; }
     if (!$("af-modal").classList.contains("hidden")) {
       if (!$("af-run").classList.contains("hidden")) cancelAutofind();
-      else closeAutofind();
+      closeAutofind();
       return;
     }
     const v = currentView();
-    if (v === "autoexec") { e.preventDefault(); showView("settings"); }
+    if (v === "autoexec") { e.preventDefault(); maybeCloseAutoexec(); }
     else if (v === "settings" || v === "whatsnew" || v === "options") { e.preventDefault(); showView("main"); }
   } else if (e.key === "Enter" && currentView() === "settings" && !state.busy && e.target.tagName !== "TEXTAREA") {
     e.preventDefault(); saveSettings();
@@ -671,7 +753,7 @@ async function boot() {
     const gs = await invoke("game_dir_status");
     // setup only when nothing was ever chosen AND the exe isn't sitting next to a game
     firstRun = !gs.configured && !gs.clientVersion;
-  } catch (e) { /* resolve failed — treat as first run */ firstRun = true; }
+  } catch (e) { /* resolve failed вЂ” treat as first run */ firstRun = true; }
   return firstRun;
 }
 
@@ -683,7 +765,7 @@ requestAnimationFrame(() =>
     try {
       await window.__TAURI__.window.getCurrentWindow().show();
     } catch (e) {
-      /* API shape differs — ignore; not fatal */
+      /* API shape differs вЂ” ignore; not fatal */
     }
     setTimeout(() => {
       $("loader").classList.add("hidden");

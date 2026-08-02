@@ -139,7 +139,7 @@
             <div class="advanced-body">
               <label class="field">
                 <span class="label" data-i18n="set.repo"></span>
-                <input id="in-repo" type="text" spellcheck="false" placeholder="Pr0j3ctPh03nix/client-dist" />
+                <input id="in-repo" type="text" spellcheck="false" placeholder="Pr0j3ctPh03nix/client-dist-staging" />
                 <span class="hint" data-i18n="set.repoHint"></span>
               </label>
               <label class="field">
@@ -257,6 +257,20 @@
         </div>
         <div class="modal-actions">
           <button class="btn ghost" id="btn-af-done" data-i18n="btn.close"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== CONFIRM MODAL ===================== -->
+  <div class="modal hidden" id="cf-modal">
+    <div class="modal-card">
+      <div class="modal-title" id="cf-title"></div>
+      <div>
+        <p class="modal-text" id="cf-text"></p>
+        <div class="modal-actions">
+          <button class="btn" id="btn-cf-ok"></button>
+          <button class="btn ghost" id="btn-cf-cancel" data-i18n="btn.cancel"></button>
         </div>
       </div>
     </div>

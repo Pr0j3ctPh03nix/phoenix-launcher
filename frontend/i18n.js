@@ -15,6 +15,7 @@ const I18N = {
     "status.saved": "Settings saved",
     "detail.reading": "Reading the manifest…",
     "detail.installing": "Installing…",
+    "detail.dl": "Downloading {i}/{n} · {item}",
     "detail.reverting": "Reverting to stock…",
     "detail.launched": "Dota 2 is starting.",
     "detail.okMeta": "{version}",
@@ -86,6 +87,14 @@ const I18N = {
     "opt.hint": "Changes apply on the next install or update.",
     "ae.unsaved": "unsaved changes",
     "wn.loading": "Loading earlier versions…",
+    "wn.none": "No release notes yet.",
+
+    "cf.uninstallTitle": "Uninstall",
+    "cf.uninstallText": "Revert the game to stock? Every file Phoenix placed will be removed.",
+    "cf.uninstallConfirm": "Uninstall",
+    "cf.discardTitle": "Discard changes",
+    "cf.discardText": "autoexec.cfg has unsaved changes. Discard them?",
+    "cf.discardConfirm": "Discard",
   },
   ru: {
     "status.notChecked": "Не проверено",
@@ -99,6 +108,7 @@ const I18N = {
     "status.saved": "Настройки сохранены",
     "detail.reading": "Читаю манифест…",
     "detail.installing": "Устанавливаю…",
+    "detail.dl": "Скачиваю {i}/{n} · {item}",
     "detail.reverting": "Возвращаю к исходному…",
     "detail.launched": "Dota 2 запускается.",
     "detail.okMeta": "{version}",
@@ -170,6 +180,14 @@ const I18N = {
     "opt.hint": "Изменения применятся при следующей установке или обновлении.",
     "ae.unsaved": "есть несохранённые изменения",
     "wn.loading": "Загружаю предыдущие версии…",
+    "wn.none": "Примечания к выпускам отсутствуют.",
+
+    "cf.uninstallTitle": "Удаление",
+    "cf.uninstallText": "Вернуть игру к исходному состоянию? Все файлы, установленные Phoenix, будут удалены.",
+    "cf.uninstallConfirm": "Удалить",
+    "cf.discardTitle": "Отменить изменения",
+    "cf.discardText": "В autoexec.cfg есть несохранённые изменения. Отбросить их?",
+    "cf.discardConfirm": "Отбросить",
   },
 };
 

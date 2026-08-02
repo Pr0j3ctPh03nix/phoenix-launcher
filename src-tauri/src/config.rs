@@ -4,6 +4,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// On-disk schema version of settings.json. v1 = initial. Bump and extend `migrate` when the
+/// shape changes (e.g. a future `installs[]` for multi-install support).
+const SETTINGS_VERSION: u32 = 1;
 
 /// Baked default source repo. Settings override it (Advanced is hidden behind SHOW_ADVANCED in
 /// the frontend, so for now this is effectively fixed).
@@ -12,11 +17,16 @@ pub const DEFAULT_REPO: &str = "Pr0j3ctPh03nix/client-dist-staging";
 /// Read-only token for the private staging repo, injected at BUILD time:
 ///     PHOENIX_BAKED_TOKEN=github_pat_... bun run tauri build
 /// Deliberately not a source literal — a committed github_pat_ gets blocked/revoked by GitHub
-/// secret scanning on push. A user-saved token still wins over this.
+/// secret scanning on push. A user-saved token still wins over this. Merged at the point of
+/// use (`Settings::token()`), never into the persisted struct — a settings save must not be
+/// able to write the baked token to disk.
 const BAKED_TOKEN: Option<&str> = option_env!("PHOENIX_BAKED_TOKEN");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
+    /// Settings schema version (see SETTINGS_VERSION).
+    #[serde(default = "default_version")]
+    pub version: u32,
     /// `owner/name` of the dist repo whose Releases we install from.
     #[serde(default = "default_repo")]
     pub source_repo: String,
@@ -40,6 +50,10 @@ pub struct Settings {
     pub selections: BTreeMap<String, serde_json::Value>,
 }
 
+fn default_version() -> u32 {
+    SETTINGS_VERSION
+}
+
 fn default_repo() -> String {
     DEFAULT_REPO.to_string()
 }
@@ -51,6 +65,7 @@ fn default_renderer() -> String {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            version: SETTINGS_VERSION,
             source_repo: default_repo(),
             game_dir: None,
             token: None,
@@ -69,24 +84,41 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        let mut s = Self::load_raw();
-        if s.token.is_none() {
-            s.token = BAKED_TOKEN.map(String::from);
-        }
-        s
-    }
-
-    fn load_raw() -> Self {
         let Some(p) = Self::config_path() else { return Self::default() };
         let Ok(text) = std::fs::read_to_string(&p) else { return Self::default() };
-        match serde_json::from_str(&text) {
+        let mut s: Self = match serde_json::from_str(&text) {
             Ok(s) => s,
             Err(_) => {
                 // corrupt file: preserve it before defaults get saved over it
                 let _ = std::fs::copy(&p, p.with_extension("json.bak"));
                 Self::default()
             }
+        };
+        s.migrate();
+        s
+    }
+
+    /// Bring an older on-disk schema up to SETTINGS_VERSION. No transformations yet — v1 is the
+    /// first schema; future bumps migrate fields here.
+    fn migrate(&mut self) {
+        if self.version < SETTINGS_VERSION {
+            self.version = SETTINGS_VERSION;
         }
+    }
+
+    /// Load → mutate → save, serialized process-wide so concurrent writers (today: commands;
+    /// later: background tasks) can't lose each other's changes.
+    pub fn update(mutate: impl FnOnce(&mut Self)) -> Result<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        let mut s = Self::load();
+        mutate(&mut s);
+        s.save()
+    }
+
+    /// The token to authenticate with: a user-saved token wins, else the build-time baked one.
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref().or(BAKED_TOKEN)
     }
 
     pub fn save(&self) -> Result<()> {

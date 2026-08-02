@@ -1,10 +1,13 @@
 //! The mutating install + uninstall.
 //!
 //! Install runs in two phases so a real game folder is never left half-updated:
+//!   0. interlock: if any file we're about to touch is locked (the game holds its loaded DLLs /
+//!      mmapped VPKs open), refuse with a typed GameRunning error — before downloading a byte;
 //!   1. obtain every changed file — from the local asset cache when its hash matches, else a
-//!      streaming download that is verified (sha256 + size) — and stage it on the same volume;
-//!      nothing under the game is touched yet;
-//!   2. commit: back up each existing target, atomically move the staged file into place, create
+//!      streaming download (a small pool fetches files in parallel; an interrupted .part is
+//!      resumed, never restarted) that is verified (sha256 + size) — and stage it on the same
+//!      volume; nothing under the game is touched yet;
+//!   2. commit: back up each existing target, atomically move the staged file in, create
 //!      winmm_orig.dll if needed, apply removals (manifest remove[] + orphaned option files),
 //!      write state. Any failure in phase 2 rolls back every step already taken.
 //!
@@ -17,14 +20,15 @@
 //!     stays empty and uninstall is a pure delete — but the machinery keeps it correct if that ever
 //!     changes.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::Settings;
+use crate::downloader::{Downloader, Release};
 use crate::manifest::{FileEntry, Manifest};
 use crate::state::{InstalledFile, InstalledState};
-use crate::{engine, github, verify};
+use crate::{engine, verify};
 
 const STAGING_DIR: &str = ".phoenix-staging";
 const BACKUP_DIR: &str = ".phoenix-backup";
@@ -89,9 +93,14 @@ struct CommitJob<'a> {
     manifest: &'a Manifest,
 }
 
-pub fn install(settings: &Settings, tag: Option<&str>) -> Result<InstallReport> {
+pub fn install(
+    settings: &Settings,
+    dl: &dyn Downloader,
+    tag: Option<&str>,
+    progress: engine::Progress,
+) -> Result<InstallReport> {
     let game_dir = settings.resolve_game_dir()?;
-    let (release, manifest) = engine::fetch(settings, tag)?;
+    let (release, manifest) = engine::fetch(settings, dl, tag)?;
 
     // Prior state distinguishes our files from genuine pre-existing ones, and remembers whether we
     // already created winmm_orig.dll.
@@ -129,30 +138,51 @@ pub fn install(settings: &Settings, tag: Option<&str>) -> Result<InstallReport> 
     seed_cache(&cache, &game_dir, &resolved, &statuses);
 
     if to_write.is_empty() && removals.is_empty() {
-        // nothing to change — still make sure every asset is cached for instant customization
-        prefetch_all(&cache, &release, &manifest, settings.token.as_deref());
+        // Nothing to change — but a missing/corrupt state file or a missing winmm_orig.dll must
+        // not lock this folder into "up to date yet not installed" forever: a no-op install
+        // still heals both (every resolved file hash-matches, so the set is provably ours to
+        // record). A heal failure rolls back whatever was created.
+        let mut committed = Vec::new();
+        let heal = ensure_winmm_orig(&game_dir, has_winmm(&resolved), &mut committed).and_then(
+            |winmm_orig| {
+                let created = prev_winmm_created || matches!(winmm_orig, WinmmOrig::Created);
+                write_state(&game_dir, &manifest, &resolved, created).map(|_| winmm_orig)
+            },
+        );
+        let winmm_orig = match heal {
+            Ok(w) => w,
+            Err(e) => {
+                rollback(&committed);
+                return Err(e.context("could not record the install state"));
+            }
+        };
+        // still make sure every asset is cached for instant customization
+        prefetch_all(&cache, dl, &release, &manifest);
         prune_cache(&cache, &manifest);
         return Ok(InstallReport {
             version: manifest.version.clone(),
             written: Vec::new(),
             removed: Vec::new(),
             up_to_date,
-            winmm_orig: WinmmOrig::NotNeeded,
+            winmm_orig,
         });
     }
 
-    // --- phase 1: obtain (cache-first, else streaming download) + stage (game untouched) ---
+    // --- interlock: fail fast when the game is running (phase 2 would roll back anyway) ---
+    probe_writable(&game_dir, to_write.iter().map(|fe| &fe.dest).chain(removals.iter()))?;
+
+    // --- phase 1a: obtain (cache-first, else parallel streaming download) — game untouched ---
     let staging = game_dir.join(STAGING_DIR);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).context("creating the staging directory")?;
+    obtain_all(&cache, dl, &release, &to_write, progress)?;
 
+    // --- phase 1b: stage locally (same volume, so the phase-2 move is atomic) ---
     let mut staged: Vec<(&FileEntry, PathBuf)> = Vec::new();
     for (i, fe) in to_write.iter().enumerate() {
-        let cpath =
-            obtain_to_cache(&cache, &release, settings.token.as_deref(), &fe.name, &fe.sha256, fe.size)?;
         // staged name is positional — asset names may repeat across dests
         let sp = staging.join(format!("s{i}"));
-        std::fs::copy(&cpath, &sp).with_context(|| format!("staging {}", fe.dest))?;
+        std::fs::copy(cache.join(&fe.sha256), &sp).with_context(|| format!("staging {}", fe.dest))?;
         staged.push((fe, sp));
     }
 
@@ -172,7 +202,7 @@ pub fn install(settings: &Settings, tag: Option<&str>) -> Result<InstallReport> 
             let _ = std::fs::remove_dir_all(&staging);
             // cache the remaining assets (unselected variants, disabled toggles) so flipping
             // customization later never waits on the network; failures fall back to on-demand
-            prefetch_all(&cache, &release, &manifest, settings.token.as_deref());
+            prefetch_all(&cache, dl, &release, &manifest);
             prune_cache(&cache, &manifest);
             Ok(InstallReport {
                 version: manifest.version.clone(),
@@ -212,7 +242,7 @@ fn commit(
         written.push(fe.dest.clone());
     }
 
-    let winmm_orig = ensure_winmm_orig(&ctx.game_dir, job.staged, committed)?;
+    let winmm_orig = ensure_winmm_orig(&ctx.game_dir, has_winmm(job.resolved), committed)?;
 
     // removals: back the file up (ours -> ephemeral, foreign -> vanilla store), and if a vanilla
     // original was preserved for the dest, put it back so the game returns to stock there
@@ -236,22 +266,173 @@ fn commit(
     }
 
     let winmm_orig_created = ctx.prev_winmm_created || matches!(winmm_orig, WinmmOrig::Created);
+    write_state(&ctx.game_dir, job.manifest, job.resolved, winmm_orig_created)?;
+
+    Ok((written, removed, winmm_orig))
+}
+
+/// Record the install: version + the resolved (effective) set (selected variants and enabled
+/// toggles included) + the winmm_orig lineage.
+fn write_state(
+    game_dir: &Path,
+    manifest: &Manifest,
+    resolved: &[FileEntry],
+    winmm_orig_created: bool,
+) -> Result<()> {
     let state = InstalledState {
-        version: job.manifest.version.clone(),
-        // the resolved (effective) set — includes selected variants and enabled toggles
-        files: job
-            .resolved
+        version: manifest.version.clone(),
+        files: resolved
             .iter()
             .map(|f| InstalledFile { dest: f.dest.clone(), sha256: f.sha256.clone() })
             .collect(),
         winmm_orig_created,
     };
-    state.save(&ctx.game_dir).context("writing install state")?;
+    state.save(game_dir).context("writing install state")
+}
 
-    Ok((written, removed, winmm_orig))
+/// Does the effective file set manage a winmm.dll (at any dest)?
+fn has_winmm(resolved: &[FileEntry]) -> bool {
+    resolved.iter().any(|fe| {
+        Path::new(&fe.dest)
+            .file_name()
+            .is_some_and(|n| n.eq_ignore_ascii_case("winmm.dll"))
+    })
+}
+
+/// Is this error "another process has the file"? std doesn't map sharing/lock violations to
+/// PermissionDenied reliably, so match the raw Windows codes too.
+fn is_in_use(e: &std::io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+    e.kind() == std::io::ErrorKind::PermissionDenied
+        || matches!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION))
+}
+
+/// Fail fast when the game is running: it holds managed files open (loaded DLLs, mmapped VPKs),
+/// so phase 2 would only roll back anyway — say "close the game" before downloading a byte.
+/// A file is "in use" when we can't even open it for write (opening without truncating touches
+/// nothing).
+fn probe_writable<'a>(game_dir: &Path, dests: impl Iterator<Item = &'a String>) -> Result<()> {
+    for dest in dests {
+        let target = game_dir.join(dest);
+        if !target.exists() {
+            continue;
+        }
+        match std::fs::OpenOptions::new().write(true).open(&target) {
+            Ok(_) => {}
+            Err(e) if is_in_use(&e) => {
+                return Err(anyhow!(engine::GameRunning(target)));
+            }
+            // other errors (read-only attribute, pending deletion, …) surface properly at their
+            // own step — the probe's only job is catching the running game early
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }
 
 // ---- asset cache ----
+
+/// How many files phase 1 fetches at once. Files are independent (content-addressed cache
+/// entries), so this is embarrassingly parallel; 4 keeps a slow link busy without hammering it.
+const DL_WORKERS: usize = 4;
+/// Byte-progress ticks are throttled to this granularity, so a fast link doesn't flood the UI
+/// with an event per 64 KiB chunk.
+const PROGRESS_GRAIN: u64 = 256 * 1024;
+
+/// Fetch every to-write file into the asset cache with a small worker pool. Errors fail the
+/// phase: the first error wins (remaining workers stop early; in-flight downloads finish — the
+/// .part they leave is resumed on the next run). Progress `current` counts COMPLETED files
+/// while `item`/`bytes` track whichever file ticked most recently.
+fn obtain_all(
+    cache: &Path,
+    dl: &dyn Downloader,
+    release: &Release,
+    to_write: &[&FileEntry],
+    progress: engine::Progress,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    // unique by sha256: two dests sharing one asset download once (the cache entry is shared)
+    let mut seen = HashSet::new();
+    let jobs: Vec<&FileEntry> =
+        to_write.iter().filter(|fe| seen.insert(fe.sha256.as_str())).copied().collect();
+    let total = jobs.len() as u64;
+
+    let next = AtomicUsize::new(0);
+    let done = AtomicU64::new(0);
+    let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
+    let sink = progress.map(Mutex::new);
+    let report = |p: engine::OpProgress| {
+        if let Some(m) = &sink {
+            (m.lock().unwrap())(p);
+        }
+    };
+
+    std::thread::scope(|s| {
+        for _ in 0..DL_WORKERS.min(jobs.len()) {
+            s.spawn(|| loop {
+                if first_err.lock().unwrap().is_some() {
+                    return;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= jobs.len() {
+                    return;
+                }
+                let fe = jobs[i];
+                let item = fe.dest.clone();
+                report(engine::OpProgress {
+                    op: "install",
+                    current: done.load(Ordering::Relaxed),
+                    total,
+                    item: Some(item.clone()),
+                    bytes_done: None,
+                    bytes_total: None,
+                });
+                let mut last = 0u64;
+                let mut chunk = |d: u64, t: Option<u64>| {
+                    if d - last >= PROGRESS_GRAIN || t == Some(d) {
+                        last = d;
+                        report(engine::OpProgress {
+                            op: "install",
+                            current: done.load(Ordering::Relaxed),
+                            total,
+                            item: Some(item.clone()),
+                            bytes_done: Some(d),
+                            bytes_total: t,
+                        });
+                    }
+                };
+                match obtain_to_cache(cache, dl, release, &fe.name, &fe.sha256, fe.size, &mut chunk) {
+                    Ok(_) => {
+                        let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        report(engine::OpProgress {
+                            op: "install",
+                            current: d,
+                            total,
+                            item: Some(fe.dest.clone()),
+                            bytes_done: None,
+                            bytes_total: None,
+                        });
+                    }
+                    Err(e) => {
+                        let mut g = first_err.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.lock().unwrap().take() {
+        return Err(e);
+    }
+    Ok(())
+}
 
 /// Every downloadable asset in the manifest — core files, all choice variants, all toggle files —
 /// as (asset name, sha256, size).
@@ -292,11 +473,12 @@ fn cache_ok(cpath: &Path, sha256: &str, size: u64) -> bool {
 /// Path to a verified cache entry for an asset: cache hit, else streaming download + verify.
 fn obtain_to_cache(
     cache: &Path,
-    release: &github::Release,
-    token: Option<&str>,
+    dl: &dyn Downloader,
+    release: &Release,
     name: &str,
     sha256: &str,
     size: u64,
+    chunk: crate::downloader::ChunkProgress,
 ) -> Result<PathBuf> {
     let cpath = cache.join(sha256);
     if cache_ok(&cpath, sha256, size) {
@@ -306,16 +488,20 @@ fn obtain_to_cache(
         .asset(name)
         .with_context(|| format!("the release has no asset named {name}"))?;
     let tmp = cache.join(format!("{sha256}.part"));
-    let dl = github::download_asset_to(asset, token, &tmp)
+    // an interrupted attempt left a .part behind — resume from its length instead of restarting
+    let resume_from = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+    let got = dl
+        .download_to(asset, &tmp, resume_from, chunk)
         .with_context(|| format!("downloading {name}"));
-    let (got_size, got_sha) = match dl {
+    let (got_size, got_sha) = match got {
         Ok(v) => v,
         Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
+            // keep the .part — the next run resumes from it
             return Err(e);
         }
     };
     if got_size != size || got_sha != sha256 {
+        // wrong bytes (corrupt source or a poisoned .part): resume can't help — start over
         let _ = std::fs::remove_file(&tmp);
         bail!("verification failed for {name}: manifest {size}b/{sha256} got {got_size}b/{got_sha}");
     }
@@ -343,23 +529,27 @@ fn seed_cache(
 
 /// Download every not-yet-cached manifest asset. Best-effort: a failed asset is skipped (it will
 /// download on demand when actually selected) so an optional extra can't fail the install.
-fn prefetch_all(cache: &Path, release: &github::Release, manifest: &Manifest, token: Option<&str>) {
+fn prefetch_all(cache: &Path, dl: &dyn Downloader, release: &Release, manifest: &Manifest) {
     let mut seen = HashSet::new();
     for (name, sha256, size) in all_assets(manifest) {
-        if !seen.insert(sha256) || cache.join(sha256).exists() {
+        // cache_ok (not a bare exists) so a corrupt entry is evicted and re-downloaded here
+        // instead of blocking the prefetch until the asset is actually selected
+        if !seen.insert(sha256) || cache_ok(&cache.join(sha256), sha256, size) {
             continue;
         }
-        let _ = obtain_to_cache(cache, release, token, name, sha256, size);
+        let _ = obtain_to_cache(cache, dl, release, name, sha256, size, &mut |_, _| {});
     }
 }
 
-/// Drop cache entries the current manifest no longer references (stale hashes, leftover .part).
+/// Drop cache entries the current manifest no longer references (stale hashes). A referenced
+/// asset's leftover `.part` is KEPT — it's the resume source for an interrupted download.
 fn prune_cache(cache: &Path, manifest: &Manifest) {
     let keep: HashSet<&str> = all_assets(manifest).into_iter().map(|(_, sha, _)| sha).collect();
     if let Ok(rd) = std::fs::read_dir(cache) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
-            if !keep.contains(name.as_str()) {
+            let base = name.strip_suffix(".part").unwrap_or(&name);
+            if !keep.contains(base) {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -383,20 +573,16 @@ fn back_up(ctx: &Ctx, dest: &str, target: &Path) -> Result<PathBuf> {
     Ok(to)
 }
 
-/// If a winmm.dll was placed and winmm_orig.dll is absent, create it by COPYING the system winmm.dll.
-/// Never overwrite an existing winmm_orig.dll — overwriting it with our proxy would make the proxy's
-/// forwarders point at themselves.
+/// If a winmm.dll is managed and winmm_orig.dll is absent, create it by COPYING the system
+/// winmm.dll. Never overwrite an existing winmm_orig.dll — overwriting it with our proxy would
+/// make the proxy's forwarders point at themselves. Decided from the resolved set (not just the
+/// files written this run) so a no-op or partial install still heals a deleted winmm_orig.
 fn ensure_winmm_orig(
     game_dir: &Path,
-    staged: &[(&FileEntry, PathBuf)],
+    winmm_managed: bool,
     committed: &mut Vec<Committed>,
 ) -> Result<WinmmOrig> {
-    let placed_winmm = staged.iter().any(|(fe, _)| {
-        Path::new(&fe.dest)
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("winmm.dll"))
-    });
-    if !placed_winmm {
+    if !winmm_managed {
         return Ok(WinmmOrig::NotNeeded);
     }
 
@@ -445,6 +631,12 @@ pub fn uninstall(settings: &Settings) -> Result<UninstallReport> {
     let state = InstalledState::load(&game_dir)
         .context("nothing to uninstall (no .phoenix-state.json in the game folder)")?;
 
+    // same interlock as install — without it a locked file fails the delete loop halfway and
+    // leaves a half-reverted install (the game holds winmm_orig.dll open too, via the proxy)
+    let winmm: Vec<String> =
+        if state.winmm_orig_created { vec![WINMM_ORIG.to_string()] } else { Vec::new() };
+    probe_writable(&game_dir, state.files.iter().map(|f| &f.dest).chain(winmm.iter()))?;
+
     let vanilla_root = game_dir.join(VANILLA_DIR);
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
@@ -482,4 +674,282 @@ pub fn uninstall(settings: &Settings) -> Result<UninstallReport> {
     let _ = std::fs::remove_file(InstalledState::path(&game_dir));
 
     Ok(UninstallReport { version: state.version, restored, deleted, winmm_orig_removed })
+}
+
+#[cfg(test)]
+mod tests {
+    //! Golden-path install state-machine tests against temp dirs, served by the in-memory
+    //! downloader fake — no network, no real game folder.
+    use super::*;
+    use crate::downloader::fake::Fake;
+    use sha2::Digest;
+
+    fn sha(b: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(b))
+    }
+
+    fn tempdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("phoenix-install-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn settings(dir: &Path) -> Settings {
+        Settings { game_dir: Some(dir.to_path_buf()), ..Default::default() }
+    }
+
+    fn file_json(name: &str, dest: &str, bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!({ "name": name, "dest": dest, "sha256": sha(bytes), "size": bytes.len() })
+    }
+
+    /// The canonical test release: a winmm.dll + one content file.
+    fn basic_release() -> (String, Vec<(&'static str, &'static [u8])>) {
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [
+                file_json("winmm.dll", "game/bin/win64/winmm.dll", b"dll"),
+                file_json("a.vpk", "game/dota/a.vpk", b"vpk"),
+            ]
+        })
+        .to_string();
+        (m, vec![("winmm.dll", b"dll"), ("a.vpk", b"vpk")])
+    }
+
+    #[test]
+    fn fresh_install_writes_files_state_and_winmm_orig() {
+        let dir = tempdir("fresh");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        let r = install(&settings(&dir), &dl, None, None).unwrap();
+
+        assert_eq!(r.written.len(), 2);
+        assert_eq!(r.winmm_orig, WinmmOrig::Created);
+        assert_eq!(std::fs::read(dir.join("game/bin/win64/winmm.dll")).unwrap(), b"dll");
+        assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
+        assert!(dir.join(WINMM_ORIG).exists());
+        let st = InstalledState::load(&dir).unwrap();
+        assert_eq!(st.version, "1.0.0");
+        assert_eq!(st.files.len(), 2);
+        assert!(st.winmm_orig_created);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn noop_install_heals_a_missing_state_file() {
+        let dir = tempdir("heal");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None).unwrap();
+        // lose the state file — the folder is now "up to date but not installed"
+        std::fs::remove_file(InstalledState::path(&dir)).unwrap();
+        assert!(InstalledState::load(&dir).is_none());
+
+        let r = install(&settings(&dir), &dl, None, None).unwrap();
+        assert!(r.written.is_empty() && r.removed.is_empty());
+        assert_eq!(r.up_to_date, 2);
+        // healed: state rewritten. winmm_orig already existed, and with the state lost we can no
+        // longer prove WE created it — so the lineage conservatively records false: a later
+        // uninstall leaves it in place rather than risk deleting a user's own winmm_orig.dll.
+        let st = InstalledState::load(&dir).unwrap();
+        assert_eq!(st.files.len(), 2);
+        assert!(!st.winmm_orig_created);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deselected_toggle_file_is_removed_on_next_install() {
+        let dir = tempdir("orphan");
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ file_json("a.vpk", "game/dota/a.vpk", b"vpk") ],
+            "options": [
+                { "id": "fx", "kind": "toggle", "label": "FX", "default": false,
+                  "files": [ file_json("fx.vpk", "game/dota/fx.vpk", b"fx") ] }
+            ]
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]);
+
+        let mut s = settings(&dir);
+        s.selections.insert("fx".into(), serde_json::json!(true));
+        install(&s, &dl, None, None).unwrap();
+        assert!(dir.join("game/dota/fx.vpk").exists());
+
+        s.selections.insert("fx".into(), serde_json::json!(false));
+        let r = install(&s, &dl, None, None).unwrap();
+        assert_eq!(r.removed, vec!["game/dota/fx.vpk".to_string()]);
+        assert!(!dir.join("game/dota/fx.vpk").exists());
+        let st = InstalledState::load(&dir).unwrap();
+        assert!(!st.files.iter().any(|f| f.dest == "game/dota/fx.vpk"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn uninstall_reverts_to_stock() {
+        let dir = tempdir("uninstall");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None).unwrap();
+
+        let r = uninstall(&settings(&dir)).unwrap();
+        assert_eq!(r.deleted.len(), 2);
+        assert!(r.winmm_orig_removed);
+        assert!(!dir.join("game/bin/win64/winmm.dll").exists());
+        assert!(!dir.join("game/dota/a.vpk").exists());
+        assert!(!dir.join(WINMM_ORIG).exists());
+        assert!(InstalledState::load(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_download_fails_and_touches_nothing() {
+        let dir = tempdir("corrupt");
+        // manifest claims a hash the served bytes don't have
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ { "name": "a.vpk", "dest": "game/dota/a.vpk",
+                         "sha256": "ff".repeat(32), "size": 3 } ]
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]);
+
+        assert!(install(&settings(&dir), &dl, None, None).is_err());
+        assert!(!dir.join("game/dota/a.vpk").exists());
+        assert!(InstalledState::load(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn many_files_install_through_the_worker_pool() {
+        let dir = tempdir("pool");
+        let names = ["f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8"];
+        let files: Vec<serde_json::Value> = names
+            .iter()
+            .map(|n| file_json(&format!("{n}.vpk"), &format!("game/dota/{n}.vpk"), n.as_bytes()))
+            .collect();
+        let m = serde_json::json!({ "version": "1.0.0", "files": files }).to_string();
+        let owned: Vec<(String, Vec<u8>)> =
+            names.iter().map(|n| (format!("{n}.vpk"), n.as_bytes().to_vec())).collect();
+        let assets: Vec<(&str, &[u8])> =
+            owned.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+        let dl = Fake::new("v1.0.0", &m, assets);
+
+        let r = install(&settings(&dir), &dl, None, None).unwrap();
+        assert_eq!(r.written.len(), 8);
+        for n in names {
+            assert_eq!(std::fs::read(dir.join(format!("game/dota/{n}.vpk"))).unwrap(), n.as_bytes());
+        }
+        assert_eq!(InstalledState::load(&dir).unwrap().files.len(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A downloader whose first download_to dies mid-stream; the next call must resume from the
+    /// .part it left behind (asserted inside).
+    struct CutOnce {
+        inner: Fake,
+        cut: usize,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::downloader::Downloader for CutOnce {
+        fn fetch_release(&self, repo: &str, tag: Option<&str>) -> Result<crate::downloader::Release> {
+            self.inner.fetch_release(repo, tag)
+        }
+        fn fetch_releases(&self, repo: &str) -> Result<Vec<crate::downloader::Release>> {
+            self.inner.fetch_releases(repo)
+        }
+        fn download(&self, asset: &crate::downloader::Asset) -> Result<Vec<u8>> {
+            self.inner.download(asset)
+        }
+        fn download_to(
+            &self,
+            asset: &crate::downloader::Asset,
+            dest: &Path,
+            resume_from: u64,
+            _progress: crate::downloader::ChunkProgress,
+        ) -> Result<(u64, String)> {
+            use std::sync::atomic::Ordering;
+            let bytes = self.download(asset)?;
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                assert_eq!(resume_from, 0, "first attempt must start fresh");
+                std::fs::write(dest, &bytes[..self.cut])?;
+                anyhow::bail!("simulated dropped connection");
+            }
+            // the engine must resume from exactly what the interrupted attempt wrote
+            assert_eq!(resume_from as usize, self.cut);
+            let mut out = std::fs::read(dest)?;
+            out.extend_from_slice(&bytes[out.len()..]);
+            std::fs::write(dest, &out)?;
+            Ok((out.len() as u64, sha(&out)))
+        }
+    }
+
+    #[test]
+    fn an_interrupted_download_resumes_instead_of_restarting() {
+        let dir = tempdir("resume");
+        let big: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ file_json("big.vpk", "game/dota/big.vpk", &big) ]
+        })
+        .to_string();
+        let dl = CutOnce {
+            inner: Fake::new("v1.0.0", &m, vec![("big.vpk", &big)]),
+            cut: 40_000,
+            failed: false.into(),
+        };
+
+        // first run: dies mid-download, touches nothing but the resumable .part
+        assert!(install(&settings(&dir), &dl, None, None).is_err());
+        assert!(!dir.join("game/dota/big.vpk").exists());
+        assert!(dir.join(CACHE_DIR).join(format!("{}.part", sha(&big))).exists());
+
+        // second run: resumes the .part (asserted inside CutOnce) and completes
+        let r = install(&settings(&dir), &dl, None, None).unwrap();
+        assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
+        assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_locked_target_fails_with_game_running_before_downloading() {
+        let dir = tempdir("locked");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None).unwrap();
+
+        // simulate the game holding winmm.dll open: no sharing allowed on our handle
+        use std::os::windows::fs::OpenOptionsExt;
+        let mut lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join("game/bin/win64/winmm.dll"))
+            .unwrap();
+
+        // a new release changes winmm.dll -> it becomes a write target -> the probe must refuse
+        let m2 = serde_json::json!({
+            "version": "1.0.1",
+            "files": [
+                file_json("winmm.dll", "game/bin/win64/winmm.dll", b"dll2"),
+                file_json("a.vpk", "game/dota/a.vpk", b"vpk"),
+            ]
+        })
+        .to_string();
+        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2"), ("a.vpk", b"vpk")]);
+        let err = install(&settings(&dir), &dl2, None, None).unwrap_err();
+        assert!(
+            err.chain().any(|c| c.downcast_ref::<engine::GameRunning>().is_some()),
+            "expected GameRunning in the error chain, got: {err:#}"
+        );
+        // and nothing was replaced while the "game" held the file — verified through the lock
+        // handle itself (a second open would violate our own share(0))
+        use std::io::Read as _;
+        let mut buf = Vec::new();
+        lock.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"dll");
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
