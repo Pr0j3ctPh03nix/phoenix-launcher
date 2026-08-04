@@ -10,8 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
-static FILE_HASHES: LazyLock<Mutex<HashMap<PathBuf, (u64, SystemTime, String)>>> =
-    LazyLock::new(Default::default);
+/// Memo entry: (size, mtime, hex sha256).
+type HashMemo = HashMap<PathBuf, (u64, SystemTime, String)>;
+
+static FILE_HASHES: LazyLock<Mutex<HashMemo>> = LazyLock::new(Default::default);
 
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut f = std::fs::File::open(path)?;

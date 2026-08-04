@@ -186,6 +186,7 @@ body {
 }
 .files { list-style: none; }
 .files li {
+  position: relative;
   display: flex; align-items: center; gap: 0.75rem; height: 2.5rem;
   border-bottom: 1px solid var(--line-soft);
 }
@@ -198,6 +199,21 @@ body {
 .fstate.update  { color: var(--gold-soft); }
 .fstate.install { color: var(--gold-soft); }
 .fstate.remove  { color: var(--terra); }
+.fstate.dl      { color: var(--gold-soft); font-family: "Mono", monospace; font-weight: 500; letter-spacing: 0; }
+
+/* Per-file download bar: a hairline riding the li's bottom edge, hidden until that file's first
+   op-progress tick reveals it. Downloads run in parallel — each li fills independently. */
+.fbar {
+  position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  overflow: hidden; opacity: 0; transition: opacity 0.2s ease;
+}
+.files li.dl .fbar { opacity: 1; }
+.fbar-fill {
+  display: block; height: 100%; width: 0;
+  background: var(--gold); box-shadow: 0 0 8px rgba(201, 168, 106, 0.5);
+  transition: width 0.2s ease;
+}
+.files li.done .fbar-fill { background: var(--verd); box-shadow: 0 0 8px rgba(98, 208, 180, 0.5); }
 
 /* ---- actions ---- */
 /* No rule above the footer. The file list already closes itself with its own last hairline,
@@ -250,7 +266,12 @@ body {
 .field { display: flex; flex-direction: column; gap: 0.5rem; }
 .label { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase; color: var(--text-dim); }
 .hint { font-size: 0.71875rem; color: var(--text-mute); }
-.hint code { font-family: "Mono", monospace; color: var(--gold-soft); }
+/* inline code chips: mono on a quiet plate, like the notes' snippets */
+.label code, .hint code {
+  font-family: "Mono", monospace; font-size: 0.9em; color: var(--gold-soft);
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: 0.05rem 0.375rem;
+}
 .row { display: flex; gap: 0.5rem; }
 input[type="text"], input[type="password"] {
   width: 100%; height: var(--ctl-h); padding: 0 0.875rem;

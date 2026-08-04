@@ -13,6 +13,20 @@ pub fn play() -> Result<(), CmdError> {
     launch::launch(&gd, &s.renderer, &s.launch_extra).map_err(CmdError::from)
 }
 
+/// Is the game currently running? The frontend polls this every few seconds: it shows an
+/// "in game" status while the game runs and re-plans once the game closes. Async so the
+/// settings read + write-probe stay off the main thread.
+#[tauri::command]
+pub async fn game_running() -> Result<bool, CmdError> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let s = Settings::load();
+        let gd = s.resolve_game_dir().map_err(CmdError::from)?;
+        Ok(launch::game_running(&gd))
+    })
+    .await
+    .map_err(CmdError::task)?
+}
+
 // ---- autoexec.cfg ----
 
 fn autoexec_path() -> Result<PathBuf, CmdError> {

@@ -12,9 +12,11 @@ const state = {
   primaryMode: "check", // "check" | "apply" | "play"
   hasToken: false,
   renderer: "dx11",
-  afTarget: null,      // "setup" | "settings" вЂ” where an autofind pick lands
+  afTarget: null,      // "setup" | "settings" — where an autofind pick lands
   afUnlisten: null,
   aeDirty: false,
+  gameRunning: false,  // polled — the game is currently running
+  fileEls: new Map(),  // dest -> its <li> in the managed-files list (keyed for live dl bars)
 };
 
 // ---- markdown-lite: the notes are trusted (our own manifest) but escape anyway, then apply the
@@ -107,10 +109,18 @@ function statusFor(v) {
 function renderPrimary() {
   const p = $("btn-primary");
   const c = $("btn-check");
+  // busy wins over "in game": a running op keeps everything locked either way
   if (state.busy) {
     p.textContent = t("status.working");
     p.disabled = true;
     c.disabled = true;
+  } else if (state.gameRunning && state.primaryMode !== "check") {
+    // the game is up: nothing mutating is offered (the backend interlock backs this up);
+    // check stays available — it's read-only. In "check" mode the primary IS the check
+    // button, so it falls through to the normal branch and stays clickable.
+    p.textContent = t("btn.ingame");
+    p.disabled = true;
+    c.disabled = false;
   } else {
     const label = { check: "btn.check", play: "btn.play", apply: state.lastCheck?.installed ? "btn.update" : "btn.install" }[state.primaryMode];
     p.textContent = t(label);
@@ -122,31 +132,48 @@ function renderPrimary() {
 
   const u = $("btn-uninstall");
   u.classList.toggle("hidden", !state.lastCheck?.canUninstall);
-  u.disabled = state.busy;
+  u.disabled = state.busy || state.gameRunning;
   $("btn-customize").disabled = state.busy;
   $("btn-settings").disabled = state.busy;
 }
 
-function applyCheck(v) {
-  state.lastCheck = v;
-  const [word, kind, detail] = statusFor(v);
-  setStatus(word, kind, detail);
-
+// Rebuild the managed-files list from a CheckView. Separate from applyCheck so a failed apply
+// can reset half-filled bars / "N MB" states without touching the (error) status line.
+function renderFiles(v) {
   const ul = $("files");
   ul.innerHTML = "";
+  state.fileEls.clear();
   for (const f of v.files) {
     const li = document.createElement("li");
+    li.dataset.dest = f.dest;
     const path = document.createElement("span");
     path.className = "fpath";
     path.textContent = f.dest;
     const st = document.createElement("span");
     st.className = "fstate " + f.status;
     st.textContent = t("fstate." + f.status);
-    li.append(path, st);
+    // files that will be fetched (update/install) carry a hairline bar, revealed + filled live
+    // from op-progress ticks during apply (downloads run in parallel — one bar each)
+    const bar = document.createElement("span");
+    bar.className = "fbar";
+    bar.innerHTML = '<span class="fbar-fill"></span>';
+    li.append(path, st, bar);
     ul.append(li);
+    state.fileEls.set(f.dest, li);
   }
   $("files-empty").style.display = v.files.length ? "none" : "flex";
   $("files-count").textContent = v.changes === 0 ? t("files.allCurrent") : t("files.toChange", { n: v.changes });
+}
+
+function applyCheck(v) {
+  state.lastCheck = v;
+  // a check completing while the game runs must not overwrite the "in game" status
+  const [word, kind, detail] = state.gameRunning
+    ? [t("status.ingame"), "ok", t("detail.ingame")]
+    : statusFor(v);
+  setStatus(word, kind, detail);
+
+  renderFiles(v);
 
   const pl = $("game-path");
   pl.textContent = v.gameDir;
@@ -196,20 +223,40 @@ async function doReplan() {
 async function doApply() {
   state.busy = true; renderPrimary();
   setStatus(t("status.working"), "busy", t("detail.installing"));
-  // the engine streams phase-1 progress as op-progress events: "file k of n · path · MB/MB"
+  // the engine streams phase-1 progress as op-progress events; downloads run in parallel, so
+  // ticks for different files interleave. The header shows the completed/total count; each file's
+  // own bar (keyed by dest in state.fileEls) fills from its byte ticks.
   let unlisten = null;
   try {
     unlisten = await listen("op-progress", (ev) => {
       const p = ev.payload;
-      if (p.op !== "install" || !p.item) return;
-      let d = t("detail.dl", { i: p.current, n: p.total, item: p.item });
-      if (p.bytesTotal) d += ` · ${(p.bytesDone / 1048576).toFixed(1)}/${(p.bytesTotal / 1048576).toFixed(1)} MB`;
-      setStatus(t("status.working"), "busy", d);
+      if (p.op !== "install") return;
+      setStatus(t("status.working"), "busy", t("detail.dl", { i: p.current, n: p.total }));
+      if (!p.item) return;
+      const li = state.fileEls.get(p.item);
+      if (!li) return;
+      li.classList.add("dl");
+      const fill = li.querySelector(".fbar-fill");
+      const st = li.querySelector(".fstate");
+      if (p.done) {
+        li.classList.add("done");
+        if (fill) fill.style.width = "100%";
+        st.className = "fstate ok";
+        st.textContent = t("fstate.ok");
+      } else if (p.bytesTotal) {
+        const pct = Math.min(100, (p.bytesDone / p.bytesTotal) * 100);
+        if (fill) fill.style.width = pct.toFixed(1) + "%";
+        st.className = "fstate dl";
+        st.textContent = `${(p.bytesDone / 1048576).toFixed(1)}/${(p.bytesTotal / 1048576).toFixed(1)} MB`;
+      }
     });
     await invoke("apply");
     await doCheck(); // refresh -> up to date, Play unlocks
   } catch (e) {
     onError(e);
+    // reset half-filled bars / "N MB" states to the last known plan (the status line keeps
+    // showing the error — renderFiles doesn't touch it)
+    if (state.lastCheck) renderFiles(state.lastCheck);
     state.busy = false; renderPrimary();
   } finally {
     if (unlisten) unlisten();
@@ -246,6 +293,32 @@ function onPrimary() {
   if (state.primaryMode === "apply") doApply();
   else if (state.primaryMode === "play") doPlay();
   else doCheck();
+}
+
+// ---- game tracking ----
+// Poll the game process; transitions drive the status: "in game" while it runs (Play and
+// Uninstall locked), and one re-plan when it closes — files may have changed (a patch, a
+// verify, a crash mid-write).
+async function pollGame() {
+  let running;
+  try {
+    running = await invoke("game_running");
+  } catch (e) {
+    return; // keep the previous state; next tick retries
+  }
+  if (running === state.gameRunning) return;
+  state.gameRunning = running;
+  renderPrimary();
+  if (running) {
+    // never stomp a running op's status line; it re-renders on its next tick anyway
+    if (!state.busy) setStatus(t("status.ingame"), "ok", t("detail.ingame"));
+  } else if (!state.busy) {
+    // re-diff locally against the cached manifest: no network (closing the game while offline
+    // must not flip "Up to date" into a network error) and no busy flicker. Without a prior
+    // check there is nothing cached — fall back to the full check.
+    if (state.lastCheck) doReplan();
+    else doCheck();
+  }
 }
 
 // ---- language ----
@@ -776,6 +849,8 @@ requestAnimationFrame(() =>
       } else {
         doCheck(); // auto-check on launch
       }
+      pollGame(); // start tracking the game
+      setInterval(pollGame, 3000);
     }, 500);
   })
 );

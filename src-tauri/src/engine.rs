@@ -31,6 +31,10 @@ pub struct OpProgress {
     /// Bytes of the current item done / total, when it's a download.
     pub bytes_done: Option<u64>,
     pub bytes_total: Option<u64>,
+    /// True on the tick that finishes `item` (its bar is now complete). Downloads run in
+    /// parallel, so ticks for different items interleave — the UI keys per-file state on `item`
+    /// and uses this to settle a bar rather than inferring completion from `current`.
+    pub done: bool,
 }
 
 /// Optional progress sink; `None` = headless (CLI, tests). Must be Send + Sync: phase-1

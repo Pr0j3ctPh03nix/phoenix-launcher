@@ -21,21 +21,24 @@
 //!     changes.
 
 use anyhow::{anyhow, bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{LazyLock, Mutex};
 
 use crate::config::Settings;
 use crate::downloader::{Downloader, Release};
 use crate::manifest::{FileEntry, Manifest};
 use crate::state::{InstalledFile, InstalledState};
-use crate::{engine, verify};
+use crate::{engine, fslock, verify};
 
 const STAGING_DIR: &str = ".phoenix-staging";
 const BACKUP_DIR: &str = ".phoenix-backup";
 const VANILLA_DIR: &str = ".phoenix-vanilla";
 /// Content-addressed asset cache (file name = sha256). Every manifest asset — including unselected
-/// variants and disabled toggles — is prefetched here after a successful install, so a later
-/// customization change never re-downloads. Pruned to the current manifest, deleted on uninstall.
+/// variants and disabled toggles — lands here via `warm_cache` (run detached by the shell after a
+/// successful install), so a later customization change never re-downloads. Pruned to the current
+/// manifest, deleted on uninstall.
 const CACHE_DIR: &str = ".phoenix-cache";
 const WINMM_ORIG: &str = "game/bin/win64/winmm_orig.dll";
 
@@ -100,6 +103,9 @@ pub fn install(
     progress: engine::Progress,
 ) -> Result<InstallReport> {
     let game_dir = settings.resolve_game_dir()?;
+    // a (re)install legitimizes cache warming again after an uninstall cancelled it — cleared
+    // here (not in warm_cache) so an uninstall racing a just-spawned warm still wins
+    WARM_CANCEL.store(false, Ordering::Relaxed);
     let (release, manifest) = engine::fetch(settings, dl, tag)?;
 
     // Prior state distinguishes our files from genuine pre-existing ones, and remembers whether we
@@ -156,9 +162,8 @@ pub fn install(
                 return Err(e.context("could not record the install state"));
             }
         };
-        // still make sure every asset is cached for instant customization
-        prefetch_all(&cache, dl, &release, &manifest);
-        prune_cache(&cache, &manifest);
+        // cache warming is the caller's affair (warm_cache, backgroundable) — a heal must
+        // return as fast as it healed
         return Ok(InstallReport {
             version: manifest.version.clone(),
             written: Vec::new(),
@@ -200,10 +205,9 @@ pub fn install(
     match commit(&ctx, &job, &mut committed) {
         Ok((written, removed, winmm_orig)) => {
             let _ = std::fs::remove_dir_all(&staging);
-            // cache the remaining assets (unselected variants, disabled toggles) so flipping
-            // customization later never waits on the network; failures fall back to on-demand
-            prefetch_all(&cache, dl, &release, &manifest);
-            prune_cache(&cache, &manifest);
+            // caching the remaining assets (unselected variants, disabled toggles) is NOT done
+            // here — it can be hundreds of MB of optional content and must not hold the install
+            // result hostage. The shell runs warm_cache detached after this returns.
             Ok(InstallReport {
                 version: manifest.version.clone(),
                 written,
@@ -299,34 +303,13 @@ fn has_winmm(resolved: &[FileEntry]) -> bool {
     })
 }
 
-/// Is this error "another process has the file"? std doesn't map sharing/lock violations to
-/// PermissionDenied reliably, so match the raw Windows codes too.
-fn is_in_use(e: &std::io::Error) -> bool {
-    const ERROR_ACCESS_DENIED: i32 = 5;
-    const ERROR_SHARING_VIOLATION: i32 = 32;
-    const ERROR_LOCK_VIOLATION: i32 = 33;
-    e.kind() == std::io::ErrorKind::PermissionDenied
-        || matches!(e.raw_os_error(), Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION))
-}
-
 /// Fail fast when the game is running: it holds managed files open (loaded DLLs, mmapped VPKs),
 /// so phase 2 would only roll back anyway — say "close the game" before downloading a byte.
-/// A file is "in use" when we can't even open it for write (opening without truncating touches
-/// nothing).
 fn probe_writable<'a>(game_dir: &Path, dests: impl Iterator<Item = &'a String>) -> Result<()> {
     for dest in dests {
         let target = game_dir.join(dest);
-        if !target.exists() {
-            continue;
-        }
-        match std::fs::OpenOptions::new().write(true).open(&target) {
-            Ok(_) => {}
-            Err(e) if is_in_use(&e) => {
-                return Err(anyhow!(engine::GameRunning(target)));
-            }
-            // other errors (read-only attribute, pending deletion, …) surface properly at their
-            // own step — the probe's only job is catching the running game early
-            Err(_) => {}
+        if fslock::locked(&target) {
+            return Err(anyhow!(engine::GameRunning(target)));
         }
     }
     Ok(())
@@ -360,6 +343,12 @@ fn obtain_all(
     let jobs: Vec<&FileEntry> =
         to_write.iter().filter(|fe| seen.insert(fe.sha256.as_str())).copied().collect();
     let total = jobs.len() as u64;
+    // every dest that shares a job's hash — ticks fan out to all of them, so each UI file row
+    // gets its bar even when two dests share one asset
+    let mut dests_of: HashMap<&str, Vec<&str>> = HashMap::new();
+    for fe in to_write {
+        dests_of.entry(fe.sha256.as_str()).or_default().push(fe.dest.as_str());
+    }
 
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
@@ -382,40 +371,35 @@ fn obtain_all(
                     return;
                 }
                 let fe = jobs[i];
-                let item = fe.dest.clone();
-                report(engine::OpProgress {
-                    op: "install",
-                    current: done.load(Ordering::Relaxed),
-                    total,
-                    item: Some(item.clone()),
-                    bytes_done: None,
-                    bytes_total: None,
-                });
+                let dests = &dests_of[fe.sha256.as_str()];
+                // size is known from the manifest, so a file's bar has its full extent from the
+                // very first tick — even before the transport reports Content-Length.
+                let size = fe.size;
+                let tick = |current: u64, bytes_done: u64, bytes_total: u64, is_done: bool| {
+                    for dest in dests {
+                        report(engine::OpProgress {
+                            op: "install",
+                            current,
+                            total,
+                            item: Some((*dest).to_string()),
+                            bytes_done: Some(bytes_done),
+                            bytes_total: Some(bytes_total),
+                            done: is_done,
+                        });
+                    }
+                };
+                tick(done.load(Ordering::Relaxed), 0, size, false);
                 let mut last = 0u64;
                 let mut chunk = |d: u64, t: Option<u64>| {
                     if d - last >= PROGRESS_GRAIN || t == Some(d) {
                         last = d;
-                        report(engine::OpProgress {
-                            op: "install",
-                            current: done.load(Ordering::Relaxed),
-                            total,
-                            item: Some(item.clone()),
-                            bytes_done: Some(d),
-                            bytes_total: t,
-                        });
+                        tick(done.load(Ordering::Relaxed), d, t.unwrap_or(size), false);
                     }
                 };
                 match obtain_to_cache(cache, dl, release, &fe.name, &fe.sha256, fe.size, &mut chunk) {
                     Ok(_) => {
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        report(engine::OpProgress {
-                            op: "install",
-                            current: d,
-                            total,
-                            item: Some(fe.dest.clone()),
-                            bytes_done: None,
-                            bytes_total: None,
-                        });
+                        tick(d, size, size, true);
                     }
                     Err(e) => {
                         let mut g = first_err.lock().unwrap();
@@ -470,6 +454,32 @@ fn cache_ok(cpath: &Path, sha256: &str, size: u64) -> bool {
     }
 }
 
+/// Hashes with a download in flight, process-wide: an apply and the background cache warm share
+/// the same `.part` path per hash — two concurrent writers would corrupt it.
+static INFLIGHT: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+
+/// Holds a hash's in-flight slot; blocks until it is free. Waiting is right for both callers:
+/// whoever got there first is downloading exactly the bytes the waiter wants — after the wait,
+/// the cache re-check hits.
+struct Inflight(String);
+
+impl Inflight {
+    fn acquire(sha256: &str) -> Self {
+        loop {
+            if INFLIGHT.lock().unwrap().insert(sha256.to_string()) {
+                return Self(sha256.to_string());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+}
+
+impl Drop for Inflight {
+    fn drop(&mut self) {
+        INFLIGHT.lock().unwrap().remove(&self.0);
+    }
+}
+
 /// Path to a verified cache entry for an asset: cache hit, else streaming download + verify.
 fn obtain_to_cache(
     cache: &Path,
@@ -481,6 +491,11 @@ fn obtain_to_cache(
     chunk: crate::downloader::ChunkProgress,
 ) -> Result<PathBuf> {
     let cpath = cache.join(sha256);
+    if cache_ok(&cpath, sha256, size) {
+        return Ok(cpath);
+    }
+    let _guard = Inflight::acquire(sha256);
+    // another thread may have finished this hash while we waited for the slot
     if cache_ok(&cpath, sha256, size) {
         return Ok(cpath);
     }
@@ -527,11 +542,49 @@ fn seed_cache(
     }
 }
 
+/// Set via `cancel_warm` so a background `warm_cache` in flight stops instead of recreating the
+/// cache dir an uninstall just deleted (checked between assets — one in-flight asset may still
+/// land; harmless residue at worst). Cleared by `install` (a (re)install legitimizes warming
+/// again).
+static WARM_CANCEL: AtomicBool = AtomicBool::new(false);
+
+/// Stop a background `warm_cache`. Callers that run `uninstall` while a warm may be in flight
+/// (the GUI shell) call this first; the engine's `uninstall` itself stays flag-free so headless
+/// runs and tests are unaffected by process-global state.
+pub fn cancel_warm() {
+    WARM_CANCEL.store(true, Ordering::Relaxed);
+}
+
+/// Warm the asset cache: download every manifest asset not yet cached — unselected variants,
+/// disabled toggles — so flipping customization later never waits on the network, then prune
+/// entries the manifest no longer references. Fetches the release itself (one API round trip)
+/// so the shell can run it DETACHED after `install` returns — optional content, possibly
+/// hundreds of MB, must never hold the install result hostage. Entirely best-effort: any
+/// failure just means on-demand download later.
+pub fn warm_cache(settings: &Settings, dl: &dyn Downloader) {
+    let Ok(game_dir) = settings.resolve_game_dir() else { return };
+    let Ok((release, manifest)) = engine::fetch(settings, dl, None) else { return };
+    if WARM_CANCEL.load(Ordering::Relaxed) {
+        return;
+    }
+    let cache = game_dir.join(CACHE_DIR);
+    if std::fs::create_dir_all(&cache).is_err() {
+        return;
+    }
+    prefetch_all(&cache, dl, &release, &manifest);
+    if !WARM_CANCEL.load(Ordering::Relaxed) {
+        prune_cache(&cache, &manifest);
+    }
+}
+
 /// Download every not-yet-cached manifest asset. Best-effort: a failed asset is skipped (it will
-/// download on demand when actually selected) so an optional extra can't fail the install.
+/// download on demand when actually selected) so an optional extra can't fail the warm.
 fn prefetch_all(cache: &Path, dl: &dyn Downloader, release: &Release, manifest: &Manifest) {
     let mut seen = HashSet::new();
     for (name, sha256, size) in all_assets(manifest) {
+        if WARM_CANCEL.load(Ordering::Relaxed) {
+            return;
+        }
         // cache_ok (not a bare exists) so a corrupt entry is evicted and re-downloaded here
         // instead of blocking the prefetch until the asset is actually selected
         if !seen.insert(sha256) || cache_ok(&cache.join(sha256), sha256, size) {
@@ -782,6 +835,30 @@ mod tests {
         assert!(!dir.join("game/dota/fx.vpk").exists());
         let st = InstalledState::load(&dir).unwrap();
         assert!(!st.files.iter().any(|f| f.dest == "game/dota/fx.vpk"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn warm_cache_prefetches_unselected_assets() {
+        let dir = tempdir("warm");
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ file_json("a.vpk", "game/dota/a.vpk", b"vpk") ],
+            "options": [
+                { "id": "fx", "kind": "toggle", "label": "FX", "default": false,
+                  "files": [ file_json("fx.vpk", "game/dota/fx.vpk", b"fx") ] }
+            ]
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]);
+        let s = settings(&dir);
+        install(&s, &dl, None, None).unwrap();
+
+        // install itself no longer prefetches the disabled toggle's asset...
+        assert!(!dir.join(CACHE_DIR).join(sha(b"fx")).exists());
+        // ...the detached warm does
+        warm_cache(&s, &dl);
+        assert!(dir.join(CACHE_DIR).join(sha(b"fx")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

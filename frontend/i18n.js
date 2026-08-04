@@ -12,10 +12,12 @@ const I18N = {
     "status.notInstalled": "Not installed",
     "status.error": "Error",
     "status.launched": "Launched",
+    "status.ingame": "In game",
+    "detail.ingame": "Dota 2 is running.",
     "status.saved": "Settings saved",
     "detail.reading": "Reading the manifest…",
     "detail.installing": "Installing…",
-    "detail.dl": "Downloading {i}/{n} · {item}",
+    "detail.dl": "Downloading files… {i}/{n} done",
     "detail.reverting": "Reverting to stock…",
     "detail.launched": "Dota 2 is starting.",
     "detail.okMeta": "{version}",
@@ -32,6 +34,7 @@ const I18N = {
 
     "btn.check": "Check for updates",
     "btn.play": "Play",
+    "btn.ingame": "In game",
     "btn.install": "Install",
     "btn.update": "Update",
     "btn.save": "Save changes",
@@ -56,7 +59,7 @@ const I18N = {
 
     "set.language": "Language",
     "set.gameFolder": "Game folder",
-    "set.gameHint": "The folder that contains game\\.",
+    "set.gameHint": "The folder that contains the folder `game`.",
     "set.launch": "Launch options",
     "set.launchHint": "Always passed. Add your own after.",
     "set.launchPh": "additional options",
@@ -105,10 +108,12 @@ const I18N = {
     "status.notInstalled": "Не установлено",
     "status.error": "Ошибка",
     "status.launched": "Запущено",
+    "status.ingame": "В игре",
+    "detail.ingame": "Dota 2 запущена.",
     "status.saved": "Настройки сохранены",
     "detail.reading": "Читаю манифест…",
     "detail.installing": "Устанавливаю…",
-    "detail.dl": "Скачиваю {i}/{n} · {item}",
+    "detail.dl": "Скачиваю файлы… готово {i}/{n}",
     "detail.reverting": "Возвращаю к исходному…",
     "detail.launched": "Dota 2 запускается.",
     "detail.okMeta": "{version}",
@@ -125,6 +130,7 @@ const I18N = {
 
     "btn.check": "Проверить обновления",
     "btn.play": "Играть",
+    "btn.ingame": "В игре",
     "btn.install": "Установить",
     "btn.update": "Обновить",
     "btn.save": "Сохранить",
@@ -149,7 +155,7 @@ const I18N = {
 
     "set.language": "Язык",
     "set.gameFolder": "Папка игры",
-    "set.gameHint": "Папка, содержащая game\\.",
+    "set.gameHint": "Папка, содержащая папку `game`.",
     "set.launch": "Параметры запуска",
     "set.launchHint": "Передаются всегда. Свои — после них.",
     "set.launchPh": "дополнительные параметры",
@@ -215,9 +221,33 @@ function mlabel(v) {
   return v[LANG] ?? v.en ?? Object.values(v)[0] ?? "";
 }
 
+/// Backtick-wrapped runs in a static string become inline <code> chips (built via DOM nodes —
+/// no HTML ever gets parsed). Only fully balanced backticks qualify (odd part count after the
+/// split); any unbalanced string renders as-is, backticks included, rather than silently
+/// dropping characters.
+function inlineCode(s) {
+  const parts = s.split("`");
+  if (parts.length < 3 || parts.length % 2 === 0) return null;
+  const frag = document.createDocumentFragment();
+  parts.forEach((p, i) => {
+    if (i % 2 === 1) {
+      const c = document.createElement("code");
+      c.textContent = p;
+      frag.append(c);
+    } else if (p) {
+      frag.append(document.createTextNode(p));
+    }
+  });
+  return frag;
+}
+
 /// Sweep static DOM strings.
 function applyStatic() {
-  for (const el of document.querySelectorAll("[data-i18n]")) el.textContent = t(el.dataset.i18n);
+  for (const el of document.querySelectorAll("[data-i18n]")) {
+    const s = t(el.dataset.i18n);
+    const frag = inlineCode(s);
+    if (frag) { el.textContent = ""; el.append(frag); } else el.textContent = s;
+  }
   for (const el of document.querySelectorAll("[data-i18n-ph]")) el.placeholder = t(el.dataset.i18nPh);
   for (const el of document.querySelectorAll("[data-i18n-title]")) {
     const s = t(el.dataset.i18nTitle);

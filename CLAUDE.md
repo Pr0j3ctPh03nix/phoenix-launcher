@@ -45,7 +45,10 @@ the target game build, by editing the dist repo + cutting a release — the upda
         install.rs        install (game-running interlock, 2-phase, parallel resumable
                           downloads, rollback, orphan removal) + uninstall; unit tests
         state.rs          per-install record, stored in the game folder (corrupt -> quarantine)
-        launch.rs         spawns dota2.exe with base options + renderer flag + user extras
+        fslock.rs         shared Windows lock probes: locked() (interlock, any can't-write)
+                          and held_by_process() (sharing violation only — game detection)
+        launch.rs         spawns dota2.exe (base options + renderer + extras) + game_running
+                          (write-probe of the exe image; a running process is locked)
         autofind.rs       game-folder scan: Steam libraries (registry/vdf) then all drives
       tauri.conf.json     window + bundle config
       capabilities/       Tauri 2 permissions
@@ -97,10 +100,18 @@ uninstall against a **decoy**, never a real game install.
   `is_in_use` matches the raw Windows codes (5/32/33).
 - **Downloads**: phase 1a fetches unique-by-hash files into the content-addressed cache with a
   4-worker pool (files are independent by construction); staging copies stay sequential so
-  commit is unchanged. An interrupted download keeps its `.part`; the next run resumes it via a
+  commit is unchanged. Progress ticks fan out to every dest sharing an asset hash (each UI row
+  gets its bar). An interrupted download keeps its `.part`; the next run resumes it via a
   Range request (the returned sha covers the whole file — the prefix is re-hashed). A hash
   mismatch deletes the `.part` (corrupt bytes can't resume). File-granularity resume comes free
   from the cache itself.
+- **Cache warm**: after a successful apply the shell runs `install::warm_cache` DETACHED — it
+  refetches the release (one API call) and prefetches every remaining manifest asset
+  (unselected variants, disabled toggles) so customization flips never wait on the network.
+  Optional content can be hundreds of MB, so it must never block the install result / Play
+  unlock. Best-effort throughout; uninstall stops it via `install::cancel_warm` (shell calls
+  it — the engine `uninstall` stays free of process-global state). A process-wide in-flight
+  hash guard stops a warm and an apply from writing the same `.part` concurrently.
 - **Settings** persist to the OS config dir (`directories` crate); the GitHub token is never sent
   back to the UI (only a `hasToken` flag, and it reflects a user-saved token only). The build-time
   baked token is merged at the point of use (`Settings::token()`), never into the persisted
@@ -118,12 +129,24 @@ uninstall against a **decoy**, never a real game install.
 - **Launch**: `play` runs `game/bin/win64/dota2.exe` with hardcoded
   `-insecure -console +exec autoexec.cfg` + `-dx11`/`-dx9` + user extras. Play is enabled in the
   UI only when installed with no pending changes; Check is always available.
+- **Game tracking**: the frontend polls the `game_running` command every 3 s (a write-probe of
+  the dota2.exe image via `fslock::held_by_process` — ONLY sharing/lock violations count, so a
+  read-only or ACL-denied exe is never mistaken for a running game). While the game runs the
+  status shows "In game" and Play/Uninstall are disabled (the backend interlock is the second
+  line); when in "check" mode the primary stays a live Check button (read-only is always
+  allowed). When the game closes, one offline `replan` refreshes the status — no network, so
+  closing the game while offline can't flip "Up to date" into an error (full `check` only when
+  nothing is cached yet).
 - **Autofind**: fast pass over Steam libraries (HKCU SteamPath + libraryfolders.vdf), then a
   bounded walk (depth 6, pruned system dirs) of all drives for `game/dota/steam.inf`; progress via
   the `autofind-progress` Tauri event, cancel via AtomicBool. Candidates carry their found
   ClientVersion purely as display info.
 - **First run**: setup view (Browse / Autofind) shows only when no game folder was ever chosen AND
   the exe's own dir has no `game/dota/steam.inf`; any picked folder is accepted without validation.
+- **Window state**: position + maximized persist across runs via `tauri-plugin-window-state`
+  (flags POSITION | MAXIMIZED only — size always resets to the config default, and visibility
+  is NOT persisted: hidden-until-first-paint stays frontend-managed). First run centers the
+  window (`center: true`); after that the saved spot wins, validated against connected monitors.
 - **i18n**: all labels derive in the frontend (it owns the language); Rust ships raw data + hints
   (`primary_action`, `can_play`, …). Engine error strings stay English (shown in the mono detail).
 - **check**: GitHub API → release (by tag or latest) → download `manifest.json` → sha256 each

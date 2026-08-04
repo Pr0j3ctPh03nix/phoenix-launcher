@@ -67,7 +67,18 @@ pub async fn apply(app: tauri::AppHandle) -> Result<InstallView, CmdError> {
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
         };
-        install::install(&settings, &dl, None, Some(&emit))
+        let report = install::install(&settings, &dl, None, Some(&emit));
+        if report.is_ok() {
+            // warm the asset cache (unselected variants, disabled toggles) DETACHED — optional
+            // content can be hundreds of MB and must not delay the install result / Play unlock.
+            // Best-effort by design; uninstall cancels it via install::cancel_warm.
+            tauri::async_runtime::spawn_blocking(|| {
+                let settings = Settings::load();
+                let dl = downloader(&settings);
+                install::warm_cache(&settings, &dl);
+            });
+        }
+        report
             .map(|r| InstallView {
                 version: r.version,
                 written: r.written,
@@ -89,6 +100,8 @@ pub async fn apply(app: tauri::AppHandle) -> Result<InstallView, CmdError> {
 #[tauri::command]
 pub async fn uninstall() -> Result<UninstallView, CmdError> {
     tauri::async_runtime::spawn_blocking(|| {
+        // a background cache warm may be running — stop it so it can't recreate .phoenix-cache
+        install::cancel_warm();
         let settings = Settings::load();
         install::uninstall(&settings)
             .map(|r| UninstallView {

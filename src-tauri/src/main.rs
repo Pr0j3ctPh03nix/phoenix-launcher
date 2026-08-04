@@ -15,6 +15,7 @@ mod cmd;
 mod config;
 mod downloader;
 mod engine;
+mod fslock;
 mod github;
 mod install;
 mod launch;
@@ -25,9 +26,19 @@ mod verify;
 mod views;
 
 use std::sync::Arc;
+use tauri_plugin_window_state::StateFlags;
 
 fn run_gui() {
     tauri::Builder::default()
+        // remember where the window was: position + maximized (the plugin itself validates the
+        // saved spot against the connected monitors and lets the OS decide if it's gone).
+        // Never SIZE (every run starts at the config size unless maximized) and never VISIBLE
+        // (hidden-until-first-paint is managed by the frontend).
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::POSITION | StateFlags::MAXIMIZED)
+                .build(),
+        )
         .manage(Arc::new(cmd::AppState::default()))
         .invoke_handler(tauri::generate_handler![
             cmd::settings::get_settings,
@@ -42,6 +53,7 @@ fn run_gui() {
             cmd::update::uninstall,
             cmd::notes::release_notes,
             cmd::launch::play,
+            cmd::launch::game_running,
             cmd::launch::read_autoexec,
             cmd::launch::save_autoexec,
             cmd::autofind::autofind_start,

@@ -55,6 +55,8 @@ pub fn run_install(flags: &[String]) -> Result<()> {
     let dl = Github::new(settings.token());
     let r = install::install(&settings, &dl, tag.as_deref(), None)?;
     println!("Installed {}: wrote {}, removed {}", r.version, r.written.len(), r.removed.len());
+    // headless: warm the customization cache synchronously (the GUI runs this detached)
+    install::warm_cache(&settings, &dl);
     Ok(())
 }
 

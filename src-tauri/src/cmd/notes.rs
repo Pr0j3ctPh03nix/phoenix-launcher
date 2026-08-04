@@ -39,7 +39,7 @@ pub async fn release_notes(
             .map(|c| c.tag_name.clone());
         let fresh = |c: &engine::NotesCache| {
             c.repo == settings.source_repo
-                && current_tag.as_ref().map_or(true, |t| *t == c.latest_tag)
+                && current_tag.as_ref().is_none_or(|t| *t == c.latest_tag)
         };
         // memory first, then disk (survives restarts); a stale same-repo cache still seeds the
         // incremental rebuild

@@ -76,7 +76,7 @@ impl<'a, F: FnMut(&Progress)> Scan<'a, F> {
 
     fn report(&mut self, current: &Path, force: bool) {
         self.scanned += 1;
-        if force || self.scanned % 128 == 0 {
+        if force || self.scanned.is_multiple_of(128) {
             (self.progress)(&Progress {
                 scanned: self.scanned,
                 current: current.display().to_string(),
