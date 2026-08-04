@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::config::Settings;
 use crate::launch;
-use crate::views::CmdError;
+use crate::views::{AutoexecView, CmdError};
 
 #[tauri::command]
 pub fn play() -> Result<(), CmdError> {
@@ -36,11 +36,21 @@ fn autoexec_path() -> Result<PathBuf, CmdError> {
 }
 
 #[tauri::command]
-pub fn read_autoexec() -> Result<String, CmdError> {
+pub fn read_autoexec() -> Result<AutoexecView, CmdError> {
     let p = autoexec_path()?;
-    match std::fs::read_to_string(&p) {
-        Ok(s) => Ok(s),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+    match std::fs::read(&p) {
+        Ok(bytes) => match String::from_utf8(bytes) {
+            Ok(content) => Ok(AutoexecView { content, lossy: false }),
+            // not UTF-8 (e.g. cp1251 comments): still show it, but flagged — the UI blocks
+            // saving so a lossy round-trip can never overwrite the user's real bytes
+            Err(e) => Ok(AutoexecView {
+                content: String::from_utf8_lossy(e.as_bytes()).into_owned(),
+                lossy: true,
+            }),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AutoexecView { content: String::new(), lossy: false })
+        }
         Err(e) => Err(CmdError::from(format!("reading {}: {e}", p.display()))),
     }
 }

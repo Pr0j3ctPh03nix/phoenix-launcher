@@ -425,6 +425,8 @@ input::placeholder { color: #4d4941; }
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .cand-build { font-size: 0.6875rem; font-weight: 600; color: var(--text-mute); margin-top: 0.1875rem; }
+/* scan-failure notice in the results stage (a failed scan must not read as "Nothing found") */
+#af-msg { margin-top: 0.875rem; }
 
 /* ---- customization ---- */
 /* the hint occupies the same head gap the other views use, so the first group starts on the

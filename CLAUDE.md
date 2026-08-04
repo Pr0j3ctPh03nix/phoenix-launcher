@@ -45,8 +45,8 @@ the target game build, by editing the dist repo + cutting a release — the upda
         install.rs        install (game-running interlock, 2-phase, parallel resumable
                           downloads, rollback, orphan removal) + uninstall; unit tests
         state.rs          per-install record, stored in the game folder (corrupt -> quarantine)
-        fslock.rs         shared Windows lock probes: locked() (interlock, any can't-write)
-                          and held_by_process() (sharing violation only — game detection)
+        fslock.rs         shared Windows lock probes: probe() -> Writable / Held (sharing
+                          violation = live process) / Denied (read-only, ACL) + held_by_process()
         launch.rs         spawns dota2.exe (base options + renderer + extras) + game_running
                           (write-probe of the exe image; a running process is locked)
         autofind.rs       game-folder scan: Steam libraries (registry/vdf) then all drives
@@ -86,7 +86,9 @@ uninstall against a **decoy**, never a real game install.
   (mirror, resumable downloads) slots in without engine changes.
 - **Error envelope**: every command fails with `CmdError {kind, message}` (views.rs). `kind` is
   classified from the anyhow chain (`network` / `auth` / `notFound` / `io` / `tooOld` /
-  `internal`); the frontend displays `message` today and can react to `kind` later.
+  `gameRunning` / `internal`); the frontend reacts to it — the status word is kind-specific
+  (Offline / No access / Launcher outdated / Game is running), the mono detail carries a
+  localized hint plus the raw engine message.
 - **Progress**: long engine ops emit `OpProgress` ticks through a `Progress` sink; the `apply`
   command forwards them to the webview as the `op-progress` event (`autofind` has its own
   `autofind-progress` event). CLI/tests pass `None`.
@@ -96,27 +98,39 @@ uninstall against a **decoy**, never a real game install.
 - **Game-running interlock**: install and uninstall first probe every file they're about to
   touch for write access (an open without truncating). A sharing violation means the game holds
   it open (loaded DLLs, mmapped VPKs) → typed `GameRunning` error, wire kind `gameRunning`,
-  before a single byte is downloaded. std does NOT map sharing violations to PermissionDenied —
-  `is_in_use` matches the raw Windows codes (5/32/33).
+  before a single byte is downloaded. Any OTHER can't-write (read-only attribute, ACL) is a
+  distinct permission error (wire kind `io`) — "close Dota 2" must never be the diagnosis for a
+  problem closing the game can't fix. std does NOT map sharing violations to PermissionDenied —
+  `is_in_use` matches the raw Windows codes (5/32/33). Install re-probes after phase 1: the game
+  may have started during a long download, and commit should fail typed and untouched, not
+  mid-way into a best-effort rollback.
 - **Downloads**: phase 1a fetches unique-by-hash files into the content-addressed cache with a
   4-worker pool (files are independent by construction); staging copies stay sequential so
   commit is unchanged. Progress ticks fan out to every dest sharing an asset hash (each UI row
-  gets its bar). An interrupted download keeps its `.part`; the next run resumes it via a
-  Range request (the returned sha covers the whole file — the prefix is re-hashed). A hash
-  mismatch deletes the `.part` (corrupt bytes can't resume). File-granularity resume comes free
-  from the cache itself.
+  gets its bar). The first failure aborts the sibling in-flight streams at their next chunk
+  (`ChunkProgress` returns bool; false = abort, partial kept) — a dead asset never waits minutes
+  for a huge neighbor to finish before surfacing. An interrupted download keeps its `.part`; the
+  next run resumes it via a Range request (the returned sha covers the whole file — the prefix
+  is re-hashed). A hash mismatch deletes the `.part` (corrupt bytes can't resume).
+  File-granularity resume comes free from the cache itself.
 - **Cache warm**: after a successful apply the shell runs `install::warm_cache` DETACHED — it
   refetches the release (one API call) and prefetches every remaining manifest asset
   (unselected variants, disabled toggles) so customization flips never wait on the network.
   Optional content can be hundreds of MB, so it must never block the install result / Play
   unlock. Best-effort throughout; uninstall stops it via `install::cancel_warm` (shell calls
-  it — the engine `uninstall` stays free of process-global state). A process-wide in-flight
-  hash guard stops a warm and an apply from writing the same `.part` concurrently.
+  it — the engine `uninstall` stays free of process-global state), which also aborts a
+  download mid-file via the chunk callback (a leftover `.part` at worst). A process-wide
+  in-flight hash guard stops a warm and an apply from writing the same `.part` concurrently.
 - **Settings** persist to the OS config dir (`directories` crate); the GitHub token is never sent
-  back to the UI (only a `hasToken` flag, and it reflects a user-saved token only). The build-time
-  baked token is merged at the point of use (`Settings::token()`), never into the persisted
-  struct — a settings save can't write it to disk. Also persisted: `language` (en/ru),
-  `launch_extra`, `renderer` (dx11/dx9), and `selections` (manifest option id -> variant id or bool).
+  back to the UI (only a `hasToken` flag, and it reflects a user-saved token only). A blank token
+  field keeps the saved one; removing it takes the explicit `clear_token` flag (the UI's Clear
+  button). The build-time baked token is merged at the point of use (`Settings::token()`), never
+  into the persisted struct — a settings save can't write it to disk. Also persisted: `language`
+  (en/ru), `launch_extra`, `renderer` (dx11/dx9), and `selections` (manifest option id -> variant
+  id or bool). Settings and the install state file are written temp+rename (atomic on the same
+  volume) — a crash mid-write can't torch them; the quarantine/.bak loaders stay last resorts.
+  Saving a change to the game folder, repo, or token invalidates the check view and re-checks —
+  Play must never act on a folder the visible status doesn't describe.
 - **Manifest options (v2)**: top-level `options[]` — `kind:"choice"` (N `variants` sharing one
   `dest`, `default` = variant id) and `kind:"toggle"` (`files[]` installed when on, `default` =
   bool). Labels are plain strings or `{"en":…,"ru":…}` maps. `engine::resolve()` materializes the
@@ -125,10 +139,16 @@ uninstall against a **decoy**, never a real game install.
   manifests without `options` parse unchanged. The dist repo's `gen_manifest.py` must emit this —
   spec lives in this repo's plan/history, updater side is done.
 - **Manifest cache**: the last fetched manifest is kept in memory; the `replan` command re-diffs
-  selections against it with no network (drives the Customization view).
+  selections against it with no network (drives the Customization view). A successful `apply`
+  refreshes the cache from the release it actually installed (`InstallReport` carries the
+  manifest + tag), so the frontend's post-apply and post-uninstall refreshes are offline-safe
+  replans — a successful offline uninstall can never end in a red network error.
 - **Launch**: `play` runs `game/bin/win64/dota2.exe` with hardcoded
   `-insecure -console +exec autoexec.cfg` + `-dx11`/`-dx9` + user extras. Play is enabled in the
-  UI only when installed with no pending changes; Check is always available.
+  UI only when installed with no pending changes; Check is always available. The autoexec.cfg
+  editor reads bytes: a non-UTF-8 file (cp1251 comments are real) comes back lossy-decoded with
+  a `lossy` flag and the editor goes read-only — saving a lossy decode (or after a failed read)
+  would corrupt/blank the user's real cfg.
 - **Game tracking**: the frontend polls the `game_running` command every 3 s (a write-probe of
   the dota2.exe image via `fslock::held_by_process` — ONLY sharing/lock violations count, so a
   read-only or ACL-denied exe is never mistaken for a running game). While the game runs the
@@ -147,6 +167,14 @@ uninstall against a **decoy**, never a real game install.
   (flags POSITION | MAXIMIZED only — size always resets to the config default, and visibility
   is NOT persisted: hidden-until-first-paint stays frontend-managed). First run centers the
   window (`center: true`); after that the saved spot wins, validated against connected monitors.
+  Closing the window while an op runs asks first (`onCloseRequested` + confirm) — downloads
+  resume, but a phase-2 commit must not be killed cold. GOTCHA: once JS registers an
+  `onCloseRequested` listener, Tauri no longer closes the window itself — the JS wrapper calls
+  `destroy()`, which needs `core:window:allow-destroy` in `capabilities/default.json` (NOT part
+  of `core:default`; without it the X silently does nothing).
+- **What's new**: the history rebuild downloads unseen releases' manifests with a small worker
+  pool (`NOTES_WORKERS`) — a first-ever open is not N serial round trips. Known tags still cost
+  nothing; cache stays memory + disk, keyed by the last checked tag.
 - **i18n**: all labels derive in the frontend (it owns the language); Rust ships raw data + hints
   (`primary_action`, `can_play`, …). Engine error strings stay English (shown in the mono detail).
 - **check**: GitHub API → release (by tag or latest) → download `manifest.json` → sha256 each
@@ -162,11 +190,16 @@ uninstall against a **decoy**, never a real game install.
   the state file and creates a missing `winmm_orig.dll` anyway — a lost/corrupt
   `.phoenix-state.json` can never wedge the folder into "up to date but not installed" (the UI
   offers Apply for exactly this case: `primary_action` is `apply` when `changes == 0 &&
-  !installed`).
+  !installed`, labeled **Repair** frontend-side). Removals: a file at a `remove[]`/orphan dest
+  that we did NOT place is moved into `.phoenix-vanilla/` (preserved, not destroyed) and the
+  removal sticks — the restore-a-vanilla-original step only fires for a copy that predates the
+  removal, never for the one `back_up` just created (that would silently undo the removal and
+  re-flag it on every plan, forever).
 - **uninstall** reverts to stock from `<game>/.phoenix-state.json`: restore a preserved vanilla
-  original if one exists, else delete our file; delete `winmm_orig.dll` only if *we* created it.
-  A corrupt state file is quarantined to `.phoenix-state.json.bak` on load (treated as
-  not-installed) rather than silently misread.
+  original if one exists, else delete our file; then restore anything still left in the vanilla
+  store (files preserved by removals — not in `state.files`) to its game path; delete
+  `winmm_orig.dll` only if *we* created it. A corrupt state file is quarantined to
+  `.phoenix-state.json.bak` on load (treated as not-installed) rather than silently misread.
 
 ## Invariants & gotchas — do not break these
 

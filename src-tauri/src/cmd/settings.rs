@@ -27,6 +27,7 @@ pub fn save_settings(
     source_repo: String,
     game_dir: String,
     token: String,
+    clear_token: bool,
     language: Option<String>,
     launch_extra: String,
     renderer: String,
@@ -38,8 +39,11 @@ pub fn save_settings(
             source_repo
         };
         s.game_dir = if game_dir.trim().is_empty() { None } else { Some(PathBuf::from(game_dir)) };
-        // blank token field => keep whatever was saved (we never send the token to the UI)
-        if !token.is_empty() {
+        // blank token field => keep whatever was saved (we never send the token to the UI);
+        // the explicit clear flag is the only way to remove a saved token
+        if clear_token {
+            s.token = None;
+        } else if !token.is_empty() {
             s.token = Some(token);
         }
         s.language = language;

@@ -59,7 +59,11 @@ pub async fn replan(state: tauri::State<'_, Arc<AppState>>) -> Result<CheckView,
 }
 
 #[tauri::command]
-pub async fn apply(app: tauri::AppHandle) -> Result<InstallView, CmdError> {
+pub async fn apply(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AppState>>,
+) -> Result<InstallView, CmdError> {
+    let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let settings = Settings::load();
         let dl = downloader(&settings);
@@ -68,7 +72,15 @@ pub async fn apply(app: tauri::AppHandle) -> Result<InstallView, CmdError> {
             let _ = app.emit("op-progress", p);
         };
         let report = install::install(&settings, &dl, None, Some(&emit));
-        if report.is_ok() {
+        if let Ok(r) = &report {
+            // the installed manifest is the freshest there is (install fetches its own) — keep
+            // the replan cache in step, so the UI's post-apply refresh is a no-network replan
+            // that can't diff against a manifest older than what was just installed
+            *st.manifest_cache.lock().unwrap() = Some(CachedManifest {
+                repo: settings.source_repo.clone(),
+                tag_name: r.tag.clone(),
+                manifest: r.manifest.clone(),
+            });
             // warm the asset cache (unselected variants, disabled toggles) DETACHED — optional
             // content can be hundreds of MB and must not delay the install result / Play unlock.
             // Best-effort by design; uninstall cancels it via install::cancel_warm.

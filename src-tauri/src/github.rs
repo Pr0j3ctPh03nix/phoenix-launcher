@@ -181,7 +181,11 @@ impl Downloader for Github {
             std::io::Write::write_all(&mut file, &buf[..n])?;
             hasher.update(&buf[..n]);
             written += n as u64;
-            progress(written, total);
+            if !progress(written, total) {
+                // caller aborted (a sibling download failed, a warm was cancelled) — the
+                // partial file stays behind as the resume source
+                bail!("download aborted");
+            }
         }
         Ok((written, hex::encode(hasher.finalize())))
     }

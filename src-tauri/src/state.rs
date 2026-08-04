@@ -46,7 +46,12 @@ impl InstalledState {
     }
 
     pub fn save(&self, game_dir: &Path) -> Result<()> {
-        std::fs::write(Self::path(game_dir), serde_json::to_string_pretty(self)?)?;
+        // temp + rename (atomic on the same volume): a crash mid-write can never leave a torn
+        // state file — the quarantine path in `load` stays a last resort, not the normal one
+        let p = Self::path(game_dir);
+        let tmp = p.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        std::fs::rename(&tmp, &p)?;
         Ok(())
     }
 }

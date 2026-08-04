@@ -95,6 +95,16 @@ pub struct UninstallView {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AutoexecView {
+    pub content: String,
+    /// The file on disk is not valid UTF-8 (e.g. a cp1251-commented cfg) and `content` is a
+    /// lossy decode. The UI must show it read-only: saving the lossy text back would corrupt
+    /// the original bytes.
+    pub lossy: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CandidateView {
     pub path: String,
     pub client_version: Option<String>,

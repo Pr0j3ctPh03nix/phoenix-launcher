@@ -16,9 +16,18 @@ type HashMemo = HashMap<PathBuf, (u64, SystemTime, String)>;
 static FILE_HASHES: LazyLock<Mutex<HashMemo>> = LazyLock::new(Default::default);
 
 pub fn sha256_file(path: &Path) -> Result<String> {
+    use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    std::io::copy(&mut f, &mut hasher)?;
+    // 256 KiB reads (vs io::copy's 8 KiB): managed content includes multi-hundred-MB VPKs
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     Ok(hex::encode(hasher.finalize()))
 }
 

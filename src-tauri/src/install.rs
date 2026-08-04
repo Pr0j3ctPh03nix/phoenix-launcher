@@ -52,10 +52,16 @@ pub enum WinmmOrig {
 #[derive(Debug)]
 pub struct InstallReport {
     pub version: String,
+    /// The release tag this install came from.
+    pub tag: String,
     pub written: Vec<String>,
     pub removed: Vec<String>,
     pub up_to_date: usize,
     pub winmm_orig: WinmmOrig,
+    /// The manifest this install applied — the freshest one there is (install fetches its own).
+    /// The shell uses it to refresh the replan cache, so a release published between check and
+    /// apply can't leave the UI re-diffing against a stale manifest.
+    pub manifest: Manifest,
 }
 
 #[derive(Debug)]
@@ -166,10 +172,12 @@ pub fn install(
         // return as fast as it healed
         return Ok(InstallReport {
             version: manifest.version.clone(),
+            tag: release.tag_name.clone(),
             written: Vec::new(),
             removed: Vec::new(),
             up_to_date,
             winmm_orig,
+            manifest,
         });
     }
 
@@ -191,6 +199,10 @@ pub fn install(
         staged.push((fe, sp));
     }
 
+    // --- re-probe: the game may have started during a long phase 1 — fail typed and untouched
+    // here rather than mid-commit into a best-effort rollback against locked files ---
+    probe_writable(&game_dir, to_write.iter().map(|fe| &fe.dest).chain(removals.iter()))?;
+
     // --- phase 2: commit, with rollback on any failure ---
     let ctx = Ctx {
         game_dir: game_dir.clone(),
@@ -210,10 +222,12 @@ pub fn install(
             // result hostage. The shell runs warm_cache detached after this returns.
             Ok(InstallReport {
                 version: manifest.version.clone(),
+                tag: release.tag_name.clone(),
                 written,
                 removed,
                 up_to_date,
                 winmm_orig,
+                manifest,
             })
         }
         Err(e) => {
@@ -253,13 +267,18 @@ fn commit(
     let mut removed = Vec::new();
     for dest in job.removals {
         let target = ctx.game_dir.join(dest);
+        let vanilla = ctx.vanilla_root.join(dest);
+        // decided BEFORE back_up: back_up may itself preserve a foreign target into the vanilla
+        // store, and restoring that same copy right back would undo the removal — the file would
+        // then re-flag as Remove on every future plan, forever. Only a copy that predates this
+        // removal is a genuine original to restore.
+        let restore_vanilla = vanilla.exists();
         if target.exists() {
             let backup = back_up(ctx, dest, &target)?;
             committed.push(Committed::Removed { target: target.clone(), backup });
             removed.push(dest.clone());
         }
-        let vanilla = ctx.vanilla_root.join(dest);
-        if vanilla.exists() {
+        if restore_vanilla {
             if let Some(p) = target.parent() {
                 std::fs::create_dir_all(p)?;
             }
@@ -303,13 +322,24 @@ fn has_winmm(resolved: &[FileEntry]) -> bool {
     })
 }
 
-/// Fail fast when the game is running: it holds managed files open (loaded DLLs, mmapped VPKs),
-/// so phase 2 would only roll back anyway — say "close the game" before downloading a byte.
+/// Fail fast when a file we must touch can't be written — before downloading a byte. The
+/// diagnosis matters: a sharing violation means the game holds it open (loaded DLLs, mmapped
+/// VPKs) -> typed GameRunning ("close the game"); any other can't-write (read-only attribute,
+/// ACL) is a permissions problem — saying "close Dota 2" for those would be advice that can
+/// never work.
 fn probe_writable<'a>(game_dir: &Path, dests: impl Iterator<Item = &'a String>) -> Result<()> {
     for dest in dests {
         let target = game_dir.join(dest);
-        if fslock::locked(&target) {
-            return Err(anyhow!(engine::GameRunning(target)));
+        match fslock::probe(&target) {
+            fslock::Probe::Writable => {}
+            fslock::Probe::Held => return Err(anyhow!(engine::GameRunning(target))),
+            fslock::Probe::Denied(e) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "no write access to {} — clear its read-only attribute or run the launcher \
+                     with sufficient permissions",
+                    target.display()
+                )));
+            }
         }
     }
     Ok(())
@@ -325,9 +355,10 @@ const DL_WORKERS: usize = 4;
 const PROGRESS_GRAIN: u64 = 256 * 1024;
 
 /// Fetch every to-write file into the asset cache with a small worker pool. Errors fail the
-/// phase: the first error wins (remaining workers stop early; in-flight downloads finish — the
-/// .part they leave is resumed on the next run). Progress `current` counts COMPLETED files
-/// while `item`/`bytes` track whichever file ticked most recently.
+/// phase: the first error wins — remaining workers stop early AND in-flight streams abort at
+/// their next chunk (the .part they leave is resumed on the next run), so a dead asset never
+/// waits minutes for a 500 MB neighbor to finish before surfacing. Progress `current` counts
+/// COMPLETED files while `item`/`bytes` track whichever file ticked most recently.
 fn obtain_all(
     cache: &Path,
     dl: &dyn Downloader,
@@ -352,6 +383,7 @@ fn obtain_all(
 
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
+    let abort = AtomicBool::new(false); // cheap flag mirrored from first_err, checked per chunk
     let first_err: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let sink = progress.map(Mutex::new);
     let report = |p: engine::OpProgress| {
@@ -363,7 +395,7 @@ fn obtain_all(
     std::thread::scope(|s| {
         for _ in 0..DL_WORKERS.min(jobs.len()) {
             s.spawn(|| loop {
-                if first_err.lock().unwrap().is_some() {
+                if abort.load(Ordering::Relaxed) {
                     return;
                 }
                 let i = next.fetch_add(1, Ordering::Relaxed);
@@ -391,10 +423,14 @@ fn obtain_all(
                 tick(done.load(Ordering::Relaxed), 0, size, false);
                 let mut last = 0u64;
                 let mut chunk = |d: u64, t: Option<u64>| {
+                    if abort.load(Ordering::Relaxed) {
+                        return false; // another file already failed — stop this stream too
+                    }
                     if d - last >= PROGRESS_GRAIN || t == Some(d) {
                         last = d;
                         tick(done.load(Ordering::Relaxed), d, t.unwrap_or(size), false);
                     }
+                    true
                 };
                 match obtain_to_cache(cache, dl, release, &fe.name, &fe.sha256, fe.size, &mut chunk) {
                     Ok(_) => {
@@ -404,8 +440,9 @@ fn obtain_all(
                     Err(e) => {
                         let mut g = first_err.lock().unwrap();
                         if g.is_none() {
-                            *g = Some(e);
+                            *g = Some(e); // aborted streams land here too, but the real error won
                         }
+                        abort.store(true, Ordering::Relaxed);
                         return;
                     }
                 }
@@ -543,9 +580,8 @@ fn seed_cache(
 }
 
 /// Set via `cancel_warm` so a background `warm_cache` in flight stops instead of recreating the
-/// cache dir an uninstall just deleted (checked between assets — one in-flight asset may still
-/// land; harmless residue at worst). Cleared by `install` (a (re)install legitimizes warming
-/// again).
+/// cache dir an uninstall just deleted (checked between assets AND per chunk mid-stream — a
+/// leftover `.part` at worst). Cleared by `install` (a (re)install legitimizes warming again).
 static WARM_CANCEL: AtomicBool = AtomicBool::new(false);
 
 /// Stop a background `warm_cache`. Callers that run `uninstall` while a warm may be in flight
@@ -590,7 +626,11 @@ fn prefetch_all(cache: &Path, dl: &dyn Downloader, release: &Release, manifest: 
         if !seen.insert(sha256) || cache_ok(&cache.join(sha256), sha256, size) {
             continue;
         }
-        let _ = obtain_to_cache(cache, dl, release, name, sha256, size, &mut |_, _| {});
+        // the chunk callback doubles as the cancel line: an uninstall's cancel_warm aborts the
+        // stream mid-file instead of letting a huge optional asset finish downloading first
+        let _ = obtain_to_cache(cache, dl, release, name, sha256, size, &mut |_, _| {
+            !WARM_CANCEL.load(Ordering::Relaxed)
+        });
     }
 }
 
@@ -720,6 +760,11 @@ pub fn uninstall(settings: &Settings) -> Result<UninstallReport> {
         }
     }
 
+    // whatever is still in the vanilla store was displaced by us but isn't in state.files —
+    // e.g. a foreign file preserved when a manifest remove[] displaced it. Revert-to-stock
+    // means putting those back too, not deleting them with the store below.
+    restore_vanilla_tree(&vanilla_root, &vanilla_root, &game_dir, &mut restored)?;
+
     let _ = std::fs::remove_dir_all(game_dir.join(BACKUP_DIR));
     let _ = std::fs::remove_dir_all(game_dir.join(STAGING_DIR));
     let _ = std::fs::remove_dir_all(game_dir.join(CACHE_DIR));
@@ -727,6 +772,35 @@ pub fn uninstall(settings: &Settings) -> Result<UninstallReport> {
     let _ = std::fs::remove_file(InstalledState::path(&game_dir));
 
     Ok(UninstallReport { version: state.version, restored, deleted, winmm_orig_removed })
+}
+
+/// Restore every file remaining under the vanilla store to its game-relative path. Skips a dest
+/// that is (unexpectedly) occupied — a file that exists there now is not ours to clobber.
+fn restore_vanilla_tree(
+    root: &Path,
+    dir: &Path,
+    game_dir: &Path,
+    restored: &mut Vec<String>,
+) -> Result<()> {
+    let Ok(rd) = std::fs::read_dir(dir) else { return Ok(()) };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            restore_vanilla_tree(root, &p, game_dir, restored)?;
+            continue;
+        }
+        let rel = p.strip_prefix(root).expect("entry under the vanilla root");
+        let target = game_dir.join(rel);
+        if !target.exists() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&p, &target)
+                .with_context(|| format!("restoring vanilla {}", rel.display()))?;
+            restored.push(rel.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -986,6 +1060,71 @@ mod tests {
         let r = install(&settings(&dir), &dl, None, None).unwrap();
         assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_foreign_file_at_a_remove_dest_is_removed_preserved_and_stays_removed() {
+        let dir = tempdir("remove-foreign");
+        // a file WE never placed (no prior state) sits at the manifest's remove[] dest
+        std::fs::create_dir_all(dir.join("game/dota")).unwrap();
+        std::fs::write(dir.join("game/dota/stale.vpk"), b"old").unwrap();
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ file_json("a.vpk", "game/dota/a.vpk", b"vpk") ],
+            "remove": [ { "dest": "game/dota/stale.vpk" } ]
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]);
+
+        let r = install(&settings(&dir), &dl, None, None).unwrap();
+        assert_eq!(r.removed, vec!["game/dota/stale.vpk".to_string()]);
+        // the removal must STICK (the old bug preserved-then-restored it in one breath,
+        // re-flagging it as Remove on every future plan, forever)...
+        assert!(!dir.join("game/dota/stale.vpk").exists());
+        // ...while the foreign file is preserved, not destroyed
+        assert_eq!(std::fs::read(dir.join(VANILLA_DIR).join("game/dota/stale.vpk")).unwrap(), b"old");
+        // and the next plan is clean — no permanent pending-remove loop
+        let chk = crate::engine::check(&settings(&dir), &dl, None).unwrap();
+        assert_eq!(chk.changes(), 0, "plan must not re-flag the removed file");
+
+        // uninstall reverts to what was there before us: the preserved file comes back
+        let u = uninstall(&settings(&dir)).unwrap();
+        assert!(u.restored.contains(&"game/dota/stale.vpk".to_string()));
+        assert_eq!(std::fs::read(dir.join("game/dota/stale.vpk")).unwrap(), b"old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    // set_readonly(false) is fine here: Windows-only test file, deleted right after
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn a_read_only_target_fails_with_a_permission_error_not_game_running() {
+        let dir = tempdir("denied");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None).unwrap();
+
+        // a read-only attribute denies write with ERROR_ACCESS_DENIED — not a live process
+        let target = dir.join("game/bin/win64/winmm.dll");
+        let mut perm = std::fs::metadata(&target).unwrap().permissions();
+        perm.set_readonly(true);
+        std::fs::set_permissions(&target, perm.clone()).unwrap();
+
+        let m2 = serde_json::json!({
+            "version": "1.0.1",
+            "files": [ file_json("winmm.dll", "game/bin/win64/winmm.dll", b"dll2") ]
+        })
+        .to_string();
+        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2")]);
+        let err = install(&settings(&dir), &dl2, None, None).unwrap_err();
+        assert!(
+            !err.chain().any(|c| c.downcast_ref::<engine::GameRunning>().is_some()),
+            "a permissions problem must not be diagnosed as the game running: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("write access"), "got: {err:#}");
+
+        perm.set_readonly(false);
+        std::fs::set_permissions(&target, perm).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

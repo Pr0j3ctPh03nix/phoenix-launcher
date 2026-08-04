@@ -196,33 +196,61 @@ impl NotesCache {
     }
 }
 
+/// How many release manifests the notes-history rebuild downloads at once. A first-ever open
+/// walks the whole release list — serial round trips would put N×RTT behind one spinner.
+const NOTES_WORKERS: usize = 4;
+
 /// The full "What's new" history: every release's manifest notes, newest first (GitHub's release
 /// order). Incremental: a release whose tag appears in `known` keeps its cached entry with no
-/// manifest download — only unseen tags cost a round trip. (Releases whose manifest carried no
-/// notes are not in `known` and re-download on each rebuild; rebuilds only happen on a new
-/// release, so that stays cheap.) Releases without a manifest.json, with an unparsable manifest,
-/// or with empty notes are skipped — a single bad release must not sink the whole history.
+/// manifest download — only unseen tags cost a round trip, and those download in parallel
+/// (NOTES_WORKERS). (Releases whose manifest carried no notes are not in `known` and re-download
+/// on each rebuild; rebuilds only happen on a new release, so that stays cheap.) Releases
+/// without a manifest.json, with an unparsable manifest, or with empty notes are skipped — a
+/// single bad release must not sink the whole history.
 pub fn fetch_notes_history(
     settings: &Settings,
     dl: &dyn Downloader,
     known: &[NotesEntry],
 ) -> Result<NotesCache> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
     let releases = dl.fetch_releases(&settings.source_repo).context("listing releases")?;
     let by_tag: BTreeMap<&str, &NotesEntry> =
         known.iter().map(|e| (e.tag.as_str(), e)).collect();
-    let mut entries = Vec::new();
-    for rel in &releases {
-        if let Some(e) = by_tag.get(rel.tag_name.as_str()) {
-            entries.push((*e).clone());
-            continue;
+    // one slot per release keeps GitHub's newest-first order regardless of download timing
+    let mut slots: Vec<Option<NotesEntry>> = releases
+        .iter()
+        .map(|r| by_tag.get(r.tag_name.as_str()).map(|e| (*e).clone()))
+        .collect();
+    let jobs: Vec<usize> =
+        slots.iter().enumerate().filter_map(|(i, s)| s.is_none().then_some(i)).collect();
+    let next = AtomicUsize::new(0);
+    let fetched: Mutex<Vec<(usize, NotesEntry)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for _ in 0..NOTES_WORKERS.min(jobs.len()) {
+            s.spawn(|| loop {
+                let j = next.fetch_add(1, Ordering::Relaxed);
+                if j >= jobs.len() {
+                    return;
+                }
+                let (i, rel) = (jobs[j], &releases[jobs[j]]);
+                let Some(asset) = rel.asset("manifest.json") else { continue };
+                let Ok(bytes) = dl.download(asset) else { continue };
+                let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) else { continue };
+                if let Some(notes) = m.notes.filter(|n| !n.trim().is_empty()) {
+                    fetched.lock().unwrap().push((
+                        i,
+                        NotesEntry { tag: rel.tag_name.clone(), version: m.version, notes },
+                    ));
+                }
+            });
         }
-        let Some(asset) = rel.asset("manifest.json") else { continue };
-        let Ok(bytes) = dl.download(asset) else { continue };
-        let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) else { continue };
-        if let Some(notes) = m.notes.filter(|n| !n.trim().is_empty()) {
-            entries.push(NotesEntry { tag: rel.tag_name.clone(), version: m.version, notes });
-        }
+    });
+    for (i, e) in fetched.into_inner().unwrap() {
+        slots[i] = Some(e);
     }
+    let entries: Vec<NotesEntry> = slots.into_iter().flatten().collect();
     Ok(NotesCache {
         repo: settings.source_repo.clone(),
         latest_tag: releases.first().map(|r| r.tag_name.clone()).unwrap_or_default(),

@@ -14,9 +14,14 @@ const state = {
   renderer: "dx11",
   afTarget: null,      // "setup" | "settings" — where an autofind pick lands
   afUnlisten: null,
+  afBusy: false,       // a scan invoke is in flight (double-start guard)
   aeDirty: false,
+  aeReadOnly: false,   // autoexec shown read-only (non-UTF-8 file or failed read)
   gameRunning: false,  // polled — the game is currently running
   fileEls: new Map(),  // dest -> its <li> in the managed-files list (keyed for live dl bars)
+  settingsSnap: null,  // settings-form snapshot at open, for the discard-changes guard
+  settingsLoaded: null, // {repo, game} as loaded — a save that changes them re-checks
+  tokenClear: false,   // "Clear" was pressed: the saved token is removed on save
 };
 
 // ---- markdown-lite: the notes are trusted (our own manifest) but escape anyway, then apply the
@@ -93,8 +98,10 @@ function setIdleStatus() {
 function statusFor(v) {
   if (v.changes === 0) {
     if (!v.installed) {
-      // files all hash-match but no install state вЂ” Apply runs the no-op heal (rewrites state)
-      return [t("status.notInstalled"), "update", t("detail.okMeta", { version: v.version })];
+      // files all hash-match but no install state — the primary runs the no-op heal. Worded as
+      // "repair", not "not installed": the list right below says every file is current, and
+      // "Install" next to "all current" reads as a contradiction.
+      return [t("status.repair"), "update", t("detail.repair", { version: v.version })];
     }
     return [t("status.upToDate"), "ok", t("detail.okMeta", { version: v.version })];
   }
@@ -122,7 +129,13 @@ function renderPrimary() {
     p.disabled = true;
     c.disabled = false;
   } else {
-    const label = { check: "btn.check", play: "btn.play", apply: state.lastCheck?.installed ? "btn.update" : "btn.install" }[state.primaryMode];
+    // apply splits three ways: heal (all files current, no install record) reads as Repair
+    const heal = state.lastCheck && state.lastCheck.changes === 0 && !state.lastCheck.installed;
+    const label = {
+      check: "btn.check",
+      play: "btn.play",
+      apply: heal ? "btn.repair" : state.lastCheck?.installed ? "btn.update" : "btn.install",
+    }[state.primaryMode];
     p.textContent = t(label);
     p.disabled = false;
     c.disabled = false;
@@ -135,6 +148,7 @@ function renderPrimary() {
   u.disabled = state.busy || state.gameRunning;
   $("btn-customize").disabled = state.busy;
   $("btn-settings").disabled = state.busy;
+  $("btn-whatsnew").disabled = state.busy;
 }
 
 // Rebuild the managed-files list from a CheckView. Separate from applyCheck so a failed apply
@@ -162,7 +176,9 @@ function renderFiles(v) {
     state.fileEls.set(f.dest, li);
   }
   $("files-empty").style.display = v.files.length ? "none" : "flex";
-  $("files-count").textContent = v.changes === 0 ? t("files.allCurrent") : t("files.toChange", { n: v.changes });
+  $("files-count").textContent = !v.files.length
+    ? "" // an empty (cleared) list isn't "all current" — it's not read yet
+    : v.changes === 0 ? t("files.allCurrent") : t("files.toChange", { n: v.changes });
 }
 
 function applyCheck(v) {
@@ -189,14 +205,19 @@ function applyCheck(v) {
 }
 
 // Command failures arrive as {kind, message} envelopes (CmdError); tolerate bare strings too.
-// `kind` is for reacting (later: token prompts on "auth", update nudges on "tooOld") вЂ” for now
-// everything displays the message.
 function errText(e) {
   return (e && typeof e === "object" && "message" in e) ? e.message : String(e);
 }
 
+// The status word reacts to the error kind (offline / access / outdated launcher / game
+// running); the mono detail keeps a localized hint plus the raw engine message.
+const ERR_WORDS = { network: "status.offline", auth: "status.noAccess", tooOld: "status.tooOld", gameRunning: "status.gameLocked" };
+const ERR_HINTS = { network: "err.network", auth: "err.auth", tooOld: "err.tooOld", gameRunning: "err.gameRunning" };
 function onError(e) {
-  setStatus(t("status.error"), "error", errText(e));
+  const kind = e && typeof e === "object" ? e.kind : null;
+  const word = t(ERR_WORDS[kind] || "status.error");
+  const hint = ERR_HINTS[kind] ? t(ERR_HINTS[kind]) + " · " : "";
+  setStatus(word, "error", hint + errText(e));
 }
 
 // ---- actions ----
@@ -224,21 +245,25 @@ async function doApply() {
   state.busy = true; renderPrimary();
   setStatus(t("status.working"), "busy", t("detail.installing"));
   // the engine streams phase-1 progress as op-progress events; downloads run in parallel, so
-  // ticks for different files interleave. The header shows the completed/total count; each file's
-  // own bar (keyed by dest in state.fileEls) fills from its byte ticks.
+  // ticks for different files interleave. Each file's own bar (keyed by dest in state.fileEls)
+  // fills from its byte ticks. The header counts DESTS done, not the engine's unique-asset
+  // current/total — dests are what the visible rows are, so the numbers always match the list.
+  const dlTotal = state.lastCheck
+    ? state.lastCheck.files.filter((f) => f.status === "update" || f.status === "install").length
+    : 0;
+  const doneDests = new Set();
   let unlisten = null;
   try {
     unlisten = await listen("op-progress", (ev) => {
       const p = ev.payload;
-      if (p.op !== "install") return;
-      setStatus(t("status.working"), "busy", t("detail.dl", { i: p.current, n: p.total }));
-      if (!p.item) return;
+      if (p.op !== "install" || !p.item) return;
       const li = state.fileEls.get(p.item);
       if (!li) return;
       li.classList.add("dl");
       const fill = li.querySelector(".fbar-fill");
       const st = li.querySelector(".fstate");
       if (p.done) {
+        doneDests.add(p.item);
         li.classList.add("done");
         if (fill) fill.style.width = "100%";
         st.className = "fstate ok";
@@ -249,17 +274,19 @@ async function doApply() {
         st.className = "fstate dl";
         st.textContent = `${(p.bytesDone / 1048576).toFixed(1)}/${(p.bytesTotal / 1048576).toFixed(1)} MB`;
       }
+      setStatus(t("status.working"), "busy", t("detail.dl", { i: doneDests.size, n: dlTotal || p.total }));
     });
     await invoke("apply");
-    await doCheck(); // refresh -> up to date, Play unlocks
+    // no network: apply refreshed the backend's manifest cache from the release it installed
+    await doReplan();
   } catch (e) {
     onError(e);
     // reset half-filled bars / "N MB" states to the last known plan (the status line keeps
     // showing the error — renderFiles doesn't touch it)
     if (state.lastCheck) renderFiles(state.lastCheck);
-    state.busy = false; renderPrimary();
   } finally {
     if (unlisten) unlisten();
+    state.busy = false; renderPrimary();
   }
 }
 
@@ -268,9 +295,12 @@ async function doUninstall() {
   setStatus(t("status.working"), "busy", t("detail.reverting"));
   try {
     await invoke("uninstall");
-    await doCheck();
+    // replan, not check: uninstall itself is fully offline — its result must not turn into a
+    // network error status when the connection happens to be down
+    await doReplan();
   } catch (e) {
     onError(e);
+  } finally {
     state.busy = false; renderPrimary();
   }
 }
@@ -360,7 +390,22 @@ function setSettingsMsg(text) {
 }
 
 function updateTokenPlaceholder() {
-  $("in-token").placeholder = state.hasToken ? t("ph.tokenSaved") : t("ph.tokenEmpty");
+  $("in-token").placeholder = state.tokenClear
+    ? t("ph.tokenCleared")
+    : state.hasToken ? t("ph.tokenSaved") : t("ph.tokenEmpty");
+}
+
+// The form's current content, for the discard-changes guard. Language is excluded — it applies
+// (and persists) instantly on toggle, so it is never "unsaved".
+function settingsSnapshot() {
+  return JSON.stringify({
+    repo: $("in-repo").value,
+    game: $("in-game").value,
+    launch: $("in-launch").value,
+    renderer: segValue($("seg-renderer")),
+    token: $("in-token").value,
+    clear: state.tokenClear,
+  });
 }
 
 async function openSettings() {
@@ -376,13 +421,17 @@ async function openSettings() {
   $("in-token").value = "";
   $("in-launch").value = s.launchExtra || "";
   state.hasToken = s.hasToken;
+  state.tokenClear = false;
   state.renderer = s.renderer || "dx11";
   updateTokenPlaceholder();
+  $("btn-token-clear").classList.toggle("hidden", !state.hasToken);
   setSeg($("seg-renderer"), state.renderer);
   setSeg($("seg-lang"), LANG);
   $("advanced").classList.toggle("hidden", !SHOW_ADVANCED);
   $("advanced").open = false;
   setSettingsMsg(null);
+  state.settingsLoaded = { repo: s.sourceRepo || "", game: s.gameDir || "" };
+  state.settingsSnap = settingsSnapshot();
   showView("settings");
 }
 
@@ -392,15 +441,53 @@ async function saveSettings() {
       sourceRepo: $("in-repo").value,
       gameDir: $("in-game").value,
       token: $("in-token").value,
+      clearToken: state.tokenClear,
       language: LANG,
       launchExtra: $("in-launch").value,
       renderer: segValue($("seg-renderer")) || "dx11",
     });
+    // a save that changes where updates come from (folder, repo, credentials) makes every bit
+    // of the shown state stale — the status, the file list, and above all Play, which would
+    // launch the NEW folder while the UI still describes the old one. Invalidate and re-check.
+    const invalidates =
+      $("in-game").value.trim() !== state.settingsLoaded.game.trim() ||
+      $("in-repo").value.trim() !== state.settingsLoaded.repo.trim() ||
+      $("in-token").value !== "" || state.tokenClear;
+    if ($("in-token").value) state.hasToken = true;
+    if (state.tokenClear) state.hasToken = false;
+    state.tokenClear = false;
+    state.settingsSnap = null;
     showView("main");
-    setStatus(t("status.saved"), "ok", "");
+    if (invalidates) {
+      state.lastCheck = null;
+      state.primaryMode = "check";
+      renderFiles({ files: [], changes: 0 });
+      $("game-path").textContent = "";
+      $("btn-customize").classList.add("hidden");
+      $("btn-whatsnew").classList.add("hidden");
+      doCheck();
+    } else {
+      setStatus(t("status.saved"), "ok", "");
+    }
   } catch (e) {
     setSettingsMsg(errText(e));
   }
+}
+
+// Back/Escape out of settings: same protection the autoexec editor has — unsaved edits ask
+// before being dropped.
+async function maybeCloseSettings() {
+  if (state.settingsSnap !== null && settingsSnapshot() !== state.settingsSnap) {
+    const ok = await confirmDialog({
+      title: t("cf.discardTitle"),
+      text: t("cf.discardSettingsText"),
+      confirm: t("cf.discardConfirm"),
+    });
+    if (!ok) return;
+  }
+  state.tokenClear = false;
+  state.settingsSnap = null;
+  showView("main");
 }
 
 async function browseInto(input) {
@@ -457,25 +544,37 @@ function closeAutofind() {
 }
 
 async function runAutofind() {
+  if (state.afBusy) return; // a scan invoke is already in flight
+  state.afBusy = true;
   afStage("run");
   $("af-count").textContent = t("af.scanning");
   $("af-current").textContent = "";
+  if (state.afUnlisten) { state.afUnlisten(); state.afUnlisten = null; } // never leak a listener
   state.afUnlisten = await listen("autofind-progress", (ev) => {
     const p = ev.payload;
     $("af-count").textContent = t("af.scanned", { n: p.scanned });
     $("af-current").textContent = p.current;
   });
-  let found = [];
+  let found = null; // null = the scan itself failed (≠ an empty result)
+  let err = null;
   try {
     found = await invoke("autofind_start");
   } catch (e) {
-    // scan failed outright вЂ” show empty results rather than a dead modal
+    err = e;
   }
+  state.afBusy = false;
   if (state.afUnlisten) { state.afUnlisten(); state.afUnlisten = null; }
-  // the modal was closed mid-scan (Escape) вЂ” discard the results instead of staging them
+  // the modal was closed mid-scan (Escape) — discard the results instead of staging them
   // under a hidden modal
   if ($("af-modal").classList.contains("hidden")) return;
-  renderCandidates(found);
+  renderCandidates(found || []);
+  // a failed scan says WHY instead of masquerading as "Nothing found"
+  const msg = $("af-msg");
+  msg.classList.toggle("hidden", !err);
+  if (err) {
+    msg.textContent = errText(err);
+    $("cands-empty").classList.add("hidden");
+  }
   afStage("results");
 }
 
@@ -524,6 +623,7 @@ function confirmDialog({ title, text, confirm }) {
   $("cf-text").textContent = text;
   $("btn-cf-ok").textContent = confirm;
   $("cf-modal").classList.remove("hidden");
+  $("btn-cf-ok").focus(); // keyboard path: Enter confirms, Escape cancels, Tab reaches Cancel
   return new Promise((resolve) => { cfResolve = resolve; });
 }
 function settleConfirm(v) {
@@ -658,23 +758,35 @@ function refreshAeHl() {
 }
 
 async function openAutoexec() {
+  // read-only mode protects the file: a lossy (non-UTF-8) decode or a failed read must never
+  // be saved back — that would corrupt or blank the user's real cfg
+  let msg = null;
+  let readOnly = false;
   try {
-    $("ae-text").value = await invoke("read_autoexec");
+    const r = await invoke("read_autoexec");
+    $("ae-text").value = r.content;
+    if (r.lossy) { readOnly = true; msg = t("ae.lossy"); }
   } catch (e) {
     $("ae-text").value = "";
-    setAeMsg(errText(e));
+    readOnly = true;
+    msg = errText(e);
   }
+  state.aeReadOnly = readOnly;
+  $("ae-text").readOnly = readOnly;
+  $("btn-ae-save").disabled = readOnly;
   refreshAeHl();
   setAeDirty(false);
-  setAeMsg(null);
+  setAeMsg(msg);
   showView("autoexec");
 }
 
 async function saveAutoexec() {
+  if (state.aeReadOnly) return;
   try {
     await invoke("save_autoexec", { content: $("ae-text").value });
     setAeDirty(false);
     setAeMsg(null);
+    showView("settings"); // saved = done editing; a failure stays open with the message
   } catch (e) {
     setAeMsg(errText(e));
   }
@@ -761,8 +873,15 @@ $("btn-customize").addEventListener("click", () => { if (!state.busy) { renderOp
 $("btn-options-back").addEventListener("click", () => showView("main"));
 $("btn-whatsnew-back").addEventListener("click", () => showView("main"));
 $("btn-save").addEventListener("click", saveSettings);
-$("btn-back").addEventListener("click", () => showView("main"));
+$("btn-back").addEventListener("click", () => maybeCloseSettings());
 $("btn-browse").addEventListener("click", () => browseInto($("in-game")));
+$("btn-token-clear").addEventListener("click", () => {
+  state.tokenClear = true;
+  state.hasToken = false;
+  $("in-token").value = "";
+  updateTokenPlaceholder();
+  $("btn-token-clear").classList.add("hidden");
+});
 $("btn-autofind").addEventListener("click", () => openAutofind("settings"));
 $("btn-setup-browse").addEventListener("click", setupBrowse);
 $("btn-setup-autofind").addEventListener("click", () => openAutofind("setup"));
@@ -778,10 +897,16 @@ $("btn-cf-cancel").addEventListener("click", () => settleConfirm(false));
 wireSeg($("seg-lang"), (l) => switchLang(l));
 wireSeg($("seg-renderer"));
 
-// Escape backs out (topmost layer first); Enter in settings commits the save.
+// Escape backs out (topmost layer first); Enter in settings commits the save. The confirm
+// modal owns the keyboard while open: Enter = confirm (or cancel, if Cancel is focused),
+// Escape = cancel, everything else stays inside it.
 document.addEventListener("keydown", (e) => {
+  if (!$("cf-modal").classList.contains("hidden")) {
+    if (e.key === "Escape") settleConfirm(false);
+    else if (e.key === "Enter") { e.preventDefault(); settleConfirm(e.target !== $("btn-cf-cancel")); }
+    return;
+  }
   if (e.key === "Escape") {
-    if (!$("cf-modal").classList.contains("hidden")) { settleConfirm(false); return; }
     if (!$("af-modal").classList.contains("hidden")) {
       if (!$("af-run").classList.contains("hidden")) cancelAutofind();
       closeAutofind();
@@ -789,11 +914,28 @@ document.addEventListener("keydown", (e) => {
     }
     const v = currentView();
     if (v === "autoexec") { e.preventDefault(); maybeCloseAutoexec(); }
-    else if (v === "settings" || v === "whatsnew" || v === "options") { e.preventDefault(); showView("main"); }
+    else if (v === "settings") { e.preventDefault(); maybeCloseSettings(); }
+    else if (v === "whatsnew" || v === "options") { e.preventDefault(); showView("main"); }
   } else if (e.key === "Enter" && currentView() === "settings" && !state.busy && e.target.tagName !== "TEXTAREA") {
     e.preventDefault(); saveSettings();
   }
 });
+
+// Quitting mid-operation: interrupted downloads resume on the next run, but a phase-2 commit
+// should never be killed cold — confirm before closing while an op is running.
+try {
+  const appWindow = window.__TAURI__.window.getCurrentWindow();
+  appWindow.onCloseRequested(async (ev) => {
+    if (!state.busy) return;
+    ev.preventDefault();
+    const ok = await confirmDialog({
+      title: t("cf.quitTitle"),
+      text: t("cf.quitText"),
+      confirm: t("cf.quitConfirm"),
+    });
+    if (ok) appWindow.destroy();
+  });
+} catch (e) { /* API shape differs — no guard, closing behaves as before */ }
 
 $("ae-text").addEventListener("input", () => { setAeDirty(true); refreshAeHl(); });
 $("ae-text").addEventListener("scroll", () => {

@@ -49,8 +49,10 @@ impl std::fmt::Display for NetKind {
 
 impl std::error::Error for NetKind {}
 
-/// Per-chunk download progress: bytes written so far, total size if known.
-pub type ChunkProgress<'a> = &'a mut dyn FnMut(u64, Option<u64>);
+/// Per-chunk download progress: bytes written so far, total size if known. Return `false` to
+/// abort the download mid-stream (the partial file is kept — it resumes later); impls fail the
+/// transfer with an error when aborted.
+pub type ChunkProgress<'a> = &'a mut dyn FnMut(u64, Option<u64>) -> bool;
 
 /// Send + Sync: install's phase 1 downloads several files at once from a worker pool, sharing
 /// one Downloader reference across threads.
@@ -132,7 +134,7 @@ pub mod fake {
             }
             out.extend_from_slice(&bytes[out.len()..]);
             std::fs::write(dest, &out).with_context(|| format!("writing {}", dest.display()))?;
-            progress(out.len() as u64, Some(out.len() as u64));
+            let _ = progress(out.len() as u64, Some(out.len() as u64));
             Ok((out.len() as u64, hex::encode(sha2::Sha256::digest(&out))))
         }
     }

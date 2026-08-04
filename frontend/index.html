@@ -144,7 +144,10 @@
               </label>
               <label class="field">
                 <span class="label" data-i18n="set.token"></span>
-                <input id="in-token" type="password" spellcheck="false" />
+                <div class="row">
+                  <input id="in-token" type="password" spellcheck="false" />
+                  <button class="btn ghost inline hidden" id="btn-token-clear" data-i18n="btn.clearToken"></button>
+                </div>
                 <span class="hint" data-i18n="set.tokenHint"></span>
               </label>
             </div>
@@ -255,6 +258,7 @@
           <div class="cands-empty hidden" id="cands-empty" data-i18n="setup.none"></div>
           <ul class="cands" id="cands"></ul>
         </div>
+        <div class="msg hidden" id="af-msg"></div>
         <div class="modal-actions">
           <button class="btn ghost" id="btn-af-done" data-i18n="btn.close"></button>
         </div>

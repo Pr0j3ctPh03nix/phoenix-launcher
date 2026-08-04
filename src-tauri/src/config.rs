@@ -126,7 +126,11 @@ impl Settings {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&p, serde_json::to_string_pretty(self)?)?;
+        // temp + rename: a crash mid-write can't torch the settings (the corrupt-file .bak
+        // path in `load` stays a last resort)
+        let tmp = p.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
+        std::fs::rename(&tmp, &p)?;
         Ok(())
     }
 
