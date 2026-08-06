@@ -12,6 +12,7 @@ const state = {
   primaryMode: "check", // "check" | "apply" | "play"
   hasToken: false,
   renderer: "dx11",
+  launchFlags: [],    // [{id, args, enabled}] as loaded from settings, toggled in place
   afTarget: null,      // "setup" | "settings" — where an autofind pick lands
   afUnlisten: null,
   afBusy: false,       // a scan invoke is in flight (double-start guard)
@@ -357,6 +358,7 @@ function rerenderDynamic() {
   if (state.lastCheck) applyCheck(state.lastCheck);
   else { setIdleStatus(); renderPrimary(); }
   updateTokenPlaceholder();
+  renderLaunchFlags();
   renderOptions();
 }
 
@@ -395,6 +397,49 @@ function updateTokenPlaceholder() {
     : state.hasToken ? t("ph.tokenSaved") : t("ph.tokenEmpty");
 }
 
+// The optional launch flags (backend table, one plate each — the whole plate is the switch, so
+// the hit target is the row). The label is `set.flag.<id>`; a flag with no string yet falls back
+// to its raw args, so a new backend row is still usable.
+function renderLaunchFlags() {
+  const list = $("flag-list");
+  list.innerHTML = "";
+  // .hidden, not the attribute — `.field`'s display:flex would win over [hidden]
+  $("launch-flags").classList.toggle("hidden", state.launchFlags.length === 0);
+  for (const f of state.launchFlags) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "flag-row" + (f.enabled ? " on" : "");
+    row.setAttribute("role", "switch");
+    row.setAttribute("aria-checked", String(f.enabled));
+
+    const text = document.createElement("span");
+    text.className = "flag-text";
+    const name = document.createElement("span");
+    name.className = "flag-name";
+    const key = "set.flag." + f.id;
+    const label = t(key);
+    name.textContent = label === key ? f.args : label;
+    const args = document.createElement("span");
+    args.className = "flag-args";
+    args.textContent = f.args;
+    text.append(name, args);
+
+    const sw = document.createElement("span");
+    sw.className = "switch" + (f.enabled ? " on" : "");
+    sw.setAttribute("aria-hidden", "true");
+
+    row.addEventListener("click", () => {
+      f.enabled = !f.enabled;
+      row.classList.toggle("on", f.enabled);
+      sw.classList.toggle("on", f.enabled);
+      row.setAttribute("aria-checked", String(f.enabled));
+    });
+
+    row.append(text, sw);
+    list.append(row);
+  }
+}
+
 // The form's current content, for the discard-changes guard. Language is excluded — it applies
 // (and persists) instantly on toggle, so it is never "unsaved".
 function settingsSnapshot() {
@@ -403,6 +448,7 @@ function settingsSnapshot() {
     game: $("in-game").value,
     launch: $("in-launch").value,
     renderer: segValue($("seg-renderer")),
+    flags: state.launchFlags.map((f) => [f.id, f.enabled]),
     token: $("in-token").value,
     clear: state.tokenClear,
   });
@@ -423,6 +469,8 @@ async function openSettings() {
   state.hasToken = s.hasToken;
   state.tokenClear = false;
   state.renderer = s.renderer || "dx11";
+  state.launchFlags = (s.launchFlags || []).map((f) => ({ ...f }));
+  renderLaunchFlags();
   updateTokenPlaceholder();
   $("btn-token-clear").classList.toggle("hidden", !state.hasToken);
   setSeg($("seg-renderer"), state.renderer);
@@ -445,6 +493,7 @@ async function saveSettings() {
       language: LANG,
       launchExtra: $("in-launch").value,
       renderer: segValue($("seg-renderer")) || "dx11",
+      launchFlags: Object.fromEntries(state.launchFlags.map((f) => [f.id, f.enabled])),
     });
     // a save that changes where updates come from (folder, repo, credentials) makes every bit
     // of the shown state stale — the status, the file list, and above all Play, which would

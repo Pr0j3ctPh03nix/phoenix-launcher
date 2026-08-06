@@ -20,7 +20,18 @@ pub struct SettingsView {
     pub language: Option<String>,
     pub launch_extra: String,
     pub renderer: String,
+    /// The optional launch flags, in table order — the UI renders one switch per entry.
+    pub launch_flags: Vec<LaunchFlagView>,
     pub selections: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchFlagView {
+    pub id: String,
+    /// The options this flag adds, shown verbatim under its label.
+    pub args: String,
+    pub enabled: bool,
 }
 
 #[derive(Serialize)]

@@ -47,7 +47,8 @@ the target game build, by editing the dist repo + cutting a release — the upda
         state.rs          per-install record, stored in the game folder (corrupt -> quarantine)
         fslock.rs         shared Windows lock probes: probe() -> Writable / Held (sharing
                           violation = live process) / Denied (read-only, ACL) + held_by_process()
-        launch.rs         spawns dota2.exe (base options + renderer + extras) + game_running
+        launch.rs         spawns dota2.exe (base options + renderer + LAUNCH_FLAGS + extras)
+                          + game_running
                           (write-probe of the exe image; a running process is locked)
         autofind.rs       game-folder scan: Steam libraries (registry/vdf) then all drives
       tauri.conf.json     window + bundle config
@@ -126,7 +127,8 @@ uninstall against a **decoy**, never a real game install.
   field keeps the saved one; removing it takes the explicit `clear_token` flag (the UI's Clear
   button). The build-time baked token is merged at the point of use (`Settings::token()`), never
   into the persisted struct — a settings save can't write it to disk. Also persisted: `language`
-  (en/ru), `launch_extra`, `renderer` (dx11/dx9), and `selections` (manifest option id -> variant
+  (en/ru), `launch_extra`, `renderer` (dx11/dx9), `launch_flags` (see Launch), and `selections`
+  (manifest option id -> variant
   id or bool). Settings and the install state file are written temp+rename (atomic on the same
   volume) — a crash mid-write can't torch them; the quarantine/.bak loaders stay last resorts.
   Saving a change to the game folder, repo, or token invalidates the check view and re-checks —
@@ -144,7 +146,14 @@ uninstall against a **decoy**, never a real game install.
   manifest + tag), so the frontend's post-apply and post-uninstall refreshes are offline-safe
   replans — a successful offline uninstall can never end in a red network error.
 - **Launch**: `play` runs `game/bin/win64/dota2.exe` with hardcoded
-  `-insecure -console +exec autoexec.cfg` + `-dx11`/`-dx9` + user extras. Play is enabled in the
+  `-insecure -console +exec autoexec.cfg` + `-dx11`/`-dx9` + enabled `LAUNCH_FLAGS` + user extras
+  (user's last, so a duplicated option lands on their value). `launch::LAUNCH_FLAGS` is the single
+  source of truth for the optional flags settings expose as switches (id + args + default; today
+  `noCloudKeybinds` -> `+dota_keybindings_cloud_disable 1`): the settings view, `save_settings`
+  and the spawn all read it, so a new flag = one row + a `set.flag.<id>` string in i18n.js (with
+  no string the UI shows the raw args). `settings.launch_flags` (id -> bool) stores only ids the
+  table knows — a missing id means the flag's own default, so new flags need no migration and a
+  stale key from another build can't inject arguments. Play is enabled in the
   UI only when installed with no pending changes; Check is always available. The autoexec.cfg
   editor reads bytes: a non-UTF-8 file (cp1251 comments are real) comes back lossy-decoded with
   a `lossy` flag and the editor goes read-only — saving a lossy decode (or after a failed read)

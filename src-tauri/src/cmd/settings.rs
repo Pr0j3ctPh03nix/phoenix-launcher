@@ -1,11 +1,13 @@
 //! Settings commands: read, save, and the single-field setters (setup flow, language toggle,
 //! customization selections). All writes go through `Settings::update`, which serializes them.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::config::{self, Settings};
+use crate::launch;
 use crate::steaminf;
-use crate::views::{CmdError, GameDirStatus, SettingsView};
+use crate::views::{CmdError, GameDirStatus, LaunchFlagView, SettingsView};
 
 #[tauri::command]
 pub fn get_settings() -> SettingsView {
@@ -17,6 +19,14 @@ pub fn get_settings() -> SettingsView {
         language: s.language,
         launch_extra: s.launch_extra,
         renderer: s.renderer,
+        launch_flags: launch::LAUNCH_FLAGS
+            .iter()
+            .map(|f| LaunchFlagView {
+                id: f.id.to_string(),
+                args: f.args.join(" "),
+                enabled: launch::flag_enabled(&s.launch_flags, f.id),
+            })
+            .collect(),
         selections: serde_json::to_value(&s.selections).unwrap_or_default(),
     }
 }
@@ -31,6 +41,7 @@ pub fn save_settings(
     language: Option<String>,
     launch_extra: String,
     renderer: String,
+    launch_flags: BTreeMap<String, bool>,
 ) -> Result<(), CmdError> {
     Settings::update(move |s| {
         s.source_repo = if source_repo.trim().is_empty() {
@@ -49,6 +60,13 @@ pub fn save_settings(
         s.language = language;
         s.launch_extra = launch_extra;
         s.renderer = if renderer == "dx9" { renderer } else { "dx11".to_string() };
+        // only ids the table knows are stored: a key from another build never accumulates on
+        // disk, and a flag the UI didn't send keeps whatever was saved
+        for f in launch::LAUNCH_FLAGS {
+            if let Some(&on) = launch_flags.get(f.id) {
+                s.launch_flags.insert(f.id.to_string(), on);
+            }
+        }
         // selections untouched — they persist independently
     })
     .map_err(CmdError::from)

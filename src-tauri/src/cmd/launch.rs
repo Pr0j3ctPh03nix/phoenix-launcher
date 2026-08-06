@@ -10,7 +10,7 @@ use crate::views::{AutoexecView, CmdError};
 pub fn play() -> Result<(), CmdError> {
     let s = Settings::load();
     let gd = s.resolve_game_dir().map_err(CmdError::from)?;
-    launch::launch(&gd, &s.renderer, &s.launch_extra).map_err(CmdError::from)
+    launch::launch(&gd, &s.renderer, &s.launch_extra, &s.launch_flags).map_err(CmdError::from)
 }
 
 /// Is the game currently running? The frontend polls this every few seconds: it shows an

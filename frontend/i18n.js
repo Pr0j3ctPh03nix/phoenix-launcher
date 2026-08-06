@@ -75,6 +75,9 @@ const I18N = {
     "set.launch": "Launch options",
     "set.launchHint": "Always passed. Add your own after.",
     "set.launchPh": "additional options",
+    "set.flags": "Tweaks",
+    // one per launch::LAUNCH_FLAGS id — key is "set.flag." + id
+    "set.flag.noCloudKeybinds": "Keep keybinds local (no Steam Cloud sync)",
     "set.renderer": "Renderer",
     "set.autoexec": "Config",
     "set.autoexecBtn": "Edit autoexec.cfg",
@@ -189,6 +192,8 @@ const I18N = {
     "set.launch": "Параметры запуска",
     "set.launchHint": "Передаются всегда. Свои — после них.",
     "set.launchPh": "дополнительные параметры",
+    "set.flags": "Твики",
+    "set.flag.noCloudKeybinds": "Хранить раскладку локально (без Steam Cloud)",
     "set.renderer": "Рендер",
     "set.autoexec": "Конфиг",
     "set.autoexecBtn": "Править autoexec.cfg",

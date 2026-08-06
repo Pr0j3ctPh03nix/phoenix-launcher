@@ -3,6 +3,8 @@
 #
 # Tag push (v*) -> build + GitHub Release with phoenix-launcher.exe attached.
 # Manual run (workflow_dispatch) -> build only, exe uploaded as a workflow artifact.
+#
+# The Rust cache is WRITTEN by ci.yml (on main), not here — see the rust-cache step below.
 
 name: release
 
@@ -33,6 +35,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          # RESTORE-ONLY on tags. Actions caches are ref-scoped: a run may only read caches from
+          # its own ref or from the default branch. A cache saved under refs/tags/v1.2.0 is
+          # invisible to refs/tags/v1.2.1, so saving here would upload ~GBs that nothing ever
+          # reads. ci.yml warms main's cache; every tag run restores from it.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # must match ci.yml — the default key includes the job id, which differs per workflow
+          shared-key: tauri-win-release
           # a failed build still caches the deps that did compile — a retry resumes instead of
           # starting from zero
           cache-on-failure: true

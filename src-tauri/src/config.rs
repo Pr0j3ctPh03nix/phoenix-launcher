@@ -45,6 +45,10 @@ pub struct Settings {
     /// Renderer flag for launch: "dx11" (default) or "dx9".
     #[serde(default = "default_renderer")]
     pub renderer: String,
+    /// Optional launch flags: `launch::LAUNCH_FLAGS` id -> on. A missing id means the flag's
+    /// own default, so a new flag needs no migration.
+    #[serde(default)]
+    pub launch_flags: BTreeMap<String, bool>,
     /// Manifest option selections: option id -> variant id (choice) or bool (toggle).
     #[serde(default)]
     pub selections: BTreeMap<String, serde_json::Value>,
@@ -72,6 +76,7 @@ impl Default for Settings {
             language: None,
             launch_extra: String::new(),
             renderer: default_renderer(),
+            launch_flags: BTreeMap::new(),
             selections: BTreeMap::new(),
         }
     }

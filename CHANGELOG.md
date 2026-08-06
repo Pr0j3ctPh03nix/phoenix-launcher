@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.2.1 — 2026-08-06
+
+### Added
+- **Launch tweaks**: settings expose optional launch options as switches, the first being
+  *Keep keybinds local* (`+dota_keybindings_cloud_disable 1`) — Dota otherwise syncs
+  keybindings through Steam Cloud and can overwrite local ones on launch.
+  `launch::LAUNCH_FLAGS` (id + args + default) is the single source of truth: the settings
+  view, `save_settings` and the spawn all read it, so a new flag is one table row plus a
+  `set.flag.<id>` string (without one the UI shows the raw args). Persisted as
+  `launch_flags` (id -> bool), storing only ids the table knows — a missing id means the
+  flag's own default, so new flags need no migration and a stale key from another build
+  cannot inject arguments. The user's extras still come last, so a duplicated option lands
+  on their value.
+
+### Fixed
+- **Release builds no longer recompile every dependency from scratch.** Actions caches are
+  ref-scoped: a run may only restore caches from its own ref or from the default branch, so
+  the cache each tag build saved was invisible to every later tag — `release` never once hit
+  its own cache. A new `ci` workflow (main pushes, weekly cron, manual) now writes the cache
+  from `main` and `release` is restore-only; both carry the same rust-cache `shared-key`,
+  since the default key embeds the job id and would differ across workflows. The weekly run
+  also keeps the entry ahead of GitHub's 7-day eviction of unused caches.
+
 ## 1.2.0 — 2026-08-04
 
 ### Added
