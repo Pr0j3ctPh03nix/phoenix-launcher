@@ -1,0 +1,24 @@
+{
+  "schema": 3,
+  "version": "1.0.0",
+  "notes": "### Added\n- Something a player can see.",
+  "files": [
+    {
+      "name": "pak01_000.vpk",
+      "dest": "game/dota/pak01_000.vpk",
+      "sha256": "7b4c2d7516f75dbac823ecb59828a8d2a42589cb96f4bcd4d49926971fa1e932",
+      "size": 5588
+    },
+    {
+      "dest": "game/dota/empty.marker",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
+    }
+  ],
+  "remove": [
+    {
+      "dest": "game/dota/scripts/regions.txt"
+    }
+  ],
+  "options": []
+}

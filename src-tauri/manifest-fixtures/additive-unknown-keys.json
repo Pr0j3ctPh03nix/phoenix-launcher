@@ -1,20 +1,60 @@
 {
-  "schema": 2,
+  "schema": 3,
   "version": "1.0.0",
   "notes": "### Added\n- Something a player can see.",
+  "bundles": [
+    {
+      "name": "b000-txt-4f3a91c2e5d8.phxb",
+      "codec": "zstd",
+      "psize": 7633,
+      "psha256": "7fd8bc307e43703a1df170724b5facda3cebaeaff5e1783fc824bdcf81c82b3c",
+      "size": 22899,
+      "members": [
+        "37552e086665ccac8a7ad7fa0ebe1a608c2cbd83e8a1cac7e324884aafffff6e",
+        "be41f7e8050257dd8851c9384fd16b4063b4d70384f80d1dbba14df482cab5e5",
+        "ffe9dacff9bbaa5d508a84be9a1a20869eaaf5324de853c067ca6d3a57270f80",
+        "634c0f4d9c199e010a28c8e2aaf48b86c005ffa33c6458936d2cb2b788c4d2c4"
+      ],
+      "some_future_bundle_key": "ignore me too"
+    },
+    {
+      "name": "b001-pack-9c2e7ab04d13.phxb",
+      "codec": "zstd",
+      "psize": 34952533,
+      "psha256": "45e116fe6bb47162f76f8cfa1947e46066fc1d9cc3e321cd3e035909db66235b",
+      "size": 104857600,
+      "members": [
+        "71000e2e30bf6fae705511f8e1ea3ecca8ce18fc678e248b35b2662a6d6d0996"
+      ]
+    }
+  ],
   "files": [
     {
-      "name": "winmm.dll",
-      "dest": "game/bin/win64/winmm.dll",
-      "sha256": "d508058f7eba5f70d1daf7de8c2d5fc35b39d9cbbcbf00762bf55b77dbac517a",
-      "size": 1560,
+      "name": "pak01_000.vpk",
+      "dest": "game/dota/pak01_000.vpk",
+      "sha256": "7b4c2d7516f75dbac823ecb59828a8d2a42589cb96f4bcd4d49926971fa1e932",
+      "size": 5588,
       "some_future_entry_key": "ignore me"
     },
     {
-      "name": "regions.txt",
-      "dest": "game/dota_phoenix/scripts/regions.txt",
-      "sha256": "9b73a25d93b7fbaf9895e03bfe89ad98fac432055911dd4a568b10262697731f",
-      "size": 4819
+      "dest": "game/dota/scripts/npc/npc_units.txt",
+      "sha256": "37552e086665ccac8a7ad7fa0ebe1a608c2cbd83e8a1cac7e324884aafffff6e",
+      "size": 6189
+    },
+    {
+      "dest": "game/dota/scripts/npc/hero_ids.txt",
+      "sha256": "be41f7e8050257dd8851c9384fd16b4063b4d70384f80d1dbba14df482cab5e5",
+      "size": 4729
+    },
+    {
+      "dest": "game/dota/bin/win64/client.dll",
+      "sha256": "71000e2e30bf6fae705511f8e1ea3ecca8ce18fc678e248b35b2662a6d6d0996",
+      "size": 104857600
+    },
+    {
+      "dest": "game/dota/empty.marker",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "size": 0
     }
   ],
   "remove": [
@@ -34,24 +74,23 @@
       "dest": "game/dota_phoenix/maps/dota.vpk",
       "variants": [
         {
-          "name": "opt__lighting__mod.vpk",
-          "sha256": "ffe9dacff9bbaa5d508a84be9a1a20869eaaf5324de853c067ca6d3a57270f80",
-          "size": 3537,
           "id": "mod",
           "label": {
             "en": "New lighting",
             "ru": "Новое освещение"
-          }
+          },
+          "sha256": "ffe9dacff9bbaa5d508a84be9a1a20869eaaf5324de853c067ca6d3a57270f80",
+          "size": 3537
         },
         {
-          "name": "opt__lighting__original.vpk",
-          "sha256": "37b5d4462d71d85f4eee306a80c93c4827c6e8bb42df31dc8635ab201618df6e",
-          "size": 6285,
           "id": "original",
           "label": {
             "en": "Original lighting",
             "ru": "Оригинальное освещение"
-          }
+          },
+          "name": "opt__lighting__original.vpk",
+          "sha256": "37b5d4462d71d85f4eee306a80c93c4827c6e8bb42df31dc8635ab201618df6e",
+          "size": 6285
         }
       ],
       "description": {
@@ -68,7 +107,6 @@
       "default": false,
       "files": [
         {
-          "name": "opt__terrain__pak01_dir.vpk",
           "dest": "game/dota_phoenix/pak01_dir.vpk",
           "sha256": "634c0f4d9c199e010a28c8e2aaf48b86c005ffa33c6458936d2cb2b788c4d2c4",
           "size": 8444

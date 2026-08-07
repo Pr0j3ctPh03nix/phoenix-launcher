@@ -5,7 +5,7 @@
   "bundles": [
     {
       "name": "b000-txt-4f3a91c2e5d8.phxb",
-      "codec": "zstd",
+      "codec": "brotli",
       "psize": 7633,
       "psha256": "7fd8bc307e43703a1df170724b5facda3cebaeaff5e1783fc824bdcf81c82b3c",
       "size": 22899,

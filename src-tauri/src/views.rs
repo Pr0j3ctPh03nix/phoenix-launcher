@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use crate::downloader::NetKind;
 use crate::engine::{self, Action, Cancelled, GameRunning};
-use crate::manifest::{Label, OptionKind, UnsupportedSchema};
+use crate::manifest::{Label, OptionKind, UnsupportedCodec, UnsupportedSchema};
 use crate::state;
 
 // ---------------- view types serialized to the webview ----------------
@@ -145,6 +145,10 @@ pub struct LauncherProgress {
 }
 
 /// What a fresh base-game download would do — the confirm dialog's numbers, before any bytes.
+///
+/// Since manifest schema 3 the byte totals come in TWO currencies (bundles compress): `bytes`
+/// is the wire, `disk_bytes` is what lands. Every progress surface (bar, ETA, "downloaded so
+/// far", `cached_bytes`) speaks wire; the free-space line speaks `need_bytes`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GamePlanView {
@@ -152,10 +156,18 @@ pub struct GamePlanView {
     /// Files that would download.
     pub files: u32,
     pub total_files: u32,
-    /// Bytes that would download (unique content).
+    /// Bytes that would cross the NETWORK (unique assets; a needed bundle counts its packed
+    /// size once) — the download bar's full extent.
     pub bytes: u64,
+    /// Decoded bytes that would LAND on disk (unique content) — the installed footprint.
+    pub disk_bytes: u64,
+    /// What the backend's disk preflight will demand (footprint + packed-bundle transient,
+    /// before its safety margin) — the frontend's early space warning mirrors this exactly, so
+    /// the confirm can never green-light a run the backend then refuses.
+    pub need_bytes: u64,
     /// Of `bytes`, how much already sits in the base cache from an interrupted attempt (full
-    /// entries + `.part` prefixes) — the confirm's "X of Y GB already downloaded" line.
+    /// entries, packed bundles, `.part` prefixes) — the confirm's "X of Y GB already
+    /// downloaded" line.
     pub cached_bytes: u64,
     /// Of `files`, how many are already COMPLETELY fetched (a `.part` counts toward bytes, not
     /// here) — without this the resume confirm counted the finished files as still-to-do.
@@ -184,7 +196,9 @@ pub struct GameVerifyView {
     /// Dests under shim management with no preserved original — not checkable, not damaged.
     pub skipped: u32,
     pub damaged: Vec<String>,
-    /// Unique bytes a repair would download — the repair progress bar's full extent.
+    /// WIRE bytes a repair would download — the repair progress bar's full extent. Needing one
+    /// member of a bundle costs the whole packed bundle, so this can dwarf the damaged files'
+    /// own sizes; it is the honest number for "what will this cost me".
     pub damaged_bytes: u64,
     /// The folder holds a DIFFERENT game build (its steam.inf exists but doesn't match). Every
     /// file then reads as "damaged" while nothing is actually broken, and a repair would
@@ -246,8 +260,12 @@ fn wire_kind(e: &anyhow::Error) -> &'static str {
             };
         }
         // wire kind stays "tooOld": from the user's side an unreadable manifest schema IS an
-        // out-of-date launcher, and the frontend already words it that way
-        if c.downcast_ref::<UnsupportedSchema>().is_some() {
+        // out-of-date launcher, and the frontend already words it that way. An undecodable
+        // bundle codec is the same answer with a different detection point (manifest R2) —
+        // never "your download is corrupt".
+        if c.downcast_ref::<UnsupportedSchema>().is_some()
+            || c.downcast_ref::<UnsupportedCodec>().is_some()
+        {
             return "tooOld";
         }
         if c.downcast_ref::<GameRunning>().is_some() {

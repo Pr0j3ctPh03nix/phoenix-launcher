@@ -8,9 +8,8 @@
       "codec": "zstd",
       "psize": 7633,
       "psha256": "7fd8bc307e43703a1df170724b5facda3cebaeaff5e1783fc824bdcf81c82b3c",
-      "size": 22899,
+      "size": 16710,
       "members": [
-        "37552e086665ccac8a7ad7fa0ebe1a608c2cbd83e8a1cac7e324884aafffff6e",
         "be41f7e8050257dd8851c9384fd16b4063b4d70384f80d1dbba14df482cab5e5",
         "ffe9dacff9bbaa5d508a84be9a1a20869eaaf5324de853c067ca6d3a57270f80",
         "634c0f4d9c199e010a28c8e2aaf48b86c005ffa33c6458936d2cb2b788c4d2c4"

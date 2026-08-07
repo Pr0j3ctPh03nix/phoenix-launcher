@@ -46,20 +46,18 @@ pub async fn game_plan(
         let statuses =
             install::base_plan(&dir, &manifest, Some(&emit), "plan", Some(&st.game_cancel))
                 .map_err(CmdError::from)?;
-        // unique content only — dests sharing a hash download once
-        let mut seen = std::collections::HashSet::new();
-        let bytes = statuses
-            .iter()
-            .filter(|s| s.action == BaseAction::Write)
-            .filter(|s| seen.insert(s.entry.sha256.as_str()))
-            .map(|s| s.entry.size)
-            .sum();
-        let (cached_bytes, cached_files) = install::base_cached(&dir, &statuses);
+        // R7's two currencies: `bytes` (wire) feeds the bar/ETA/confirm, `disk_bytes` the
+        // footprint, `need_bytes` the space warning — same math as the backend preflight
+        let (wire, disk, need) =
+            install::base_costs(&manifest, &statuses).map_err(CmdError::from)?;
+        let (cached_bytes, cached_files) = install::base_cached(&dir, &manifest, &statuses);
         Ok(GamePlanView {
             version: manifest.version,
             files: statuses.iter().filter(|s| s.action == BaseAction::Write).count() as u32,
             total_files: statuses.len() as u32,
-            bytes,
+            bytes: wire,
+            disk_bytes: disk,
+            need_bytes: need,
             cached_bytes,
             cached_files: cached_files as u32,
             free_bytes: install::free_space(&dir),
@@ -232,13 +230,10 @@ pub async fn game_verify(
             install::base_plan(&dir, &manifest, Some(&emit), "verify", Some(&st.game_cancel))
                 .map_err(CmdError::from)?;
         let count = |a: BaseAction| statuses.iter().filter(|s| s.action == a).count() as u32;
-        let mut seen = std::collections::HashSet::new();
-        let damaged_bytes = statuses
-            .iter()
-            .filter(|s| s.action == BaseAction::Write)
-            .filter(|s| seen.insert(s.entry.sha256.as_str()))
-            .map(|s| s.entry.size)
-            .sum();
+        // wire cost: repairing one member of a bundle re-fetches the whole packed bundle, and
+        // the repair bar/confirm must promise that number, not the damaged files' own sizes
+        let (damaged_bytes, _disk, _need) =
+            install::base_costs(&manifest, &statuses).map_err(CmdError::from)?;
         // a populated folder whose steam.inf does not match is a DIFFERENT build, not a damaged
         // one — computed before `manifest.version` is moved into the view below
         let foreign_build = install::foreign_build(&dir, &manifest);

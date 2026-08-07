@@ -141,13 +141,12 @@ pub fn manifest_of(dl: &dyn Downloader, release: &Release) -> Result<Manifest> {
 
 /// Merge every release of the game repo's assets into the manifest release.
 ///
-/// GitHub caps a release at 1,000 assets and the base-game tree is ~4.6k files, so game-dist
-/// SHARDS them: the versioned release (always the repo's latest — shards are prereleases, which
-/// `/releases/latest` never resolves to) carries manifest.json, and `<tag>-assets-N` prereleases
-/// carry the files. Folding every shard's assets into the main `Release` keeps the entire
-/// download machinery on its single-release worldview — nothing downstream knows shards exist.
-/// First name wins on a clash (the manifest release outranks shards); an unsharded repo merges
-/// to itself.
+/// Historical: GitHub caps a release at 1,000 assets, and before manifest schema 3 the ~4.6k
+/// base-game files were SHARDED across `<tag>-assets-N` prereleases (the versioned release —
+/// always the repo's latest, since prereleases never resolve as latest — carried manifest.json).
+/// Bundles collapsed the tree to ~146 assets in ONE release, so today this folds a single
+/// release into itself — a harmless no-op, kept in case a sharded release ever reappears.
+/// First name wins on a clash (the manifest release outranks shards).
 pub fn merged_game_release(dl: &dyn Downloader, repo: &str, mut main: Release) -> Result<Release> {
     let all = dl.fetch_releases(repo).context("listing the game repo's asset shards")?;
     let mut have: HashSet<String> = main.assets.iter().map(|a| a.name.clone()).collect();

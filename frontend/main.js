@@ -1151,23 +1151,27 @@ async function gdOpen(origin, dir) {
     if (planUnlisten) planUnlisten();
   }
   if ($("gd-modal").classList.contains("hidden")) return;
+  // WIRE bytes: bundles compress, so what downloads and what lands on disk are two different
+  // numbers now — the bar/ETA/"downloaded so far" all speak the wire, the confirm names both
   gd.bytes = plan.bytes;
   gd.files = plan.files;
+  const disk = (plan.diskBytes / GB).toFixed(1);
   // an interrupted attempt left verified-size entries/.parts in the cache: say how much of the
   // plan is already here — bytes AND files ("did my 5 GB survive the restart?"). The files
   // number is completely-fetched only; a .part counts toward the bytes, not the files.
   $("gd-summary").textContent = plan.cachedBytes > 0
     ? t("gd.confirmResume", {
         have: (plan.cachedBytes / GB).toFixed(1), gb: (plan.bytes / GB).toFixed(1),
-        df: plan.cachedFiles, n: plan.files, dir,
+        df: plan.cachedFiles, n: plan.files, disk, dir,
       })
-    : t("gd.confirm", { gb: (plan.bytes / GB).toFixed(1), n: plan.files, dir });
-  // refuse up front what the backend would refuse a click later — same margin (512 MB)
-  const short = plan.freeBytes != null && plan.freeBytes < plan.bytes + 512 * 1024 * 1024;
+    : t("gd.confirm", { gb: (plan.bytes / GB).toFixed(1), n: plan.files, disk, dir });
+  // refuse up front what the backend would refuse a click later — its exact demand (decoded
+  // footprint + packed-bundle transient, computed backend-side) plus the same 512 MB margin
+  const short = plan.freeBytes != null && plan.freeBytes < plan.needBytes + 512 * 1024 * 1024;
   $("gd-space").hidden = !short;
   if (short) {
     $("gd-space").textContent = t("gd.noSpace", {
-      need: (plan.bytes / GB).toFixed(1), free: (plan.freeBytes / GB).toFixed(1),
+      need: (plan.needBytes / GB).toFixed(1), free: (plan.freeBytes / GB).toFixed(1),
     });
   }
   $("btn-gd-go").disabled = short;

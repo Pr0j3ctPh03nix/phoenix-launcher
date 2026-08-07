@@ -22,10 +22,18 @@ use std::collections::HashMap;
 ///
 ///   1  the original flat {files, remove} document — predates the `schema` key entirely
 ///   2  adds options[] (choice/toggle); an unknown `kind` is fatal to a v1 reader
+///   3  adds bundles[] (many files as one solid zstd stream) and makes `name` OPTIONAL on every
+///      file-bearing entry — a nameless entry's bytes come from the bundle carrying its sha256
+///      (spec: docs/manifest-format-v3.md in the dist repo)
 ///
 /// Raise `MAX_SCHEMA` in the same change that teaches the reader the new format, never before.
 pub const MIN_SCHEMA: u32 = 1;
-pub const MAX_SCHEMA: u32 = 2;
+pub const MAX_SCHEMA: u32 = 3;
+
+/// Bundle codecs this build can decode. Adding one is a `schema` bump by the spec's bump rule,
+/// so the schema gate normally catches a new codec first — the explicit check (R2) is defence in
+/// depth against a producer that broke that rule.
+const CODECS: &[&str] = &["zstd"];
 
 /// What an ABSENT `schema` means. Schema 1 predates the key, so requiring it would reject every
 /// manifest published before it existed.
@@ -55,6 +63,27 @@ impl std::fmt::Display for UnsupportedSchema {
 
 impl std::error::Error for UnsupportedSchema {}
 
+/// A bundle names a codec this build cannot decode, under a schema it CAN read. Same user-facing
+/// answer as `UnsupportedSchema` — "update the launcher", never "your download is corrupt" — and
+/// the shell maps it to the same `tooOld` wire kind; only the detection point differs (R2).
+#[derive(Debug, Clone)]
+pub struct UnsupportedCodec {
+    pub bundle: String,
+    pub codec: String,
+}
+
+impl std::fmt::Display for UnsupportedCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "this release's bundle {} uses codec {:?}, which this launcher cannot decode — update the launcher",
+            self.bundle, self.codec
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedCodec {}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     /// Format version of this document, as decided by `read_schema` during `parse`.
@@ -77,6 +106,10 @@ pub struct Manifest {
     /// file set). Absent in older manifests.
     #[serde(default)]
     pub options: Vec<OptionEntry>,
+    /// Many files' bytes as one solid compressed release asset (schema 3). Absent means none —
+    /// a schema-3 document with no bundles is exactly a schema-2 document (R1).
+    #[serde(default)]
+    pub bundles: Vec<Bundle>,
 }
 
 fn default_schema() -> u32 {
@@ -105,7 +138,9 @@ impl Manifest {
         Ok(manifest)
     }
 
-    /// Check every install destination in the document before anything can act on one.
+    /// Check every install destination in the document before anything can act on one, then the
+    /// bundle invariants — all at parse time (R9): a lazy check would report a broken release
+    /// partway through a multi-gigabyte install, and could not be conformance-tested at all.
     fn validate(&self) -> Result<()> {
         for f in &self.files {
             check_dest(&f.dest)?;
@@ -121,8 +156,100 @@ impl Manifest {
                 check_dest(&f.dest)?;
             }
         }
+        self.validate_bundles()
+    }
+
+    /// Every file-bearing entry in the document — files[], toggle files, and choice variants —
+    /// as (asset name, content hash, size). Variants are included deliberately: a variant can be
+    /// a bundle member, lives outside files[], and shares its dest with its siblings — which is
+    /// exactly why bundle membership is keyed by content hash rather than by path or position.
+    pub fn payload_entries(&self) -> impl Iterator<Item = (Option<&str>, &str, u64)> {
+        let files = self.files.iter().map(|f| (f.name.as_deref(), f.sha256.as_str(), f.size));
+        let opts = self.options.iter().flat_map(|o| {
+            let vs = o.variants.iter().map(|v| (v.name.as_deref(), v.sha256.as_str(), v.size));
+            let fs = o.files.iter().map(|f| (f.name.as_deref(), f.sha256.as_str(), f.size));
+            vs.chain(fs)
+        });
+        files.chain(opts)
+    }
+
+    /// The producer guarantees B1–B8 (docs/manifest-format-v3.md) plus the codec gate (R2),
+    /// validated rather than trusted: a violation is a producer defect — a broken release — and
+    /// deserves to be named as one up front, not discovered as a mid-download hash mismatch.
+    ///
+    /// Message prefixes ("B2: …") match the reference validator (tools/validate_manifest.py) so
+    /// a launcher-side refusal and a dist-side selftest describe the same defect the same way.
+    ///
+    /// B8 is checked the way the reference does: bundle names against each other and against
+    /// entry names — NOT entry names against each other, which schema 2 never promised (two
+    /// dests may legitimately share one asset).
+    fn validate_bundles(&self) -> Result<()> {
+        let size_of: HashMap<&str, u64> =
+            self.payload_entries().map(|(_, sha, size)| (sha, size)).collect();
+        let entry_names: std::collections::HashSet<&str> =
+            self.payload_entries().filter_map(|(name, _, _)| name).collect();
+
+        let mut names = std::collections::HashSet::new();
+        let mut all_members: HashMap<&str, &str> = HashMap::new(); // member -> first bundle
+        for b in &self.bundles {
+            if !CODECS.contains(&b.codec.as_str()) {
+                return Err(anyhow!(UnsupportedCodec {
+                    bundle: b.name.clone(),
+                    codec: b.codec.clone(),
+                }));
+            }
+            if !names.insert(b.name.as_str()) || entry_names.contains(b.name.as_str()) {
+                bail_invalid(format!("B8: duplicate asset name {}", b.name))?;
+            }
+            if b.members.is_empty() {
+                bail_invalid(format!("B7: {} has no members", b.name))?;
+            }
+            let mut total: u64 = 0;
+            for m in &b.members {
+                let Some(&size) = size_of.get(m.as_str()) else {
+                    // .get, not [..12]: a malformed hash can hold multibyte characters, and
+                    // slicing on a non-boundary panics — same trap check_dest documents
+                    return bail_invalid(format!(
+                        "B1: {} member {} matches no entry",
+                        b.name,
+                        m.get(..12).unwrap_or(m)
+                    ));
+                };
+                if size == 0 {
+                    bail_invalid(format!("B6: {} carries a zero-size member", b.name))?;
+                }
+                if all_members.insert(m.as_str(), b.name.as_str()).is_some() {
+                    bail_invalid("B5: a hash appears in members more than once".to_string())?;
+                }
+                total += size;
+            }
+            if total != b.size {
+                bail_invalid(format!(
+                    "B2: {} members sum to {total}, size says {}",
+                    b.name, b.size
+                ))?;
+            }
+        }
+
+        // B3: a non-empty entry with no `name` must be claimed by exactly one bundle — nothing
+        // else in the document says where its bytes would come from. ("Exactly one" is already
+        // half-guaranteed by the B5 check above.)
+        for (name, sha, size) in self.payload_entries() {
+            if size > 0 && name.is_none() && !all_members.contains_key(sha) {
+                bail_invalid(format!(
+                    "B3: entry {} has no `name` and is in no bundle",
+                    sha.get(..12).unwrap_or(sha)
+                ))?;
+            }
+        }
         Ok(())
     }
+}
+
+/// A bundle-invariant violation: a supported schema whose document breaks a producer guarantee.
+/// A broken release — NOT an "update the launcher" answer, and not a schema refusal.
+fn bail_invalid(why: String) -> Result<()> {
+    Err(anyhow!("refusing a broken release manifest — {why}"))
 }
 
 /// The declared format version. Absent (or null) means `LEGACY_SCHEMA`. Present but not a whole
@@ -194,12 +321,46 @@ fn check_dest(dest: &str) -> Result<()> {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileEntry {
-    /// Asset name in the release.
-    pub name: String,
+    /// Asset name in the release. OPTIONAL since schema 3 — an entry resolves to bytes by exactly
+    /// one route, checked in this order (the spec's resolution table):
+    ///
+    /// 1. `size == 0` — the reader materializes an empty file; no asset exists (a leftover
+    ///    `name` on such an entry is historical and meaningless — GitHub refuses to host
+    ///    zero-byte assets, so none was ever uploaded);
+    /// 2. `name` present — that release asset, verbatim (schema-2 behaviour);
+    /// 3. `name` absent — the one bundle whose `members` carries this entry's `sha256`
+    ///    (existence and uniqueness guaranteed by B3/B5, validated at parse).
+    #[serde(default)]
+    pub name: Option<String>,
     /// Install destination, relative to the game root (the folder containing `game/`).
     pub dest: String,
     pub sha256: String,
     pub size: u64,
+}
+
+/// Many files' bytes concatenated and compressed as ONE release asset (schema 3). There is no
+/// container inside the file — no tar, no member table: the manifest already states every
+/// member's `sha256` and `size`, so the decoded stream is split by counting bytes against the
+/// members' sizes, in `members` order (B4: nothing between members, nothing after the last).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Bundle {
+    /// Release asset name. Content-addressed by the producer (embeds a psha256 prefix), but
+    /// readers use it verbatim and never parse the hash back out — `psha256` is stated below.
+    pub name: String,
+    /// Enumerated; only "zstd" is defined. Unknown -> `UnsupportedCodec` at parse time.
+    pub codec: String,
+    /// Bytes of the PACKED asset on the wire. Progress bars, ETAs and "downloaded so far" speak
+    /// this number; it is not interchangeable with `size` (R7).
+    pub psize: u64,
+    /// sha256 of the packed asset's bytes — verified BEFORE anything is decoded (R3).
+    pub psha256: String,
+    /// Bytes of the DECODED stream (== the members' sizes summed, B2). Free-space / installed-
+    /// footprint math speaks this number.
+    pub size: u64,
+    /// Content hashes of the carried entries, in stream order. Keyed by hash, not dest or
+    /// position: choice variants share one dest and live outside files[], and duplicate content
+    /// is carried once while landing at several dests.
+    pub members: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -249,8 +410,10 @@ pub struct OptionEntry {
 pub struct Variant {
     pub id: String,
     pub label: Label,
-    /// Asset name in the release.
-    pub name: String,
+    /// Asset name in the release; optional since schema 3 (same resolution routes as
+    /// `FileEntry::name` — a nameless variant's bytes come from the bundle carrying its hash).
+    #[serde(default)]
+    pub name: Option<String>,
     pub sha256: String,
     pub size: u64,
 }
@@ -270,6 +433,11 @@ mod tests {
     /// Was this refused SPECIFICALLY for its schema, rather than as a parse/validation failure?
     fn refused_for_schema(e: &anyhow::Error) -> bool {
         e.chain().any(|c| c.downcast_ref::<UnsupportedSchema>().is_some())
+    }
+
+    /// Was this refused SPECIFICALLY for an undecodable bundle codec (R2)?
+    fn refused_for_codec(e: &anyhow::Error) -> bool {
+        e.chain().any(|c| c.downcast_ref::<UnsupportedCodec>().is_some())
     }
 
     /// Walks `index.json` and asserts every documented expectation against the real reader.
@@ -313,6 +481,30 @@ mod tests {
                         "{file} was refused, but NOT for its schema — it failed as: {e:#}\n  why: {why}"
                     );
                 }
+                // supported schema, unrecognised codec: the same user-facing "update the app"
+                // as refuse:schema, but detected at the bundle (typed UnsupportedCodec)
+                "refuse:codec" => {
+                    let Err(e) = got else {
+                        panic!("{file} must be REFUSED but parsed clean\n  why: {why}");
+                    };
+                    assert!(
+                        refused_for_codec(&e),
+                        "{file} was refused, but NOT for its codec — it failed as: {e:#}\n  why: {why}"
+                    );
+                }
+                // supported schema, broken producer guarantee (B1–B8): a broken release —
+                // refused, but neither as a schema nor as a codec problem ("update the
+                // launcher" would be a lie; there is no launcher that reads it)
+                "refuse:invalid" => {
+                    let Err(e) = got else {
+                        panic!("{file} must be REFUSED but parsed clean\n  why: {why}");
+                    };
+                    assert!(
+                        !refused_for_schema(&e) && !refused_for_codec(&e),
+                        "{file} must be refused as a BROKEN RELEASE, not as a schema/codec \
+                         refusal — it failed as: {e:#}\n  why: {why}"
+                    );
+                }
                 other => panic!("{file}: unknown expectation {other:?} in index.json"),
             }
         }
@@ -320,13 +512,54 @@ mod tests {
 
     /// The accepted fixtures must not merely parse — they must yield what the spec describes.
     /// "Accept" that silently drops the options list would pass the suite and install nothing.
+    /// current.json exercises every schema-3 feature at once: a raw entry, a multi-member bundle,
+    /// a one-member bundle, a zero-byte entry and a BUNDLED option variant.
     #[test]
     fn current_fixture_parses_into_the_documented_shape() {
         let m = Manifest::parse(&std::fs::read(fixtures().join("current.json")).unwrap()).unwrap();
-        assert_eq!(m.schema, 2);
+        assert_eq!(m.schema, 3);
         assert_eq!(m.version, "1.0.0");
         assert!(m.notes.is_some_and(|n| n.contains("Added")));
+
+        assert_eq!(m.bundles.len(), 2);
+        let multi = &m.bundles[0];
+        assert_eq!(multi.name, "b000-txt-4f3a91c2e5d8.phxb");
+        assert_eq!(multi.codec, "zstd");
+        assert_eq!((multi.psize, multi.size), (7633, 22899));
+        assert_eq!(multi.members.len(), 4);
+        assert_eq!(m.bundles[1].members.len(), 1, "a one-member bundle is legal (B7)");
+
+        assert_eq!(m.files.len(), 5);
+        assert_eq!(m.files[0].name.as_deref(), Some("pak01_000.vpk"), "a raw entry keeps its name");
+        assert_eq!(m.files[1].name, None, "a bundled entry has none");
+        assert!(multi.members.contains(&m.files[1].sha256), "…and its hash is in the bundle");
+        let empty = &m.files[4];
+        assert_eq!(empty.size, 0, "a zero-byte entry is materialized, never fetched");
+        assert_eq!(m.remove.len(), 1);
+
+        let choice = &m.options[0];
+        assert_eq!(choice.kind, OptionKind::Choice);
+        assert_eq!(choice.default, serde_json::json!("original"));
+        assert_eq!(choice.variants[0].name, None, "the bundled variant — what forces hash keying");
+        assert!(multi.members.contains(&choice.variants[0].sha256));
+        assert_eq!(choice.variants[1].name.as_deref(), Some("opt__lighting__original.vpk"));
+        let toggle = &m.options[1];
+        assert_eq!(toggle.kind, OptionKind::Toggle);
+        assert_eq!(toggle.files[0].name, None);
+        assert!(multi.members.contains(&toggle.files[0].sha256));
+    }
+
+    /// Exactly what the shim producer emits today — and will keep emitting: the shim never cuts
+    /// over to 3, and it is the routine update path hit on every launch. A reader that only
+    /// handles bundled documents would break the repo it updates from.
+    #[test]
+    fn schema2_fixture_parses_into_the_shim_shape() {
+        let m =
+            Manifest::parse(&std::fs::read(fixtures().join("schema2-options.json")).unwrap()).unwrap();
+        assert_eq!(m.schema, 2);
+        assert!(m.bundles.is_empty(), "absent bundles mean none (R1)");
         assert_eq!(m.files.len(), 2);
+        assert_eq!(m.files[0].name.as_deref(), Some("winmm.dll"));
         assert_eq!(m.files[0].dest, "game/bin/win64/winmm.dll");
         assert_eq!(m.files[0].size, 1560);
         assert_eq!(m.remove.len(), 1);
@@ -339,7 +572,7 @@ mod tests {
         assert_eq!(choice.dest.as_deref(), Some("game/dota_phoenix/maps/dota.vpk"));
         assert_eq!(choice.default, serde_json::json!("original")); // variant id for a choice
         assert_eq!(choice.variants.len(), 2);
-        assert_eq!(choice.variants[0].name, "opt__lighting__mod.vpk");
+        assert_eq!(choice.variants[0].name.as_deref(), Some("opt__lighting__mod.vpk"));
         assert!(matches!(&choice.label, Label::Localized(m) if m["ru"] == "Освещение"));
 
         let toggle = &m.options[1];
@@ -359,14 +592,18 @@ mod tests {
     }
 
     /// Unknown keys are ignored, not rejected — and the recognised ones around them still land.
+    /// The fixture plants them at the top level, inside a file entry, inside a BUNDLE and inside
+    /// an option.
     #[test]
     fn additive_unknown_keys_are_ignored() {
         let m = Manifest::parse(&std::fs::read(fixtures().join("additive-unknown-keys.json")).unwrap())
             .unwrap();
-        assert_eq!(m.files.len(), 2);
+        assert_eq!(m.files.len(), 5);
         assert_eq!(m.options.len(), 2);
-        // the unknown top-level/entry keys sit beside real ones; nothing may be lost to them
+        assert_eq!(m.bundles.len(), 2);
+        // the unknown top-level/entry/bundle keys sit beside real ones; nothing may be lost
         assert_eq!(m.files[0].sha256.len(), 64);
+        assert_eq!(m.bundles[0].members.len(), 4);
         assert!(m.options[0].description.is_some(), "a known optional key next to unknown ones");
     }
 
@@ -443,6 +680,38 @@ mod tests {
                         "dest":"game/dota_phoenix/maps/dota.vpk",
                         "variants":[{"id":"v","label":"V","name":"n","sha256":"bb","size":2}]}]}"#;
         assert!(Manifest::parse(good).is_ok());
+    }
+
+    /// The B1/B3 messages truncate hashes for display; a broken manifest can put multibyte
+    /// garbage where a hash belongs, and a byte-index slice there panics mid-character. Must be
+    /// a clean refusal — a hostile document crashing the parser is strictly worse than the
+    /// arbitrary-write it failed to achieve. ("aяяяяяя": byte 12 lands mid-я.)
+    #[test]
+    fn multibyte_garbage_in_hashes_is_refused_without_panicking() {
+        let b1 = r#"{"schema":3,"version":"1","files":[],
+            "bundles":[{"name":"b","codec":"zstd","psize":1,"psha256":"p","size":1,
+                        "members":["aяяяяяя"]}]}"#;
+        let e = Manifest::parse(b1.as_bytes()).unwrap_err();
+        assert!(format!("{e:#}").contains("B1"), "got: {e:#}");
+        let b3 = r#"{"schema":3,"version":"1",
+            "files":[{"dest":"game/x","sha256":"aяяяяяя","size":4}]}"#;
+        let e = Manifest::parse(b3.as_bytes()).unwrap_err();
+        assert!(format!("{e:#}").contains("B3"), "got: {e:#}");
+    }
+
+    /// R8: arriving via a bundle relaxes nothing about `dest` — a nameless entry is checked
+    /// exactly like a named one, and refused as a traversal, not as some bundle defect.
+    #[test]
+    fn bundled_entries_get_the_same_dest_validation() {
+        let sha = "aa".repeat(32);
+        let src = format!(
+            r#"{{"schema":3,"version":"1.0.0",
+                 "files":[{{"dest":"game/../../evil.dll","sha256":"{sha}","size":4}}],
+                 "bundles":[{{"name":"b.phxb","codec":"zstd","psize":2,"psha256":"bb",
+                              "size":4,"members":["{sha}"]}}]}}"#
+        );
+        let e = Manifest::parse(src.as_bytes()).unwrap_err();
+        assert!(format!("{e:#}").contains("refusing manifest dest"), "failed as: {e:#}");
     }
 
     /// The traversal check must cover EVERY dest in the document, not just `files[]`.

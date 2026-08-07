@@ -21,22 +21,20 @@ a Release described by a `manifest.json`:
   (`PHOENIX_BAKED_TOKEN`, see `config.rs`); a user-saved token still wins.
 - `Pr0j3ctPh03nix/client-dist` — public, for the eventual public release.
 - `Pr0j3ctPh03nix/game-dist` — public (must be: game downloads are GBs and ride the tokenless
-  `browser_download_url` CDN path), holds the vanilla Dota 2 build-1805 files as release assets
-  + a `manifest.json` in the standard format. The base for fresh installs / Verify game files /
-  repair. **Sharded**: GitHub caps a release at 1,000 assets and the tree is 4,635 files, so the
-  versioned release (v1805, always `/releases/latest` — shards are prereleases, which latest
-  never resolves to) carries manifest.json while `v1805-assets-N` prereleases carry the files,
-  **≤190 each** (~25 shards): the launcher reads assets from the list-releases response's
-  EMBEDDED arrays, which are only verified complete up to ~200 assets (probed against a real
-  195-asset release; GitHub documents no bound) — capping at 190 keeps every shard inside proven
-  territory with zero pagination. `engine::merged_game_release` folds every shard back into one
-  asset index, so the download machinery keeps its single-release worldview. Produced by the
-  dist repo's `tools/gen_game_manifest.py` from a pristine install. Kept separate on purpose:
+  `browser_download_url` CDN path), holds the vanilla Dota 2 build-1805 tree as **manifest
+  schema 3 bundles** (spec: `docs/manifest-format-v3.md` in the dist repo): one release, `v1805`,
+  146 assets for 4,635 dests / 14.77 GiB — 7.92 GiB on the wire. A `.phxb` bundle is a **bare
+  zstd frame** of many files' bytes concatenated (no tar, no member table — the manifest states
+  every member's `sha256`/`size`, IN STREAM ORDER, so the reader splits by counting bytes);
+  big incompressible files ship raw, `name`-less entries resolve to the one bundle carrying
+  their hash. Produced by the dist repo's `tools/build_game_bundles.py` from a pristine
+  install. The base for fresh installs / Verify game files / repair. (The earlier
+  `v1805-assets-N` shard prereleases are GONE — `engine::merged_game_release` survives as a
+  harmless no-op in case a sharded release ever reappears.) Kept separate on purpose:
   a takedown of game bytes must not sink the launcher/shim infrastructure. **It must stay
   public**: `open_repo` succeeds anonymously, so assets download via `browser_download_url` —
-  no auth, no API budget. Private, every one of the 4,635 assets would instead be an API
-  request against the token owner's 5,000/hr limit, i.e. roughly one fresh install per hour
-  shared across all users. The baked token therefore needs NO access to this repo.
+  no auth, no API budget. Private, every asset would instead be an API request against the
+  token owner's 5,000/hr limit. The baked token therefore needs NO access to this repo.
 
 The updater is **data-driven**: the file list, install destinations, download URLs, and the
 install-identity gate all come from the manifest. It hardcodes none of them. Change what ships, or
@@ -57,8 +55,10 @@ the target game build, by editing the dist repo + cutting a release — the upda
         downloader.rs     the network seam: Downloader trait + Release/Asset + NetKind error
                           marker + an in-memory fake for tests
         github.rs         GitHub Releases Downloader impl (public no-auth + private token)
-        manifest.rs       manifest.json types + `Manifest::parse` (the `schema` compat gate and
-                          dest-traversal rejection); conformance tests walk manifest-fixtures/
+        manifest.rs       manifest.json types + `Manifest::parse` (the `schema` compat gate,
+                          dest-traversal rejection, and the schema-3 bundle invariants B1-B8 +
+                          codec gate, all at parse time); conformance tests walk
+                          manifest-fixtures/
         steaminf.rs       reads game/dota/steam.inf ClientVersion (info only, no gating)
         verify.rs         sha256 of files ((size,mtime)-memoized)
         engine.rs         fetch (via Manifest::parse) + resolve (options -> effective
@@ -174,7 +174,11 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   yet. (This replaced `min_launcher`, which pointed the dependency the wrong way; it is gone from
   producer and reader alike.) `manifest::{MIN,MAX}_SCHEMA` is the supported range — raise MAX in
   the same change that teaches the new format. An unsupported schema fails with a typed
-  `UnsupportedSchema` (wire kind stays `tooOld`, so the UI wording is unchanged).
+  `UnsupportedSchema` (wire kind stays `tooOld`, so the UI wording is unchanged); an
+  unrecognised bundle `codec` under a READABLE schema fails with a typed `UnsupportedCodec` —
+  same `tooOld` wire kind, different detection point (R2: "update the launcher", never "your
+  download is corrupt"). A supported schema that breaks a bundle guarantee (B1–B8) is refused
+  as a broken release — a plain error, deliberately NOT `tooOld`.
   **`Manifest::parse` reads `schema` in a separate permissive `Value` pass BEFORE deserializing** —
   a future manifest can carry an option `kind` we have no variant for, and parsing first would
   report "update the launcher" as an unintelligible syntax error. The `Value` is reused, so it is
@@ -231,11 +235,38 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   "stock", so the shim comes back while the UI reports the game reverted. When the state is
   missing AND the folder shows a prior install (winmm_orig.dll or a vanilla store), displaced
   files go to the ephemeral backup instead. Costs a preserved original; never fakes one.
-- **Downloads**: phase 1a fetches unique-by-hash files into the content-addressed cache with an
-  8-worker pool (files are independent by construction), **largest first**: the base game is
-  thousands of tiny request-bound files plus a few multi-GB VPKs, so LPT scheduling keeps the
-  big files streaming the whole run (alphabetical order used to leave a giant file running ALONE
-  at the end) and makes the byte rate — and the ETA built on it — honest from the first seconds.
+- **Bundles (manifest schema 3)**: the unit of download is an **asset**, not a file — `install.rs`
+  groups the wanted entries into `Acq` jobs (Raw / Empty / Bundle) by the spec's route order:
+  size 0 → materialized locally (GitHub can't host a 0-byte asset); `name` → that asset verbatim;
+  no `name` → the ONE bundle whose `members` carries the entry's hash. Members needed from one
+  bundle become ONE job (needing one 4 KB file costs the whole bundle — grouping is what stops
+  the same bundle downloading per member). A bundle downloads through the same
+  resume/retry/verify machinery keyed on `psha256`/`psize` (packed bytes verified BEFORE
+  decoding, R3), then streams through zstd sequentially: wanted members are split out by
+  byte-counting, hash-verified (R4) and renamed into the content-addressed cache; unneeded ones
+  pass through; the packed cache entry is deleted after extraction (wire-sized bytes with no
+  further use). A member mismatch or a stream that runs short/long AFTER a clean `psha256` is a
+  **producer defect** (R5): fail loudly, never retry (the errors carry no `NetKind`, which is
+  what keeps the retry loop away), and the packed entry is KEPT so the next attempt fails fast
+  instead of re-downloading gigabytes toward the same wall. **Two byte totals everywhere (R7)**:
+  wire (`psize`, raw sizes) drives bars/ETA/"downloaded so far"/`cached_bytes`; decoded `size`
+  drives the footprint, and the disk preflight demands footprint + packed transient (each worker
+  holds ≤1 packed bundle — it decodes and deletes before its next job, so the transient is the
+  DL_WORKERS largest psizes; `costs_of`/`base_costs`, mirrored exactly by the frontend's space
+  warning via `need_bytes`). Resume accounting is **per asset** (R6, `base_cached`): a packed
+  bundle or its `.part` is wire progress toward all members; extracted members alone are fetched
+  FILES but discount no wire bytes while siblings are missing (the packed asset still crosses
+  whole). Progress: a bundle ticks bytes as ONE item under its asset name (`done` stays false —
+  file counters count dests), then fans zero-byte `done` ticks to every dest it satisfied. A
+  process-wide `bundle:<psha256>` in-flight guard serializes decode between a warm and an apply
+  (distinct from the download guard on `psha256` — same key would self-deadlock). The shim's
+  schema-2 manifests ride the same code as all-Raw jobs, unchanged forever.
+- **Downloads**: phase 1a fetches the acquisition jobs into the content-addressed cache with an
+  8-worker pool (assets are independent by construction), **largest wire cost first**: the base
+  game is thousands of tiny request-bound files plus a few multi-GB assets, so LPT scheduling
+  keeps the big ones streaming the whole run (alphabetical order used to leave a giant file
+  running ALONE at the end) and makes the byte rate — and the ETA built on it — honest from the
+  first seconds.
   Worker count and github.rs's POOL_PER_HOST move together, or workers churn reconnects.
   **Transient failures retry per asset** (DL_RETRIES, exponential backoff): 4,600+ requests
   against a CDN that throws sporadic 5xxs meant one hiccup killed a 15 GB run and the USER was
@@ -364,9 +395,9 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   `startGameResume` is the ONE download flow that reuses the configured folder instead of
   asking: "where" was already answered by the folder holding the cache, and the confirm still
   names the exact path plus how much is already fetched (`GamePlanView.cached_bytes` +
-  `cached_files`: bytes count full entries and `.part` prefixes unique-by-hash, files count
-  DESTS with a complete entry only — a `.part` is byte progress, not a downloaded file;
-  metadata-only, `install::base_cached`). `game_verify`'s not-a-game refusal names the
+  `cached_files`: bytes are WIRE currency accounted per asset, files count DESTS whose bytes
+  need no further network — a `.part` is byte progress, not a downloaded file; metadata-only,
+  `install::base_cached`, see the Bundles bullet for the per-asset rules). `game_verify`'s not-a-game refusal names the
   interrupted download when one is present instead of "doesn't look like a game folder".
 - **A failed check falls back to `local_check`, never to a dead end.** Play and Uninstall are
   purely local, and both are gated on `state.lastCheck`, which only a SUCCESSFUL check used to

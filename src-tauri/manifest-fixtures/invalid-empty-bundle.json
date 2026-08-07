@@ -21,10 +21,8 @@
       "codec": "zstd",
       "psize": 34952533,
       "psha256": "45e116fe6bb47162f76f8cfa1947e46066fc1d9cc3e321cd3e035909db66235b",
-      "size": 104857600,
-      "members": [
-        "71000e2e30bf6fae705511f8e1ea3ecca8ce18fc678e248b35b2662a6d6d0996"
-      ]
+      "size": 0,
+      "members": []
     }
   ],
   "files": [

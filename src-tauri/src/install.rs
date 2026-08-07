@@ -28,7 +28,7 @@ use std::sync::{LazyLock, Mutex};
 
 use crate::config::Settings;
 use crate::downloader::{Downloader, NetKind, Release};
-use crate::manifest::{FileEntry, Manifest};
+use crate::manifest::{Bundle, FileEntry, Manifest};
 use crate::state::{InstalledFile, InstalledState};
 use crate::{engine, fslock, verify};
 
@@ -214,7 +214,7 @@ pub fn install(
     let staging = game_dir.join(STAGING_DIR);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).context("creating the staging directory")?;
-    obtain_all(&cache, dl, &release, &to_write, progress, cancel)?;
+    obtain_all(&cache, dl, &release, &to_write, &manifest, progress, cancel)?;
 
     // --- phase 1b: stage locally (same volume, so the phase-2 move is atomic) ---
     let mut staged: Vec<(&FileEntry, PathBuf)> = Vec::new();
@@ -458,54 +458,181 @@ fn transient_net_failure(e: &anyhow::Error) -> bool {
     })
 }
 
+/// One unit of network acquisition — an ASSET, not a file. Since manifest schema 3 the two are
+/// no longer the same thing: a raw entry maps 1:1, but a bundle is one asset carrying up to
+/// thousands of members. Jobs are what the download pool schedules, so members needed from one
+/// bundle are grouped into ONE job — without that, needing N files from a bundle would download
+/// the same multi-GB asset N times.
+enum Acq<'a> {
+    /// A named release asset, fetched into `cache/<sha256>` (route 2 — schema-2 behaviour).
+    Raw { name: &'a str, sha256: &'a str, size: u64 },
+    /// A zero-byte entry — materialized locally, never on the wire (route 1; GitHub refuses to
+    /// host zero-byte assets, so none exists even when the entry carries a leftover `name`).
+    Empty { sha256: &'a str },
+    /// A packed bundle (route 3): fetch `cache/<psha256>`, decode, split by member sizes, keep
+    /// the `wanted` members as ordinary content-addressed cache entries.
+    Bundle { bundle: &'a Bundle, wanted: Vec<(&'a str, u64)> },
+}
+
+impl Acq<'_> {
+    /// Bytes this job puts on the WIRE — the LPT sort key, the progress currency, and one half
+    /// of every user-facing byte total (R7: `psize` is what crosses the network, `size` is what
+    /// lands on disk; they differ per bundle and are never interchangeable).
+    fn wire_cost(&self) -> u64 {
+        match self {
+            Acq::Raw { size, .. } => *size,
+            Acq::Empty { .. } => 0,
+            Acq::Bundle { bundle, .. } => bundle.psize,
+        }
+    }
+
+    /// The release asset this job needs, if any — the preflight checks these against the
+    /// release's asset list before a byte moves.
+    fn asset_name(&self) -> Option<&str> {
+        match self {
+            Acq::Raw { name, .. } => Some(name),
+            Acq::Empty { .. } => None,
+            Acq::Bundle { bundle, .. } => Some(&bundle.name),
+        }
+    }
+}
+
+/// Group `wants` (deduplicated by content hash — two dests sharing one hash acquire once) into
+/// acquisition jobs, resolving each entry by the spec's route order: empty → named asset →
+/// bundle. The B3 guarantee (validated at parse) makes the bundle lookup total; the bail is the
+/// belt to that suspender.
+fn build_acqs<'a>(
+    bundles: &'a [Bundle],
+    wants: impl Iterator<Item = (Option<&'a str>, &'a str, u64)>,
+) -> Result<Vec<Acq<'a>>> {
+    let member_of: HashMap<&str, usize> = bundles
+        .iter()
+        .enumerate()
+        .flat_map(|(i, b)| b.members.iter().map(move |m| (m.as_str(), i)))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut acqs = Vec::new();
+    let mut wanted_of: HashMap<usize, Vec<(&str, u64)>> = HashMap::new();
+    for (name, sha256, size) in wants {
+        if !seen.insert(sha256) {
+            continue;
+        }
+        if size == 0 {
+            acqs.push(Acq::Empty { sha256 });
+        } else if let Some(name) = name {
+            acqs.push(Acq::Raw { name, sha256, size });
+        } else if let Some(&i) = member_of.get(sha256) {
+            wanted_of.entry(i).or_default().push((sha256, size));
+        } else {
+            bail!("entry {sha256} has no asset name and is in no bundle");
+        }
+    }
+    acqs.extend(
+        wanted_of.into_iter().map(|(i, wanted)| Acq::Bundle { bundle: &bundles[i], wanted }),
+    );
+    Ok(acqs)
+}
+
+/// The byte totals of an acquisition set, in R7's two currencies plus the preflight demand:
+/// (wire, disk, need).
+///   wire  what crosses the network — raw assets by size, each needed bundle's `psize` ONCE
+///         (needing one member costs the whole bundle). Bars, ETAs, "downloaded so far".
+///   disk  the decoded content that lands, unique by hash. The installed footprint.
+///   need  what the disk preflight demands (sans margin): `disk` plus the packed transient —
+///         a download worker holds at most one packed bundle at a time (it decodes and deletes
+///         before taking its next job), so at worst the DL_WORKERS largest packed assets are
+///         alive in the cache on top of the decoded content.
+fn costs_of(acqs: &[Acq]) -> (u64, u64, u64) {
+    let wire = acqs.iter().map(Acq::wire_cost).sum();
+    let disk = acqs
+        .iter()
+        .map(|a| match a {
+            Acq::Raw { size, .. } => *size,
+            Acq::Empty { .. } => 0,
+            Acq::Bundle { wanted, .. } => wanted.iter().map(|(_, s)| s).sum(),
+        })
+        .sum::<u64>();
+    let mut psizes: Vec<u64> = acqs
+        .iter()
+        .filter_map(|a| match a {
+            Acq::Bundle { bundle, .. } => Some(bundle.psize),
+            _ => None,
+        })
+        .collect();
+    psizes.sort_unstable_by_key(|p| std::cmp::Reverse(*p));
+    let transient: u64 = psizes.iter().take(DL_WORKERS).sum();
+    (wire, disk, disk + transient)
+}
+
+/// `costs_of` over a base plan's Write set — the numbers behind the download/repair confirms,
+/// computed with the exact math `install_base`'s own preflight uses.
+pub fn base_costs(manifest: &Manifest, statuses: &[BaseStatus]) -> Result<(u64, u64, u64)> {
+    let acqs = build_acqs(
+        &manifest.bundles,
+        statuses
+            .iter()
+            .filter(|s| s.action == BaseAction::Write)
+            .map(|s| (s.entry.name.as_deref(), s.entry.sha256.as_str(), s.entry.size)),
+    )?;
+    Ok(costs_of(&acqs))
+}
+
 /// Fetch every to-write file into the asset cache with a small worker pool. Errors fail the
 /// phase: the first error wins — remaining workers stop early AND in-flight streams abort at
 /// their next chunk (the .part they leave is resumed on the next run), so a dead asset never
 /// waits minutes for a 500 MB neighbor to finish before surfacing. Progress `current` counts
-/// COMPLETED files while `item`/`bytes` track whichever file ticked most recently.
+/// COMPLETED jobs while `item`/`bytes` track whichever asset ticked most recently.
 fn obtain_all(
     cache: &Path,
     dl: &dyn Downloader,
     release: &Release,
     to_write: &[&FileEntry],
+    manifest: &Manifest,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    obtain_all_tagged(cache, dl, release, to_write, progress, "install", cancel)
+    obtain_all_tagged(cache, dl, release, to_write, manifest, progress, "install", cancel)
 }
 
 /// `obtain_all` with the progress `op` tag and an external cancel flag injected — the base-game
 /// path reports as its own operation ("game") and is user-cancellable mid-download (a shim
 /// install is seconds; a 9 GB base install is not).
+// two internal callers; a params struct would be ceremony without reuse
+#[allow(clippy::too_many_arguments)]
 fn obtain_all_tagged(
     cache: &Path,
     dl: &dyn Downloader,
     release: &Release,
     to_write: &[&FileEntry],
+    manifest: &Manifest,
     progress: engine::Progress,
     op: &'static str,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    // unique by sha256: two dests sharing one asset download once (the cache entry is shared)
-    let mut seen = HashSet::new();
-    let mut jobs: Vec<&FileEntry> =
-        to_write.iter().filter(|fe| seen.insert(fe.sha256.as_str())).copied().collect();
-    // Largest first (LPT scheduling): the multi-GB VPKs start streaming immediately and run for
-    // most of the download while the other workers chew through the small-file tail — in manifest
-    // (alphabetical) order, a giant file picked up near the end ran ALONE long after every other
-    // worker went idle, adding its whole transfer time to the wall clock. Also steadies the UI:
-    // the byte rate reaches link speed in the first seconds, so the ETA is honest early.
-    jobs.sort_unstable_by_key(|fe| std::cmp::Reverse(fe.size));
+    let mut jobs = build_acqs(
+        &manifest.bundles,
+        to_write.iter().map(|fe| (fe.name.as_deref(), fe.sha256.as_str(), fe.size)),
+    )?;
+    // Largest WIRE cost first (LPT scheduling): the multi-GB assets start streaming immediately
+    // and run for most of the download while the other workers chew through the small tail — in
+    // manifest (alphabetical) order, a giant asset picked up near the end ran ALONE long after
+    // every other worker went idle, adding its whole transfer time to the wall clock. Also
+    // steadies the UI: the byte rate reaches link speed in the first seconds, so the ETA is
+    // honest early.
+    jobs.sort_unstable_by_key(|a| std::cmp::Reverse(a.wire_cost()));
     let total = jobs.len() as u64;
-    // every dest that shares a job's hash — ticks fan out to all of them, so each UI file row
-    // gets its bar even when two dests share one asset
+    // every dest that shares a hash — completion ticks fan out to all of them, so each UI file
+    // row settles even when two dests share one asset (or one bundle member)
     let mut dests_of: HashMap<&str, Vec<&str>> = HashMap::new();
     for fe in to_write {
         dests_of.entry(fe.sha256.as_str()).or_default().push(fe.dest.as_str());
     }
+    // split boundaries for every bundle member, from the WHOLE manifest — a repair may want two
+    // members of a bundle whose other two thousand still have to be sized to be skipped over
+    let sizes: HashMap<&str, u64> = manifest.payload_entries().map(|(_, s, z)| (s, z)).collect();
 
-    // one lookup table for the whole pool: the base game's 4,635 jobs against a merged release's
-    // 4,636 assets would otherwise be a linear scan each
+    // one lookup table for the whole pool: thousands of jobs against a release carrying
+    // thousands of assets would otherwise be a linear scan each
     let index = release.asset_index();
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
@@ -529,40 +656,92 @@ fn obtain_all_tagged(
                 if i >= jobs.len() {
                     return;
                 }
-                let fe = jobs[i];
-                let dests = &dests_of[fe.sha256.as_str()];
-                // size is known from the manifest, so a file's bar has its full extent from the
-                // very first tick — even before the transport reports Content-Length.
-                let size = fe.size;
+                let job = &jobs[i];
+                // What a byte tick names, and its full extent (known from the manifest, so the
+                // bar has its span from the very first tick). A raw asset ticks per dest; a
+                // bundle ticks as ONE item under its asset name — fanning every packed chunk to
+                // two thousand member dests would multiply the event stream by the member count
+                // for no information.
+                let (items, wire): (Vec<&str>, u64) = match job {
+                    Acq::Raw { sha256, size, .. } => (dests_of[sha256].clone(), *size),
+                    Acq::Bundle { bundle, .. } => (vec![bundle.name.as_str()], bundle.psize),
+                    Acq::Empty { .. } => (Vec::new(), 0),
+                };
                 let tick = |current: u64, bytes_done: u64, bytes_total: u64, is_done: bool| {
-                    for dest in dests {
+                    for item in &items {
                         report(engine::OpProgress {
                             op,
                             current,
                             total,
-                            item: Some((*dest).to_string()),
+                            item: Some((*item).to_string()),
                             bytes_done: Some(bytes_done),
                             bytes_total: Some(bytes_total),
                             done: is_done,
                         });
                     }
                 };
-                tick(done.load(Ordering::Relaxed), 0, size, false);
+                if !items.is_empty() {
+                    tick(done.load(Ordering::Relaxed), 0, wire, false);
+                }
                 let mut last = 0u64;
                 let mut chunk = |d: u64, t: Option<u64>| {
                     if abort.load(Ordering::Relaxed) || cancelled() {
                         return false; // a sibling failed or the user cancelled — stop this stream
                     }
-                    if d - last >= PROGRESS_GRAIN || t == Some(d) {
+                    // abs_diff, NOT d - last: this closure spans every retry attempt of the
+                    // job, and an attempt can restart BELOW the previous high-water mark (a
+                    // poisoned .part discarded, a server declining the Range) — plain
+                    // subtraction underflows (a debug-build panic), and a monotonic check
+                    // would mute the bar until the old mark was re-passed.
+                    if d.abs_diff(last) >= PROGRESS_GRAIN || t == Some(d) {
                         last = d;
-                        tick(done.load(Ordering::Relaxed), d, t.unwrap_or(size), false);
+                        tick(done.load(Ordering::Relaxed), d, t.unwrap_or(wire), false);
                     }
                     true
                 };
-                match obtain_to_cache(cache, dl, &index, &fe.name, &fe.sha256, fe.size, &mut chunk) {
-                    Ok(_) => {
+                let mut keep_going = || !(abort.load(Ordering::Relaxed) || cancelled());
+                match obtain_acq(cache, dl, &index, job, &sizes, &mut chunk, &mut keep_going) {
+                    Ok(()) => {
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                        tick(d, size, size, true);
+                        match job {
+                            Acq::Raw { size, .. } => tick(d, *size, *size, true),
+                            // dests of a zero-byte entry still owe the UI their completion
+                            Acq::Empty { sha256 } => {
+                                for dest in &dests_of[*sha256] {
+                                    report(engine::OpProgress {
+                                        op,
+                                        current: d,
+                                        total,
+                                        item: Some((*dest).to_string()),
+                                        bytes_done: Some(0),
+                                        bytes_total: Some(0),
+                                        done: true,
+                                    });
+                                }
+                            }
+                            Acq::Bundle { bundle, wanted } => {
+                                // settle the bundle's own bar — done stays FALSE on this item:
+                                // file counters count DESTS, and the bundle is not a dest
+                                tick(d, bundle.psize, bundle.psize, false);
+                                // …then complete every dest the bundle just satisfied. Zero
+                                // bytes on purpose: the wire bytes were already accounted under
+                                // the bundle item, and double-counting them per member would
+                                // run the aggregate bar past its total.
+                                for (sha, _) in wanted {
+                                    for dest in &dests_of[*sha] {
+                                        report(engine::OpProgress {
+                                            op,
+                                            current: d,
+                                            total,
+                                            item: Some((*dest).to_string()),
+                                            bytes_done: Some(0),
+                                            bytes_total: Some(0),
+                                            done: true,
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         let mut g = first_err.lock().unwrap();
@@ -587,20 +766,168 @@ fn obtain_all_tagged(
     Ok(())
 }
 
-/// Every downloadable asset in the manifest — core files, all choice variants, all toggle files —
-/// as (asset name, sha256, size).
-fn all_assets(m: &Manifest) -> Vec<(&str, &str, u64)> {
-    let mut v: Vec<(&str, &str, u64)> =
-        m.files.iter().map(|f| (f.name.as_str(), f.sha256.as_str(), f.size)).collect();
-    for o in &m.options {
-        for var in &o.variants {
-            v.push((var.name.as_str(), var.sha256.as_str(), var.size));
+/// Obtain one acquisition job into the cache. Raw assets verify and land at `cache/<sha256>`;
+/// bundles land packed at `cache/<psha256>` (same resume/retry machinery), are decoded into
+/// their wanted members, and the packed entry is deleted — it held wire-sized bytes with no
+/// further use, inside the game folder.
+///
+/// `chunk` is the byte-tick/abort line for the download; `keep_going` is the abort line for the
+/// decode (which must stay off the byte accounting — its progress is not wire progress).
+fn obtain_acq(
+    cache: &Path,
+    dl: &dyn Downloader,
+    index: &HashMap<&str, &crate::downloader::Asset>,
+    acq: &Acq,
+    sizes: &HashMap<&str, u64>,
+    chunk: crate::downloader::ChunkProgress,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<()> {
+    match acq {
+        Acq::Empty { sha256 } => materialize_empty(cache, sha256).map(drop),
+        Acq::Raw { name, sha256, size } => {
+            obtain_to_cache(cache, dl, index, name, sha256, *size, chunk).map(drop)
         }
-        for f in &o.files {
-            v.push((f.name.as_str(), f.sha256.as_str(), f.size));
+        Acq::Bundle { bundle, wanted } => {
+            // One flow decodes a given bundle at a time, process-wide: obtain_to_cache guards
+            // the packed DOWNLOAD, but a background warm and an apply could otherwise both
+            // finish (or cache-hit) the same packed entry and then write the same member
+            // entries concurrently. Keyed distinctly from the download guard — same key would
+            // self-deadlock on the nested acquire.
+            let _guard = Inflight::acquire(&format!("bundle:{}", bundle.psha256));
+            // decided under the guard: whoever held it before us may have extracted everything
+            let missing: HashSet<&str> = wanted
+                .iter()
+                .filter(|(sha, size)| !cache_ok(&cache.join(sha), sha, *size))
+                .map(|(sha, _)| *sha)
+                .collect();
+            if missing.is_empty() {
+                return Ok(());
+            }
+            // R3 rides on the existing verify: obtain_to_cache renames the packed asset into
+            // the cache only after psize + psha256 check out — nothing unverified is decoded
+            let packed =
+                obtain_to_cache(cache, dl, index, &bundle.name, &bundle.psha256, bundle.psize, chunk)?;
+            extract_members(cache, &packed, bundle, &missing, sizes, keep_going)?;
+            let _ = std::fs::remove_file(&packed);
+            Ok(())
         }
     }
-    v
+}
+
+/// Split a verified packed bundle into its members (R4): stream-decode, count bytes against
+/// each member's manifest size, keep the wanted ones as content-addressed cache entries. Decode
+/// is strictly sequential — reaching member 900 means consuming members 0–899 — so unneeded
+/// members are passed through and discarded (zstd decodes >1 GB/s; there is no seeking).
+///
+/// Any defect found here — a member hash mismatch, a stream that runs short or long (B4) — is a
+/// PRODUCER defect (R5): `psha256` already verified, so the wire carried exactly the bytes the
+/// manifest asked for and refetching would reproduce them. Fail loudly, never retry; the errors
+/// carry no NetKind on purpose, which is what keeps the retry loop away from them. The packed
+/// cache entry is left in place so the next attempt fails fast instead of re-downloading
+/// gigabytes toward the same wall.
+fn extract_members(
+    cache: &Path,
+    packed: &Path,
+    bundle: &Bundle,
+    wanted: &HashSet<&str>,
+    sizes: &HashMap<&str, u64>,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Result<()> {
+    use sha2::Digest;
+    use std::io::{Read, Write};
+    let file = std::fs::File::open(packed)
+        .with_context(|| format!("opening the downloaded bundle {}", bundle.name))?;
+    let mut dec = zstd::stream::read::Decoder::new(file)
+        .with_context(|| format!("starting to decode bundle {}", bundle.name))?;
+    // 256 KiB like every other streaming path in this codebase (github.rs, verify.rs)
+    let mut buf = vec![0u8; 256 * 1024];
+    for m in &bundle.members {
+        let size = *sizes
+            .get(m.as_str())
+            .with_context(|| format!("bundle {} member {m} matches no entry", bundle.name))?;
+        // a member already in the cache is skipped like an unwanted one — its bytes still have
+        // to be consumed to reach the members behind it
+        let keep = wanted.contains(m.as_str());
+        let mut out = if keep {
+            let tmp = cache.join(format!("{m}.tmp"));
+            Some((
+                std::fs::File::create(&tmp)
+                    .with_context(|| format!("creating a cache entry for {m}"))?,
+                tmp,
+                sha2::Sha256::new(),
+            ))
+        } else {
+            None
+        };
+        let mut left = size;
+        while left > 0 {
+            if !keep_going() {
+                // the `_` pattern drops the open handle before the delete — Windows insists
+                if let Some((_, tmp, _)) = out {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                bail!("bundle decode aborted");
+            }
+            let want = buf.len().min(left as usize);
+            let n = dec
+                .read(&mut buf[..want])
+                .with_context(|| format!("decoding bundle {}", bundle.name))?;
+            if n == 0 {
+                if let Some((_, tmp, _)) = out {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                bail!(
+                    "bundle {} ran out mid-member: the decoded stream is shorter than the \
+                     manifest declares — a broken release, refetching cannot fix it",
+                    bundle.name
+                );
+            }
+            if let Some((f, _, hasher)) = &mut out {
+                f.write_all(&buf[..n])
+                    .with_context(|| format!("writing a cache entry for {m}"))?;
+                hasher.update(&buf[..n]);
+            }
+            left -= n as u64;
+        }
+        if let Some((f, tmp, hasher)) = out {
+            drop(f);
+            let got = hex::encode(hasher.finalize());
+            if got != *m {
+                let _ = std::fs::remove_file(&tmp);
+                bail!(
+                    "bundle {} member decoded with hash {got}, manifest says {m} — the packed \
+                     asset verified clean, so this is a broken release; not retrying",
+                    bundle.name
+                );
+            }
+            std::fs::rename(&tmp, cache.join(m.as_str()))
+                .with_context(|| format!("caching bundle member {m}"))?;
+        }
+    }
+    // B4: nothing after the last member — trailing bytes mean the split above was built on a lie
+    if dec.read(&mut buf[..1]).unwrap_or(1) != 0 {
+        bail!(
+            "bundle {} decodes past its declared members — a broken release, refetching cannot \
+             fix it",
+            bundle.name
+        );
+    }
+    Ok(())
+}
+
+/// Materialize the one file that never crosses the wire: a zero-byte entry. Not an optimization
+/// — GitHub refuses to host a zero-byte release asset (422), so the publisher COULD not upload
+/// one even though the game genuinely contains such files. A size of 0 paired with any other
+/// hash is a corrupt manifest, not an empty file.
+fn materialize_empty(cache: &Path, sha256: &str) -> Result<PathBuf> {
+    let cpath = cache.join(sha256);
+    if sha256 != EMPTY_SHA256 {
+        bail!("manifest lists a 0-byte entry with sha256 {sha256}, not the empty hash");
+    }
+    if !cpath.exists() {
+        std::fs::write(&cpath, b"").context("creating an empty cache entry")?;
+    }
+    Ok(cpath)
 }
 
 /// Does this cache entry exist and verify? A corrupt entry is deleted and treated as a miss.
@@ -806,7 +1133,8 @@ pub fn warm_cache(settings: &Settings, dl: &dyn Downloader) {
 }
 
 /// Download every not-yet-cached manifest asset. Best-effort: a failed asset is skipped (it will
-/// download on demand when actually selected) so an optional extra can't fail the warm.
+/// download on demand when actually selected) so an optional extra can't fail the warm. Bundled
+/// entries warm by the bundle, through the same job builder the install uses.
 fn prefetch_all(
     cache: &Path,
     dl: &dyn Downloader,
@@ -815,19 +1143,25 @@ fn prefetch_all(
     cancelled: &dyn Fn() -> bool,
 ) {
     let index = release.asset_index();
-    let mut seen = HashSet::new();
-    for (name, sha256, size) in all_assets(manifest) {
+    let sizes: HashMap<&str, u64> = manifest.payload_entries().map(|(_, s, z)| (s, z)).collect();
+    let Ok(acqs) = build_acqs(&manifest.bundles, manifest.payload_entries()) else { return };
+    for acq in acqs {
         if cancelled() {
             return;
         }
-        // cache_ok (not a bare exists) so a corrupt entry is evicted and re-downloaded here
-        // instead of blocking the prefetch until the asset is actually selected
-        if !seen.insert(sha256) || cache_ok(&cache.join(sha256), sha256, size) {
-            continue;
-        }
-        // the chunk callback doubles as the cancel line: an uninstall's cancel_warm aborts the
-        // stream mid-file instead of letting a huge optional asset finish downloading first
-        let _ = obtain_to_cache(cache, dl, &index, name, sha256, size, &mut |_, _| !cancelled());
+        // obtain_acq itself starts from the cache check (evicting a corrupt entry), so a warm
+        // over an already-warm cache costs stats. The chunk callback doubles as the cancel
+        // line: an uninstall's cancel_warm aborts the stream mid-file instead of letting a
+        // huge optional asset finish downloading first.
+        let _ = obtain_acq(
+            cache,
+            dl,
+            &index,
+            &acq,
+            &sizes,
+            &mut |_, _| !cancelled(),
+            &mut || !cancelled(),
+        );
     }
 }
 
@@ -838,7 +1172,13 @@ fn prefetch_all(
 /// base-game pipeline caches under `CACHE_DIR/BASE_CACHE_SUBDIR`. Recursing (or deleting
 /// directory entries) would make a background warm delete a half-finished 16 GB game download.
 fn prune_cache(cache: &Path, manifest: &Manifest) {
-    let keep: HashSet<&str> = all_assets(manifest).into_iter().map(|(_, sha, _)| sha).collect();
+    // entry hashes AND bundle psha256s: a packed bundle (or its `.part`) mid-warm is a resume
+    // source exactly like an asset `.part`, and must survive the prune that follows it
+    let keep: HashSet<&str> = manifest
+        .payload_entries()
+        .map(|(_, sha, _)| sha)
+        .chain(manifest.bundles.iter().map(|b| b.psha256.as_str()))
+        .collect();
     if let Ok(rd) = std::fs::read_dir(cache) {
         for e in rd.flatten() {
             if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
@@ -1238,40 +1578,80 @@ pub fn pending_base_bytes(game_dir: &Path) -> u64 {
         .sum()
 }
 
-/// What the plan's to-download set ALREADY has in the base cache: (bytes, fully-fetched files).
-/// A full entry counts whole, a `.part` counts its current length (both capped at the asset
-/// size — an over-long leftover must not report more than the plan asked for). Bytes are unique
-/// by hash like every other byte total; FILES count dests (that is what every visible counter
-/// counts), and a dest is "fetched" only when its asset is complete — a `.part` is progress in
-/// bytes but not a downloaded file. Metadata only. Drives the resume confirm's
+/// What the plan's to-download set ALREADY has in the base cache: (WIRE bytes, fully-fetched
+/// files). Accounted per ASSET, not per file (R6): a partly-fetched bundle is progress toward
+/// all of its members and toward none of them individually — without asset tracking, a bundle
+/// killed at 90% read as "0 bytes downloaded" with gigabytes sitting on disk.
+///
+/// Bytes are wire currency, capped at each asset's wire size (an over-long leftover must not
+/// report more than the plan asked for): a raw entry or `.part` counts its length; a bundle
+/// counts its full `psize` once nothing more of it must cross the network (packed asset
+/// present, or every wanted member already extracted), else its packed `.part`'s length.
+/// FILES count dests (that is what every visible counter counts), and a dest is "fetched" only
+/// when its bytes are obtainable with no network — a complete raw entry, an extracted member,
+/// or any member of a fully-present packed bundle. Metadata only. Drives the resume confirm's
 /// "X of Y GB · N of M files already downloaded".
-pub fn base_cached(game_dir: &Path, statuses: &[BaseStatus]) -> (u64, usize) {
+pub fn base_cached(game_dir: &Path, manifest: &Manifest, statuses: &[BaseStatus]) -> (u64, usize) {
     let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
-    // per unique hash: (counted bytes, is a complete entry)
-    let mut probed: HashMap<&str, (u64, bool)> = HashMap::new();
+    let writes: Vec<&FileEntry> = statuses
+        .iter()
+        .filter(|s| s.action == BaseAction::Write)
+        .map(|s| &s.entry)
+        .collect();
+    let Ok(acqs) = build_acqs(
+        &manifest.bundles,
+        writes.iter().map(|fe| (fe.name.as_deref(), fe.sha256.as_str(), fe.size)),
+    ) else {
+        return (0, 0);
+    };
+    let entry_len = |name: String| std::fs::metadata(cache.join(name)).ok().map(|m| m.len());
+    let complete = |sha: &str, size: u64| entry_len(sha.to_string()).is_some_and(|l| l >= size);
+
     let mut bytes = 0u64;
-    let mut files = 0usize;
-    for s in statuses.iter().filter(|s| s.action == BaseAction::Write) {
-        let sha = s.entry.sha256.as_str();
-        let info = match probed.get(sha) {
-            Some(i) => *i,
-            None => {
-                let i = if let Ok(md) = std::fs::metadata(cache.join(sha)) {
-                    (md.len().min(s.entry.size), md.len() >= s.entry.size)
-                } else if let Ok(md) = std::fs::metadata(cache.join(format!("{sha}.part"))) {
-                    (md.len().min(s.entry.size), false)
-                } else {
-                    (0, false)
-                };
-                probed.insert(sha, i);
-                bytes += i.0; // once per unique hash
-                i
+    // hashes whose bytes need no further network — dests holding them count as fetched below
+    let mut fetched: HashSet<&str> = HashSet::new();
+    for acq in &acqs {
+        match acq {
+            Acq::Raw { sha256, size, .. } => {
+                if let Some(len) = entry_len(sha256.to_string()) {
+                    bytes += len.min(*size);
+                    if len >= *size {
+                        fetched.insert(sha256);
+                    }
+                } else if let Some(len) = entry_len(format!("{sha256}.part")) {
+                    bytes += len.min(*size);
+                }
             }
-        };
-        if info.1 {
-            files += 1; // once per DEST — two dests sharing a cached asset are two fetched files
+            // costs nothing to download; "fetched" once its entry was materialized
+            Acq::Empty { sha256 } => {
+                if entry_len(sha256.to_string()).is_some() {
+                    fetched.insert(sha256);
+                }
+            }
+            Acq::Bundle { bundle, wanted } => {
+                let have: Vec<&str> = wanted
+                    .iter()
+                    .filter(|(sha, size)| complete(sha, *size))
+                    .map(|(sha, _)| *sha)
+                    .collect();
+                if complete(&bundle.psha256, bundle.psize) || have.len() == wanted.len() {
+                    // nothing more of this bundle crosses the network — and a present packed
+                    // asset makes every wanted member obtainable offline
+                    bytes += bundle.psize;
+                    fetched.extend(wanted.iter().map(|(sha, _)| *sha));
+                } else {
+                    // extracted members do NOT discount the bytes: the packed asset still has
+                    // to cross whole for the members that are missing. They do count as
+                    // fetched FILES — their dests need no further network.
+                    fetched.extend(have);
+                    if let Some(len) = entry_len(format!("{}.part", bundle.psha256)) {
+                        bytes += len.min(bundle.psize);
+                    }
+                }
+            }
         }
     }
+    let files = writes.iter().filter(|fe| fetched.contains(fe.sha256.as_str())).count();
     (bytes, files)
 }
 
@@ -1377,34 +1757,36 @@ pub fn install_base(
         return Ok(report(0, 0));
     }
 
-    // Preflight the asset index. A name the (merged, sharded) release does not carry is a
-    // permanent condition no retry can fix, and the lookup otherwise happens inside the download
-    // worker — so a truncated shard array surfaced only after thousands of files and gigabytes,
-    // dressed up as a transient download failure. Milliseconds here, hours saved there.
+    // The acquisition set — raw assets, needed bundles (grouped), materialized empties — is what
+    // both preflights below reason about: assets are what downloads, not files.
+    let acqs = build_acqs(
+        &manifest.bundles,
+        to_write.iter().map(|(fe, _)| (fe.name.as_deref(), fe.sha256.as_str(), fe.size)),
+    )?;
+
+    // Preflight the asset index. A name the release does not carry is a permanent condition no
+    // retry can fix, and the lookup otherwise happens inside the download worker — so a
+    // truncated asset array surfaced only after thousands of files and gigabytes, dressed up as
+    // a transient download failure. Milliseconds here, hours saved there.
     let missing: Vec<&str> = {
         let mut seen = HashSet::new();
-        to_write
-            .iter()
-            // a 0-byte entry is CREATED, never downloaded — it legitimately has no asset
-            .filter(|(fe, _)| fe.size > 0)
-            .map(|(fe, _)| fe.name.as_str())
+        acqs.iter()
+            .filter_map(Acq::asset_name)
             .filter(|name| seen.insert(*name))
             .filter(|name| release.asset(name).is_none())
             .collect()
     };
     if !missing.is_empty() {
         bail!(
-            "the game release is incomplete: {} file(s) have no matching asset (first: {})",
+            "the game release is incomplete: {} asset(s) are missing (first: {})",
             missing.len(),
             missing[0]
         );
     }
 
-    let need: u64 = {
-        // unique by hash — shared-content dests download once
-        let mut seen = HashSet::new();
-        to_write.iter().filter(|(fe, _)| seen.insert(fe.sha256.as_str())).map(|(fe, _)| fe.size).sum()
-    };
+    // Disk preflight: the decoded content that lands plus the packed transient (see `costs_of`)
+    // — refused BEFORE any bytes, never discovered as a mysterious failure at 97%.
+    let (_wire, _disk, need) = costs_of(&acqs);
     ensure_disk_space(need, free_space(game_dir))?;
 
     // interlock: a running game holds its VPKs/DLLs mmapped — say "close the game" NOW, not
@@ -1421,7 +1803,7 @@ pub fn install_base(
     let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
     std::fs::create_dir_all(&cache).context("creating the asset cache")?;
     let fe_only: Vec<&FileEntry> = to_write.iter().map(|(fe, _)| *fe).collect();
-    obtain_all_tagged(&cache, dl, release, &fe_only, progress, "game", cancel)?;
+    obtain_all_tagged(&cache, dl, release, &fe_only, manifest, progress, "game", cancel)?;
 
     // the game may have started during a multi-GB download — re-probe before touching anything
     probe_writable(game_dir, rels.iter())?;
@@ -1537,7 +1919,7 @@ mod tests {
 
         let manifest = Manifest::parse(basic_release().0.as_bytes()).unwrap();
         let fe = FileEntry {
-            name: "winmm.dll".to_string(),
+            name: Some("winmm.dll".to_string()),
             dest: dest.to_string(),
             sha256: sha(b"new"),
             size: 3,
@@ -2354,15 +2736,291 @@ mod tests {
         std::fs::write(cache.join(sha(b"EXE")), b"EXE").unwrap();
         std::fs::write(cache.join(format!("{}.part", sha(b"PAK"))), b"PA").unwrap();
         // bytes: 3 (full) + 2 (part). files: only EXE — a .part is byte progress, not a file
-        assert_eq!(base_cached(&dir, &statuses), (5, 1));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), (5, 1));
 
         // the CFG asset landing makes BOTH its dests fetched files, but its bytes count once
         std::fs::write(cache.join(sha(b"CFG")), b"CFG").unwrap();
-        assert_eq!(base_cached(&dir, &statuses), (8, 3));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), (8, 3));
 
         // an over-long leftover must not report more than the plan asked for
         std::fs::write(cache.join(sha(b"EXE")), b"EXE-OVERLONG").unwrap();
-        assert_eq!(base_cached(&dir, &statuses), (8, 3));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), (8, 3));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- bundles (manifest schema 3) ----
+
+    /// Concatenate members and zstd-pack them: (packed bytes, psha256, decoded size).
+    fn pack(members: &[&[u8]]) -> (Vec<u8>, String, u64) {
+        let mut stream = Vec::new();
+        for m in members {
+            stream.extend_from_slice(m);
+        }
+        let packed = zstd::stream::encode_all(&stream[..], 3).unwrap();
+        let psha = sha(&packed);
+        (packed, psha, stream.len() as u64)
+    }
+
+    /// A schema-3 entry: no `name` — its bytes come from a bundle (or nowhere, when empty).
+    fn bundled_json(dest: &str, bytes: &[u8]) -> serde_json::Value {
+        serde_json::json!({ "dest": dest, "sha256": sha(bytes), "size": bytes.len() })
+    }
+
+    /// The full schema-3 feature set through the ordinary install pipeline: a raw named asset,
+    /// a multi-member bundle whose content lands at several dests (including two dests sharing
+    /// ONE member), a bundled choice variant, and a zero-byte entry that never touches the wire.
+    #[test]
+    fn bundled_files_install_and_the_packed_asset_is_reclaimed() {
+        let dir = tempdir("bundle-install");
+        let (x, y, shared, variant) = (b"X1X1" as &[u8], b"Y2" as &[u8], b"SHARED", b"VARIANT");
+        let (packed, psha, dsize) = pack(&[x, y, shared, variant]);
+        let m = serde_json::json!({
+            "schema": 3,
+            "version": "1.0.0",
+            "bundles": [{
+                "name": "b0.phxb", "codec": "zstd",
+                "psize": packed.len(), "psha256": psha, "size": dsize,
+                "members": [sha(x), sha(y), sha(shared), sha(variant)],
+            }],
+            "files": [
+                file_json("a.vpk", "game/dota/a.vpk", b"raw"),
+                bundled_json("game/dota/x.txt", x),
+                bundled_json("game/dota/y.txt", y),
+                bundled_json("game/dota/s1.txt", shared),
+                bundled_json("game/dota/s2.txt", shared),
+                bundled_json("game/dota/empty.marker", b""),
+            ],
+            "options": [{
+                "id": "look", "kind": "choice", "label": "Look", "default": "mod",
+                "dest": "game/dota/look.vpk",
+                "variants": [
+                    { "id": "mod", "label": "Mod",
+                      "sha256": sha(variant), "size": variant.len() },
+                ],
+            }],
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"raw"), ("b0.phxb", &packed)]);
+
+        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        assert_eq!(r.written.len(), 7);
+        assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"raw");
+        assert_eq!(std::fs::read(dir.join("game/dota/x.txt")).unwrap(), x);
+        assert_eq!(std::fs::read(dir.join("game/dota/y.txt")).unwrap(), y);
+        assert_eq!(std::fs::read(dir.join("game/dota/s1.txt")).unwrap(), shared);
+        assert_eq!(std::fs::read(dir.join("game/dota/s2.txt")).unwrap(), shared);
+        assert_eq!(std::fs::read(dir.join("game/dota/empty.marker")).unwrap(), b"");
+        assert_eq!(std::fs::read(dir.join("game/dota/look.vpk")).unwrap(), variant);
+        // the packed asset held wire-sized bytes with no further use — reclaimed after decode
+        assert!(!dir.join(CACHE_DIR).join(&psha).exists(), "packed bundle must be deleted");
+        // …while its members stay as ordinary content-addressed entries
+        assert_eq!(std::fs::read(dir.join(CACHE_DIR).join(sha(x))).unwrap(), x);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Counts download_to calls per asset name, delegating to the Fake.
+    struct Counting {
+        inner: Fake,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl crate::downloader::Downloader for Counting {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+            self.inner.fetch_release(r, t)
+        }
+        fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &crate::downloader::Asset) -> Result<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            a: &crate::downloader::Asset,
+            d: &Path,
+            r: u64,
+            p: crate::downloader::ChunkProgress,
+        ) -> Result<(u64, String)> {
+            self.calls.lock().unwrap().push(a.name.clone());
+            self.inner.download_to(a, d, r, p)
+        }
+    }
+
+    /// R5: a member hash mismatch AFTER a clean psha256 is a producer defect — the wire carried
+    /// exactly what the manifest asked for, so refetching reproduces it. One download, a loud
+    /// failure naming a broken release, no retry loop burning bandwidth toward the same wall.
+    #[test]
+    fn a_member_hash_mismatch_fails_loudly_and_is_never_retried() {
+        let dir = tempdir("bundle-defect");
+        let good = b"GOOD" as &[u8];
+        let evil = b"EVIL" as &[u8]; // same size, different bytes — B2 passes, R4 must not
+        let (packed, psha, dsize) = pack(&[evil]);
+        let m = serde_json::json!({
+            "schema": 3, "version": "1.0.0",
+            "bundles": [{ "name": "b0.phxb", "codec": "zstd",
+                          "psize": packed.len(), "psha256": psha, "size": dsize,
+                          "members": [sha(good)] }],
+            "files": [ bundled_json("game/dota/g.txt", good) ],
+        })
+        .to_string();
+        let dl = Counting {
+            inner: Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]),
+            calls: Mutex::new(Vec::new()),
+        };
+
+        let e = install(&settings(&dir), &dl, None, None, None).unwrap_err();
+        assert!(format!("{e:#}").contains("broken release"), "got: {e:#}");
+        assert_eq!(
+            dl.calls.lock().unwrap().len(),
+            1,
+            "a producer defect must not be retried as a transfer problem"
+        );
+        assert!(!dir.join("game/dota/g.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// B4 at decode time: the stream must end exactly at the last member. Trailing bytes mean
+    /// the byte-counting split was built on a lie — refuse, do not install what happened to
+    /// align before the error.
+    #[test]
+    fn trailing_bytes_after_the_last_member_are_refused() {
+        let dir = tempdir("bundle-trailing");
+        let a = b"AAAA" as &[u8];
+        let (packed, psha, _) = pack(&[a, b"TRAILING GARBAGE"]);
+        let m = serde_json::json!({
+            "schema": 3, "version": "1.0.0",
+            "bundles": [{ "name": "b0.phxb", "codec": "zstd",
+                          "psize": packed.len(), "psha256": psha, "size": a.len(),
+                          "members": [sha(a)] }],
+            "files": [ bundled_json("game/dota/a.txt", a) ],
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]);
+        let e = install(&settings(&dir), &dl, None, None, None).unwrap_err();
+        assert!(format!("{e:#}").contains("past its declared members"), "got: {e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An interrupted PACKED download resumes from its `.part` (R6: progress lives per asset).
+    #[test]
+    fn an_interrupted_bundle_download_resumes_instead_of_restarting() {
+        let dir = tempdir("bundle-resume");
+        // period-4099 pseudo-noise so the packed stream is big enough to cut meaningfully
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2654435761) % 251) as u8).collect();
+        let (packed, psha, dsize) = pack(&[&big]);
+        assert!(packed.len() > 2, "the member must not compress to nothing");
+        let m = serde_json::json!({
+            "schema": 3, "version": "1.0.0",
+            "bundles": [{ "name": "b0.phxb", "codec": "zstd",
+                          "psize": packed.len(), "psha256": psha, "size": dsize,
+                          "members": [sha(&big)] }],
+            "files": [ bundled_json("game/dota/big.vpk", &big) ],
+        })
+        .to_string();
+        let dl = CutOnce {
+            inner: Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]),
+            cut: packed.len() / 2,
+            failed: false.into(),
+        };
+
+        // first run: dies mid-packed-download, leaving the resumable .part under the psha256
+        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert!(!dir.join("game/dota/big.vpk").exists());
+        assert!(dir.join(CACHE_DIR).join(format!("{psha}.part")).exists());
+
+        // second run: resumes the packed .part (asserted inside CutOnce) and completes
+        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
+        assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
+        assert!(!dir.join(CACHE_DIR).join(&psha).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Gotcha 5 (repair granularity): needing members from ONE bundle fetches that bundle once
+    /// — and leaves every other bundle alone.
+    #[test]
+    fn repair_fetches_only_the_bundle_holding_the_damage_and_only_once() {
+        let dir = tempdir("bundle-repair");
+        let (a1, a2) = (b"ALPHA-1" as &[u8], b"ALPHA-2" as &[u8]);
+        let b1 = b"BETA-1" as &[u8];
+        let (packed_a, psha_a, dsize_a) = pack(&[a1, a2]);
+        let (packed_b, psha_b, dsize_b) = pack(&[b1]);
+        let m = serde_json::json!({
+            "schema": 3, "version": "1805",
+            "bundles": [
+                { "name": "a.phxb", "codec": "zstd",
+                  "psize": packed_a.len(), "psha256": psha_a, "size": dsize_a,
+                  "members": [sha(a1), sha(a2)] },
+                { "name": "b.phxb", "codec": "zstd",
+                  "psize": packed_b.len(), "psha256": psha_b, "size": dsize_b,
+                  "members": [sha(b1)] },
+            ],
+            "files": [
+                bundled_json("game/dota/a1.txt", a1),
+                bundled_json("game/dota/a2.txt", a2),
+                bundled_json("game/dota/b1.txt", b1),
+            ],
+        })
+        .to_string();
+        let manifest = Manifest::parse(m.as_bytes()).unwrap();
+        let dl = Counting {
+            inner: Fake::new("v1805", &m, vec![("a.phxb", &packed_a), ("b.phxb", &packed_b)]),
+            calls: Mutex::new(Vec::new()),
+        };
+        let release = dl.fetch_release("r", None).unwrap();
+
+        // a full install, then damage BOTH files of bundle A; bundle B's file stays intact
+        install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        std::fs::write(dir.join("game/dota/a1.txt"), b"corrupt").unwrap();
+        std::fs::write(dir.join("game/dota/a2.txt"), b"corrupt").unwrap();
+        dl.calls.lock().unwrap().clear();
+
+        let r = install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        assert_eq!(r.written, 2);
+        assert_eq!(std::fs::read(dir.join("game/dota/a1.txt")).unwrap(), a1);
+        assert_eq!(std::fs::read(dir.join("game/dota/a2.txt")).unwrap(), a2);
+        assert_eq!(
+            *dl.calls.lock().unwrap(),
+            vec!["a.phxb".to_string()],
+            "one fetch of the damaged bundle; the intact bundle costs nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R6 in `base_cached`'s terms: a packed bundle on disk is wire progress toward all of its
+    /// members; extracted members alone are fetched FILES but discount no wire bytes while the
+    /// bundle still has missing members.
+    #[test]
+    fn base_cached_accounts_bundles_per_asset() {
+        let dir = tempdir("bundle-cached");
+        let (x, y) = (b"XX-CONTENT" as &[u8], b"YY" as &[u8]);
+        let (packed, psha, dsize) = pack(&[x, y]);
+        let m = serde_json::json!({
+            "schema": 3, "version": "1805",
+            "bundles": [{ "name": "b0.phxb", "codec": "zstd",
+                          "psize": packed.len(), "psha256": psha, "size": dsize,
+                          "members": [sha(x), sha(y)] }],
+            "files": [ bundled_json("game/dota/x.txt", x), bundled_json("game/dota/y.txt", y) ],
+        })
+        .to_string();
+        let manifest = Manifest::parse(m.as_bytes()).unwrap();
+        let statuses = base_plan(&dir, &manifest, None, "plan", None).unwrap();
+        let cache = dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
+        std::fs::create_dir_all(&cache).unwrap();
+
+        // nothing cached
+        assert_eq!(base_cached(&dir, &manifest, &statuses), (0, 0));
+        // one extracted member, packed gone: its dest needs no network, but the packed asset
+        // still crosses whole for the other member — zero wire bytes discounted
+        std::fs::write(cache.join(sha(x)), x).unwrap();
+        assert_eq!(base_cached(&dir, &manifest, &statuses), (0, 1));
+        // a packed .part is byte progress
+        std::fs::write(cache.join(format!("{psha}.part")), &packed[..2]).unwrap();
+        assert_eq!(base_cached(&dir, &manifest, &statuses), (2, 1));
+        // the full packed asset present: the whole bundle is offline-obtainable
+        std::fs::remove_file(cache.join(format!("{psha}.part"))).unwrap();
+        std::fs::write(cache.join(&psha), &packed).unwrap();
+        assert_eq!(base_cached(&dir, &manifest, &statuses), (packed.len() as u64, 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

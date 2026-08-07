@@ -44,15 +44,17 @@ window.addEventListener("load", () => {
       document.getElementById("gd-modal").classList.remove("hidden");
       gdStage("run");
       gd.perFile = new Map();
-      gd.sum = 2.9 * GB; gd.doneFiles = 1289; gd.files = 4635; gd.bytes = 14.75 * GB;
+      // bytes are WIRE bytes since the bundle format (schema 3): 7.92 GB crosses the network
+      // for 14.77 GB on disk, and a mid-run item is as often a packed bundle as a file
+      gd.sum = 2.9 * GB; gd.doneFiles = 1289; gd.files = 4635; gd.bytes = 7.92 * GB;
       gd.samples = [{ t: performance.now() - 20000, b: 2.4 * GB }];
       gd.etaText = ""; gd.etaAt = 0;
-      onGdProgress({ payload: { op: "game", item: "game/dota/pak01_dir.vpk", current: 1290,
-        total: 4635, bytesDone: 12 * 1024 * 1024, bytesTotal: 200 * 1024 * 1024, done: true } });
+      onGdProgress({ payload: { op: "game", item: "b002-txt-736453e4cf3c.phxb", current: 12,
+        total: 146, bytesDone: 12 * 1024 * 1024, bytesTotal: 200 * 1024 * 1024, done: false } });
     } else if (h === "gd") {
       document.getElementById("gd-title").textContent = t("gd.title");
       document.getElementById("gd-summary").textContent =
-        t("gd.confirm", { gb: "16.4", n: 4635, dir: "D:\\Games\\Dota 2 6.88" });
+        t("gd.confirm", { gb: "7.9", disk: "14.8", n: 4635, dir: "D:\\Games\\Dota 2 6.88" });
       document.getElementById("gd-modal").classList.remove("hidden");
       gdStage("confirm");
     }
