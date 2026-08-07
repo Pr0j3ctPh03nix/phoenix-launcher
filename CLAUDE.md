@@ -86,7 +86,6 @@ the target game build, by editing the dist repo + cutting a release — the upda
       preview/            its stub `window.__TAURI__` + location.hash director (never shipped)
     dev/check_i18n.js     EN/RU key parity + every `$("id")` resolves; exits non-zero on a gap
     known_bugs.md         accepted residual risks: trigger, why accepted, fix direction
-    bundle_format_plan.md proposed .phxb bundle format for game-dist (schema 3) — not implemented
 
 ## Build / run / test
 
