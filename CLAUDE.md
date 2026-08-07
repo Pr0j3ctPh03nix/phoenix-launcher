@@ -236,7 +236,14 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   thousands of tiny request-bound files plus a few multi-GB VPKs, so LPT scheduling keeps the
   big files streaming the whole run (alphabetical order used to leave a giant file running ALONE
   at the end) and makes the byte rate — and the ETA built on it — honest from the first seconds.
-  Worker count and github.rs's POOL_PER_HOST move together, or workers churn reconnects. Staging
+  Worker count and github.rs's POOL_PER_HOST move together, or workers churn reconnects.
+  **Transient failures retry per asset** (DL_RETRIES, exponential backoff): 4,600+ requests
+  against a CDN that throws sporadic 5xxs meant one hiccup killed a 15 GB run and the USER was
+  the retry loop. Only genuinely transient failures qualify (transport, 5xx/429/408) — a 4xx, a
+  verification failure, or a callback abort (cancel / sibling failure) is never retried, and the
+  backoff sleeps in slices polling the chunk callback so Stop lands mid-nap. Each attempt
+  resumes from the `.part`. Relatedly, `net_err` drops HTML bodies from status errors (the CDN's
+  error pages are tag soup; the API's JSON errors stay quoted). Staging
   copies stay sequential so commit is unchanged. Progress ticks fan out to every dest sharing an asset hash (each UI row
   gets its bar). The first failure aborts the sibling in-flight streams at their next chunk
   (`ChunkProgress` returns bool; false = abort, partial kept) — a dead asset never waits minutes

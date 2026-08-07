@@ -74,7 +74,15 @@ fn net_err(e: ureq::Error) -> anyhow::Error {
     match e {
         ureq::Error::Status(code, resp) => {
             let body = resp.into_string().unwrap_or_default();
-            let snippet: String = body.chars().take(200).collect();
+            let trimmed = body.trim_start();
+            // The snippet exists for the API's JSON errors ({"message": "Not Found"}), which are
+            // worth showing. The CDN's error PAGES are HTML — 200 chars of doctype and meta tags
+            // in the status line help nobody. The root NetKind already says "HTTP 500", so an
+            // HTML body adds no context at all.
+            if trimmed.starts_with('<') {
+                return anyhow::Error::new(NetKind::Status(code));
+            }
+            let snippet: String = trimmed.chars().take(200).collect();
             anyhow::Error::new(NetKind::Status(code)).context(format!("HTTP {code}: {snippet}"))
         }
         ureq::Error::Transport(t) => {

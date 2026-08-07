@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::config::Settings;
-use crate::downloader::{Downloader, Release};
+use crate::downloader::{Downloader, NetKind, Release};
 use crate::manifest::{FileEntry, Manifest};
 use crate::state::{InstalledFile, InstalledState};
 use crate::{engine, fslock, verify};
@@ -430,6 +430,34 @@ const PROGRESS_GRAIN: u64 = 256 * 1024;
 /// is a burst of pure overhead, and the counter only has to move visibly.
 const PLAN_GRAIN: u64 = 16;
 
+/// Transient-failure retries per asset before the run fails. The base game is 4,600+ requests
+/// against GitHub's CDN, which throws sporadic 5xxs — without retries the odds of one hiccup
+/// killing a 15 GB run are terrible, and the user becomes the retry loop (clicking Resume for
+/// every blip). Retries cost nothing wrong: the `.part` resume machinery continues each attempt
+/// from the bytes already fetched.
+const DL_RETRIES: u32 = 3;
+/// First retry delay; doubles per attempt (1 s, 2 s, 4 s live). Milliseconds in tests — a unit
+/// test must not sleep out a real backoff schedule.
+#[cfg(not(test))]
+const RETRY_BACKOFF_MS: u64 = 1000;
+#[cfg(test)]
+const RETRY_BACKOFF_MS: u64 = 1;
+/// Backoff sleeps in slices this long, polling the chunk callback between them — a Stop pressed
+/// during a 4-second backoff must land now, not after the nap.
+const RETRY_SLICE_MS: u64 = 100;
+
+/// Worth retrying? Only failures the next attempt can plausibly not repeat: transport drops and
+/// server-side errors (5xx, 429 rate limit, 408 timeout). A 4xx is a fact about the request, a
+/// verification failure is a fact about the source, and a callback abort (cancel / sibling
+/// failure) is an instruction — retrying any of those fights the truth or the user.
+fn transient_net_failure(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| match c.downcast_ref::<NetKind>() {
+        Some(NetKind::Transport) => true,
+        Some(NetKind::Status(s)) => *s >= 500 || *s == 429 || *s == 408,
+        None => false,
+    })
+}
+
 /// Fetch every to-write file into the asset cache with a small worker pool. Errors fail the
 /// phase: the first error wins — remaining workers stop early AND in-flight streams abort at
 /// their next chunk (the .part they leave is resumed on the next run), so a dead asset never
@@ -657,29 +685,53 @@ fn obtain_to_cache(
         .copied()
         .with_context(|| format!("the release has no asset named {name}"))?;
     let tmp = cache.join(format!("{sha256}.part"));
-    // an interrupted attempt left a .part behind — resume from its length instead of restarting
-    let mut resume_from = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-    // ...but a .part that already reached the full length can never be resumed: the Range would
-    // start at EOF and the CDN answers 416, which is an error, which keeps the .part — leaving
-    // the asset permanently undownloadable. That state is reachable without anything exotic (a
-    // completed transfer whose rename into the cache failed, or a cancel landing on the last
-    // chunk of a file), so treat an over-long .part as poison and start clean.
-    if resume_from >= size {
-        let _ = std::fs::remove_file(&tmp);
-        resume_from = 0;
-    }
-    let got = dl
-        .download_to(asset, &tmp, resume_from, chunk)
-        .with_context(|| format!("downloading {name}"));
-    let (got_size, got_sha) = match got {
-        Ok(v) => v,
-        Err(e) => {
-            // keep the .part — the next run resumes from it — unless it is now full-length or
-            // longer, which no future Range request could extend
-            if std::fs::metadata(&tmp).map(|m| m.len() >= size).unwrap_or(false) {
-                let _ = std::fs::remove_file(&tmp);
+    let mut attempt = 0u32;
+    let (got_size, got_sha) = loop {
+        // an interrupted attempt (an earlier run's, or this loop's previous try) left a .part —
+        // resume from its length instead of restarting.
+        // ...but a .part that already reached the full length can never be resumed: the Range
+        // would start at EOF and the CDN answers 416, which is an error, which keeps the .part —
+        // leaving the asset permanently undownloadable. That state is reachable without anything
+        // exotic (a completed transfer whose rename into the cache failed, or a cancel landing
+        // on the last chunk of a file), so treat an over-long .part as poison and start clean.
+        let mut resume_from = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        if resume_from >= size {
+            let _ = std::fs::remove_file(&tmp);
+            resume_from = 0;
+        }
+        match dl.download_to(asset, &tmp, resume_from, chunk) {
+            Ok(v) => break v,
+            Err(e) => {
+                // keep the .part — the next attempt (or run) resumes from it — unless it is now
+                // full-length or longer, which no future Range request could extend
+                if std::fs::metadata(&tmp).map(|m| m.len() >= size).unwrap_or(false) {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                attempt += 1;
+                if attempt > DL_RETRIES || !transient_net_failure(&e) {
+                    return Err(e).with_context(|| {
+                        if attempt > 1 {
+                            format!("downloading {name} (after {attempt} attempts)")
+                        } else {
+                            format!("downloading {name}")
+                        }
+                    });
+                }
+                // Exponential backoff, slept in slices with the chunk callback polled between
+                // them: the callback is the cancel line (Stop, a sibling's failure), and a
+                // cancel during a multi-second nap must land now — the sleeper reports the
+                // bytes it already has, which the grain check keeps out of the UI.
+                let written = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+                let delay = RETRY_BACKOFF_MS << (attempt - 1);
+                for _ in 0..delay.div_ceil(RETRY_SLICE_MS) {
+                    if !chunk(written, None) {
+                        return Err(anyhow!("download aborted"));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        RETRY_SLICE_MS.min(delay),
+                    ));
+                }
             }
-            return Err(e);
         }
     };
     if got_size != size || got_sha != sha256 {
@@ -1773,6 +1825,101 @@ mod tests {
         let r = install(&settings(&dir), &dl, None, None, None).unwrap();
         assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Fails `download_to` with a given error until `fail` runs out, then delegates to the Fake.
+    struct Flaky {
+        inner: Fake,
+        fail: std::sync::atomic::AtomicU32,
+        kind: Option<crate::downloader::NetKind>, // None = an error with no NetKind (an abort)
+        calls: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::downloader::Downloader for Flaky {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+            self.inner.fetch_release(r, t)
+        }
+        fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &crate::downloader::Asset) -> Result<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            a: &crate::downloader::Asset,
+            d: &Path,
+            r: u64,
+            p: crate::downloader::ChunkProgress,
+        ) -> Result<(u64, String)> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) > 0 {
+                self.fail.fetch_sub(1, Ordering::SeqCst);
+                return Err(match self.kind {
+                    Some(k) => anyhow::Error::new(k).context("simulated server flake"),
+                    None => anyhow!("download aborted"),
+                });
+            }
+            self.inner.download_to(a, d, r, p)
+        }
+    }
+
+    fn one_file_release() -> (String, Vec<(&'static str, &'static [u8])>) {
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ file_json("a.vpk", "game/dota/a.vpk", b"vpk") ]
+        })
+        .to_string();
+        (m, vec![("a.vpk", b"vpk")])
+    }
+
+    #[test]
+    fn a_transient_500_is_retried_until_it_passes() {
+        use crate::downloader::NetKind;
+        let dir = tempdir("retry-500");
+        let (m, assets) = one_file_release();
+        let dl = Flaky {
+            inner: Fake::new("v1.0.0", &m, assets),
+            fail: 2.into(),
+            kind: Some(NetKind::Status(500)),
+            calls: 0.into(),
+        };
+        // two flakes, then success — the user must never have seen an error
+        install(&settings(&dir), &dl, None, None, None).unwrap();
+        assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn permanent_failures_and_aborts_are_not_retried() {
+        use crate::downloader::NetKind;
+        // a 404 is a fact about the request — retrying re-asks a settled question
+        let dir = tempdir("retry-404");
+        let (m, assets) = one_file_release();
+        let dl = Flaky {
+            inner: Fake::new("v1.0.0", &m, assets),
+            fail: 99.into(),
+            kind: Some(NetKind::Status(404)),
+            calls: 0.into(),
+        };
+        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // an abort (cancel, sibling failure) is an instruction — retrying fights the user
+        let dir = tempdir("retry-abort");
+        let (m, assets) = one_file_release();
+        let dl = Flaky {
+            inner: Fake::new("v1.0.0", &m, assets),
+            fail: 99.into(),
+            kind: None,
+            calls: 0.into(),
+        };
+        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
