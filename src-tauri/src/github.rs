@@ -17,12 +17,13 @@ const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per socket read/write op — detects stalls without capping total transfer time of large assets.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// Idle connections the pool keeps PER HOST. ureq's default is 1 — with the 4-worker download
-/// pool (and the 4-worker notes fetch) all hitting one host, every moment two workers were
-/// between files the pool closed one connection and the next file paid a full DNS+TCP+TLS
-/// handshake again: exactly the 663-vs-159 ms/file cost the pooled-agent design (below) exists
-/// to avoid, resurfacing across thousands of base-game files. Sized past every worker pool.
-const POOL_PER_HOST: usize = 8;
+/// Idle connections the pool keeps PER HOST. ureq's default is 1 — with a multi-worker download
+/// pool hitting one host, every moment two workers were between files the pool closed one
+/// connection and the next file paid a full DNS+TCP+TLS handshake again: exactly the
+/// 663-vs-159 ms/file cost the pooled-agent design (below) exists to avoid, resurfacing across
+/// thousands of base-game files. Sized past the biggest pool (install.rs DL_WORKERS = 8) plus
+/// slack for a straggling background warm and the notes fetch — idle sockets cost nothing.
+const POOL_PER_HOST: usize = 12;
 
 /// The GitHub-backed `Downloader`. Holds the optional auth token and its pooled HTTP agents.
 ///
@@ -214,7 +215,9 @@ impl Downloader for Github {
         // drop any stale tail beyond the prefix we just hashed, then append
         file.set_len(prefix)?;
         file.seek(std::io::SeekFrom::Start(prefix))?;
-        let mut buf = [0u8; 64 * 1024];
+        // 256 KiB reads, matching verify.rs's file hashing: the payload includes multi-hundred-MB
+        // VPKs, and 64 KiB quadrupled the read syscalls per file for nothing
+        let mut buf = vec![0u8; 256 * 1024];
         let mut written = prefix;
         loop {
             let n = reader.read(&mut buf)?;

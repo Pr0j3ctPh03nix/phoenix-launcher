@@ -33,6 +33,18 @@ window.addEventListener("load", () => {
       doGameVerify();
       setStatus(t("status.working"), "busy", t("gv.progress", { i: 1342, n: 4635 }));
       if (h.endsWith("stopping")) fireStop(); // the after-click state: Stop pressed, now disabled
+    } else if (h === "gd:run") {
+      // mid-download, ETA included: one synthetic 20-second-old rate sample, then a real tick
+      // through onGdProgress so the line renders exactly as it would live
+      document.getElementById("gd-title").textContent = t("gd.title");
+      document.getElementById("gd-modal").classList.remove("hidden");
+      gdStage("run");
+      gd.perFile = new Map();
+      gd.sum = 2.9 * GB; gd.doneFiles = 1289; gd.files = 4635; gd.bytes = 14.75 * GB;
+      gd.samples = [{ t: performance.now() - 20000, b: 2.4 * GB }];
+      gd.etaText = ""; gd.etaAt = 0;
+      onGdProgress({ payload: { op: "game", item: "game/dota/pak01_dir.vpk", current: 1290,
+        total: 4635, bytesDone: 12 * 1024 * 1024, bytesTotal: 200 * 1024 * 1024, done: true } });
     } else if (h === "gd") {
       document.getElementById("gd-title").textContent = t("gd.title");
       document.getElementById("gd-summary").textContent =

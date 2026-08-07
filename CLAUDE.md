@@ -225,9 +225,13 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   "stock", so the shim comes back while the UI reports the game reverted. When the state is
   missing AND the folder shows a prior install (winmm_orig.dll or a vanilla store), displaced
   files go to the ephemeral backup instead. Costs a preserved original; never fakes one.
-- **Downloads**: phase 1a fetches unique-by-hash files into the content-addressed cache with a
-  4-worker pool (files are independent by construction); staging copies stay sequential so
-  commit is unchanged. Progress ticks fan out to every dest sharing an asset hash (each UI row
+- **Downloads**: phase 1a fetches unique-by-hash files into the content-addressed cache with an
+  8-worker pool (files are independent by construction), **largest first**: the base game is
+  thousands of tiny request-bound files plus a few multi-GB VPKs, so LPT scheduling keeps the
+  big files streaming the whole run (alphabetical order used to leave a giant file running ALONE
+  at the end) and makes the byte rate — and the ETA built on it — honest from the first seconds.
+  Worker count and github.rs's POOL_PER_HOST move together, or workers churn reconnects. Staging
+  copies stay sequential so commit is unchanged. Progress ticks fan out to every dest sharing an asset hash (each UI row
   gets its bar). The first failure aborts the sibling in-flight streams at their next chunk
   (`ChunkProgress` returns bool; false = abort, partial kept) — a dead asset never waits minutes
   for a huge neighbor to finish before surfacing. An interrupted download keeps its `.part`; the
@@ -401,6 +405,11 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   status (that was O(n²) over 4,635 files). UI: setup's third button, and settings' **Game files**
   tab — "Download the game" + "Verify game files" under a `6.88f` tag, alongside
   **Uninstall Phoenix**; kept off the main footer, where they crowded the everyday actions.
+  The download line carries an **ETA** from a ~30 s sliding-window byte rate (frontend-only,
+  `gdEta`): windowed so resume jumps and the request-bound small-file stretches don't haunt the
+  estimate, repainted at most once a second, silent for the first seconds, coarse units on
+  purpose ("~14 min", never "13:47"). Files-done and bytes deliberately DISAGREE mid-run — 1,290
+  files can be 0.37 GB; both are true.
   Verify and Uninstall both leave settings first, through the same unsaved-changes guard as Back,
   since the status line they report through lives on main — Uninstall runs its destructive
   confirm BEFORE that guard, so declining it leaves the user where they were instead of on main.

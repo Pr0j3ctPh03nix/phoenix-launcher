@@ -1020,7 +1020,43 @@ const gd = {
   sum: 0,          // running total of perFile's values, maintained by delta (never re-summed)
   doneFiles: 0,
   unlisten: null,
+  samples: null,   // [{t, b}] byte-total snapshots for the ETA's sliding-window rate
+  etaText: "",     // last rendered ETA (repainted at most once a second)
+  etaAt: 0,
 };
+
+// ---- ETA ----
+// Rate over the last ~30 s of ticks, NOT the whole run: a resumed run starts with a byte jump,
+// and the small-file stretches are request-bound — a whole-run average would haunt the estimate
+// long after conditions changed. Repainted at most once a second: an ETA that flickers with
+// every tick reads as noise. Says nothing for the first seconds — early guesses are wrong in
+// both directions, and a number that appears and stabilizes beats one that thrashes.
+function gdEta(now) {
+  const s = gd.samples;
+  s.push({ t: now, b: Math.min(gd.sum, gd.bytes) });
+  while (s.length > 2 && now - s[0].t > 30000) s.shift();
+  const span = now - s[0].t;
+  if (span < 3000) return gd.etaText;
+  // etaAt 0 = never painted -> paint now; afterwards at most once a second
+  if (!gd.etaAt || now - gd.etaAt >= 1000) {
+    const rate = (s[s.length - 1].b - s[0].b) / (span / 1000);
+    if (rate > 0) {
+      gd.etaAt = now;
+      gd.etaText = t("gd.eta", { t: fmtDuration((gd.bytes - s[s.length - 1].b) / rate) });
+    }
+  }
+  return gd.etaText;
+}
+
+// Coarse on purpose (nearest unit, minutes rounded): "~14 min left" is a promise the link can
+// keep; "13:47" is one it can't. Minutes computed first so 59.9 min carries into "1 h 0 min"
+// instead of rendering as "60 min".
+function fmtDuration(sec) {
+  const m = Math.round(sec / 60);
+  if (m >= 60) return t("time.hm", { h: Math.floor(m / 60), m: m % 60 });
+  if (m >= 1) return t("time.m", { m });
+  return t("time.s", { s: Math.max(1, Math.round(sec)) });
+}
 
 function gdStage(stage) {
   for (const s of ["gd-plan", "gd-confirm", "gd-run", "gd-err"])
@@ -1127,10 +1163,11 @@ function onGdProgress(ev) {
       const sum = Math.min(gd.sum, gd.bytes); // shared-content dests double-tick; the bar must not
       const pct = gd.bytes ? (sum / gd.bytes) * 100 : 100;
       $("gd-fill").style.width = pct.toFixed(1) + "%";
+      const eta = gdEta(performance.now());
       $("gd-line1").textContent = t("gd.dl", {
         done: (sum / GB).toFixed(2), total: (gd.bytes / GB).toFixed(2),
         i: gd.doneFiles, n: gd.files,
-      });
+      }) + (eta ? " · " + eta : "");
       $("gd-line2").textContent = p.item || "";
     }
   } else if (p.op === "install") {
@@ -1150,6 +1187,9 @@ async function gdRun() {
   gd.perFile = new Map();
   gd.sum = 0;      // running byte total; reset with the map or a resumed run inherits it
   gd.doneFiles = 0;
+  gd.samples = []; // fresh rate window — a retry must not inherit the failed run's rate
+  gd.etaText = "";
+  gd.etaAt = 0;
   $("gd-fill").style.width = "0%";
   $("gd-line1").textContent = t("gd.starting");
   $("gd-line2").textContent = "";

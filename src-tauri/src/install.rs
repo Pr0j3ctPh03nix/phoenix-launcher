@@ -417,8 +417,12 @@ fn probe_writable<'a>(game_dir: &Path, dests: impl Iterator<Item = &'a String>) 
 // ---- asset cache ----
 
 /// How many files phase 1 fetches at once. Files are independent (content-addressed cache
-/// entries), so this is embarrassingly parallel; 4 keeps a slow link busy without hammering it.
-const DL_WORKERS: usize = 4;
+/// entries), so this is embarrassingly parallel. 8, not 4: the base game is thousands of TINY
+/// files (a real run showed 1,290 done at 0.37 GB — ~290 KB each), and for those the cost is the
+/// request round trip, not the bytes — per-file overhead divides by the worker count while the
+/// few multi-GB VPKs stream at link speed regardless. Bounded by the per-host idle pool in
+/// github.rs (POOL_PER_HOST) — raise that alongside this, or the workers churn reconnects.
+const DL_WORKERS: usize = 8;
 /// Byte-progress ticks are throttled to this granularity, so a fast link doesn't flood the UI
 /// with an event per 64 KiB chunk.
 const PROGRESS_GRAIN: u64 = 256 * 1024;
@@ -456,8 +460,14 @@ fn obtain_all_tagged(
 ) -> Result<()> {
     // unique by sha256: two dests sharing one asset download once (the cache entry is shared)
     let mut seen = HashSet::new();
-    let jobs: Vec<&FileEntry> =
+    let mut jobs: Vec<&FileEntry> =
         to_write.iter().filter(|fe| seen.insert(fe.sha256.as_str())).copied().collect();
+    // Largest first (LPT scheduling): the multi-GB VPKs start streaming immediately and run for
+    // most of the download while the other workers chew through the small-file tail — in manifest
+    // (alphabetical) order, a giant file picked up near the end ran ALONE long after every other
+    // worker went idle, adding its whole transfer time to the wall clock. Also steadies the UI:
+    // the byte rate reaches link speed in the first seconds, so the ETA is honest early.
+    jobs.sort_unstable_by_key(|fe| std::cmp::Reverse(fe.size));
     let total = jobs.len() as u64;
     // every dest that shares a job's hash — ticks fan out to all of them, so each UI file row
     // gets its bar even when two dests share one asset
