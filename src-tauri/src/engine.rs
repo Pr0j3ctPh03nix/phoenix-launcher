@@ -444,6 +444,12 @@ pub fn evaluate(settings: &Settings, tag_name: &str, manifest: &Manifest) -> Res
 }
 
 /// Read-only check: fetch the manifest and evaluate it.
+///
+/// Callers are the debug-only CLI and the test suite — the GUI's `check` command composes
+/// `fetch` + `evaluate` itself (it caches the manifest between the two). Release builds compile
+/// neither caller, so the release-only dead-code silence below is accurate, and a debug build
+/// still warns if this ever becomes genuinely unused.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub fn check(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Result<CheckResult> {
     let (release, manifest) = fetch(settings, dl, tag)?;
     evaluate(settings, &release.tag_name, &manifest)

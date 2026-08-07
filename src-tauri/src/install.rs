@@ -1042,9 +1042,13 @@ impl BaseStatus {
 #[derive(Debug)]
 pub struct BaseReport {
     pub version: String,
+    /// Read by the debug-only CLI's report line; the GUI view doesn't carry it.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub tag: String,
     pub written: usize,
     pub up_to_date: usize,
+    /// Read by the debug-only CLI and the tests; the GUI view doesn't carry it.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub skipped: usize,
     /// Bytes downloaded (the sum of written file sizes).
     pub bytes: u64,

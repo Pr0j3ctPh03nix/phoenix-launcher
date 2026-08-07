@@ -10,6 +10,9 @@
 //! as plain strings or `{lang: text}` objects for the frontend to resolve.
 
 mod autofind;
+// Debug-only like its dispatcher below: gated at the MODULE, not just the call site, so release
+// builds neither ship the CLI code nor warn about it being dead (nothing references it there).
+#[cfg(debug_assertions)]
 mod cli;
 mod cmd;
 mod config;
