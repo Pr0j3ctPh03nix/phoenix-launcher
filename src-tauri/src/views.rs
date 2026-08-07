@@ -157,6 +157,9 @@ pub struct GamePlanView {
     /// Of `bytes`, how much already sits in the base cache from an interrupted attempt (full
     /// entries + `.part` prefixes) — the confirm's "X of Y GB already downloaded" line.
     pub cached_bytes: u64,
+    /// Of `files`, how many are already COMPLETELY fetched (a `.part` counts toward bytes, not
+    /// here) — without this the resume confirm counted the finished files as still-to-do.
+    pub cached_files: u32,
     /// Free bytes on the target volume; absent when undeterminable.
     pub free_bytes: Option<u64>,
 }

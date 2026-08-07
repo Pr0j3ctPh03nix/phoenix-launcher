@@ -356,8 +356,10 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   A PRESENCE gate, not a build gate — the no-install-gate decision stands untouched.
   `startGameResume` is the ONE download flow that reuses the configured folder instead of
   asking: "where" was already answered by the folder holding the cache, and the confirm still
-  names the exact path plus how much is already fetched (`GamePlanView.cached_bytes`, full
-  entries + `.part` prefixes, metadata-only). `game_verify`'s not-a-game refusal names the
+  names the exact path plus how much is already fetched (`GamePlanView.cached_bytes` +
+  `cached_files`: bytes count full entries and `.part` prefixes unique-by-hash, files count
+  DESTS with a complete entry only — a `.part` is byte progress, not a downloaded file;
+  metadata-only, `install::base_cached`). `game_verify`'s not-a-game refusal names the
   interrupted download when one is present instead of "doesn't look like a game folder".
 - **A failed check falls back to `local_check`, never to a dead end.** Play and Uninstall are
   purely local, and both are gated on `state.lastCheck`, which only a SUCCESSFUL check used to

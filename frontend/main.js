@@ -1154,11 +1154,12 @@ async function gdOpen(origin, dir) {
   gd.bytes = plan.bytes;
   gd.files = plan.files;
   // an interrupted attempt left verified-size entries/.parts in the cache: say how much of the
-  // plan is already here — the answer to "did my 5 GB survive the restart?"
+  // plan is already here — bytes AND files ("did my 5 GB survive the restart?"). The files
+  // number is completely-fetched only; a .part counts toward the bytes, not the files.
   $("gd-summary").textContent = plan.cachedBytes > 0
     ? t("gd.confirmResume", {
         have: (plan.cachedBytes / GB).toFixed(1), gb: (plan.bytes / GB).toFixed(1),
-        n: plan.files, dir,
+        df: plan.cachedFiles, n: plan.files, dir,
       })
     : t("gd.confirm", { gb: (plan.bytes / GB).toFixed(1), n: plan.files, dir });
   // refuse up front what the backend would refuse a click later — same margin (512 MB)

@@ -1186,26 +1186,41 @@ pub fn pending_base_bytes(game_dir: &Path) -> u64 {
         .sum()
 }
 
-/// How many of the plan's to-download bytes are ALREADY in the base cache: a full entry counts
-/// whole, a `.part` counts its current length (both capped at the asset size — an over-long
-/// leftover must not report more than the plan asked for). Metadata only, unique by hash like
-/// every other byte total. Drives the resume confirm's "X of Y GB already downloaded".
-pub fn base_cached_bytes(game_dir: &Path, statuses: &[BaseStatus]) -> u64 {
+/// What the plan's to-download set ALREADY has in the base cache: (bytes, fully-fetched files).
+/// A full entry counts whole, a `.part` counts its current length (both capped at the asset
+/// size — an over-long leftover must not report more than the plan asked for). Bytes are unique
+/// by hash like every other byte total; FILES count dests (that is what every visible counter
+/// counts), and a dest is "fetched" only when its asset is complete — a `.part` is progress in
+/// bytes but not a downloaded file. Metadata only. Drives the resume confirm's
+/// "X of Y GB · N of M files already downloaded".
+pub fn base_cached(game_dir: &Path, statuses: &[BaseStatus]) -> (u64, usize) {
     let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
-    let mut seen = HashSet::new();
-    statuses
-        .iter()
-        .filter(|s| s.action == BaseAction::Write)
-        .filter(|s| seen.insert(s.entry.sha256.as_str()))
-        .map(|s| {
-            if let Ok(md) = std::fs::metadata(cache.join(&s.entry.sha256)) {
-                return md.len().min(s.entry.size);
+    // per unique hash: (counted bytes, is a complete entry)
+    let mut probed: HashMap<&str, (u64, bool)> = HashMap::new();
+    let mut bytes = 0u64;
+    let mut files = 0usize;
+    for s in statuses.iter().filter(|s| s.action == BaseAction::Write) {
+        let sha = s.entry.sha256.as_str();
+        let info = match probed.get(sha) {
+            Some(i) => *i,
+            None => {
+                let i = if let Ok(md) = std::fs::metadata(cache.join(sha)) {
+                    (md.len().min(s.entry.size), md.len() >= s.entry.size)
+                } else if let Ok(md) = std::fs::metadata(cache.join(format!("{sha}.part"))) {
+                    (md.len().min(s.entry.size), false)
+                } else {
+                    (0, false)
+                };
+                probed.insert(sha, i);
+                bytes += i.0; // once per unique hash
+                i
             }
-            std::fs::metadata(cache.join(format!("{}.part", s.entry.sha256)))
-                .map(|m| m.len().min(s.entry.size))
-                .unwrap_or(0)
-        })
-        .sum()
+        };
+        if info.1 {
+            files += 1; // once per DEST — two dests sharing a cached asset are two fetched files
+        }
+    }
+    (bytes, files)
 }
 
 /// Does this folder hold a DIFFERENT game build than the manifest describes?
@@ -2180,7 +2195,7 @@ mod tests {
     }
 
     #[test]
-    fn base_cached_bytes_counts_full_entries_and_part_prefixes() {
+    fn base_cached_counts_bytes_by_hash_and_files_by_dest() {
         let dir = tempdir("cached-bytes");
         let (m, _) = base_release();
         let manifest = crate::manifest::Manifest::parse(m.as_bytes()).unwrap();
@@ -2188,15 +2203,19 @@ mod tests {
 
         let cache = dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
         std::fs::create_dir_all(&cache).unwrap();
-        // EXE (3 bytes) fully cached; PAK has a 2-byte .part; CFG absent entirely
+        // EXE (3 bytes) fully cached; PAK has a 2-byte .part; the shared CFG asset absent
         std::fs::write(cache.join(sha(b"EXE")), b"EXE").unwrap();
         std::fs::write(cache.join(format!("{}.part", sha(b"PAK"))), b"PA").unwrap();
-        // 3 (full) + 2 (part) — CFG contributes 0, and the shared-content cfg pair counts once
-        assert_eq!(base_cached_bytes(&dir, &statuses), 5);
+        // bytes: 3 (full) + 2 (part). files: only EXE — a .part is byte progress, not a file
+        assert_eq!(base_cached(&dir, &statuses), (5, 1));
+
+        // the CFG asset landing makes BOTH its dests fetched files, but its bytes count once
+        std::fs::write(cache.join(sha(b"CFG")), b"CFG").unwrap();
+        assert_eq!(base_cached(&dir, &statuses), (8, 3));
 
         // an over-long leftover must not report more than the plan asked for
         std::fs::write(cache.join(sha(b"EXE")), b"EXE-OVERLONG").unwrap();
-        assert_eq!(base_cached_bytes(&dir, &statuses), 5);
+        assert_eq!(base_cached(&dir, &statuses), (8, 3));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

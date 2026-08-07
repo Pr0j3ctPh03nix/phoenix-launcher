@@ -54,12 +54,14 @@ pub async fn game_plan(
             .filter(|s| seen.insert(s.entry.sha256.as_str()))
             .map(|s| s.entry.size)
             .sum();
+        let (cached_bytes, cached_files) = install::base_cached(&dir, &statuses);
         Ok(GamePlanView {
             version: manifest.version,
             files: statuses.iter().filter(|s| s.action == BaseAction::Write).count() as u32,
             total_files: statuses.len() as u32,
             bytes,
-            cached_bytes: install::base_cached_bytes(&dir, &statuses),
+            cached_bytes,
+            cached_files: cached_files as u32,
             free_bytes: install::free_space(&dir),
         })
     })
