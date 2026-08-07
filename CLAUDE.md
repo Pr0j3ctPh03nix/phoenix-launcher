@@ -593,7 +593,12 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   update that never clears itself (and the pending-update banner outranks Play, so it is
   unrecoverable without another release). `release.yml` now CHECKS all three against the tag
   before building, and publishes with `fail_on_unmatched_files` so a release can never go out
-  without the `.sha256` sidecar clients require to auto-update.
+  without the `.sha256` sidecar clients require to auto-update. **The tag must be ANNOTATED and
+  its message BODY is the changelog**: release.yml extracts `%(contents:body)` into the release
+  body, which is what the in-app update banner renders — on a lightweight tag that format string
+  falls through to the commit message, and v1.3.4 briefly shipped its release notes as a bare
+  `Co-Authored-By` trailer that way. Subject line = release title material (redundant, kept
+  short); body = `#### Added/Changed/Fixed` markdown, user-facing.
 - **The `.old`/`.new` exe siblings** are self-update scratch, named off the RUNNING exe's stem, so
   a launcher the user renamed still finds its own leftovers and never adopts another copy's.
 - **Staging must be on the same volume as the game** (`<game>/.phoenix-staging/`) so the final move
