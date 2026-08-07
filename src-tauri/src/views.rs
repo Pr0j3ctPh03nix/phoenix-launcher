@@ -79,6 +79,14 @@ pub struct CheckView {
     /// what WE installed, not what the latest release is. The UI must word it as "couldn't check"
     /// rather than "up to date" (see `local_check`).
     pub local: bool,
+    /// The folder holds a game (`game/dota`) or a prior install record. False = there is nothing
+    /// to update INTO: the UI says "no game here" and offers the download instead of Install
+    /// (which would otherwise read "Update available" over an empty folder), and the apply
+    /// command refuses as the backend line behind that.
+    pub game_present: bool,
+    /// Bytes an interrupted base-game download left in `.phoenix-cache/base/` — turns the offer
+    /// into "Resume download (~N GB fetched)".
+    pub pending_base_bytes: u64,
 }
 
 #[derive(Serialize)]
@@ -146,6 +154,9 @@ pub struct GamePlanView {
     pub total_files: u32,
     /// Bytes that would download (unique content).
     pub bytes: u64,
+    /// Of `bytes`, how much already sits in the base cache from an interrupted attempt (full
+    /// entries + `.part` prefixes) — the confirm's "X of Y GB already downloaded" line.
+    pub cached_bytes: u64,
     /// Free bytes on the target volume; absent when undeterminable.
     pub free_bytes: Option<u64>,
 }
@@ -349,6 +360,8 @@ pub fn build_check_view(r: engine::CheckResult) -> CheckView {
         can_play: installed && changes == 0,
         can_uninstall: installed,
         local: false,
+        game_present: crate::install::game_present(&r.game_dir),
+        pending_base_bytes: crate::install::pending_base_bytes(&r.game_dir),
     }
 }
 
@@ -389,5 +402,8 @@ pub fn build_local_check_view(game_dir: &std::path::Path, st: &state::InstalledS
         can_play: changes == 0,
         can_uninstall: true,
         local: true,
+        // an install record exists by construction here — that IS the game-present evidence
+        game_present: true,
+        pending_base_bytes: 0,
     }
 }

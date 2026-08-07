@@ -8,6 +8,8 @@ const CHECK = {
   changes: 2,
   canPlay: true,
   canUninstall: true,
+  gamePresent: true,
+  pendingBaseBytes: 0,
   primaryAction: "apply",
   notes: "## Fixed\n- Launch tweaks\n- Release build caching",
   options: [{ id: "hud", kind: "choice", label: "HUD skin", value: "classic", variants: [{ id: "classic", label: "Classic" }, { id: "dark", label: "Dark" }] }],

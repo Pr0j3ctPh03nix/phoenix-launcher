@@ -13,7 +13,7 @@ use crate::config::Settings;
 use crate::github::Github;
 use crate::install::{self, BaseAction};
 use crate::views::{CmdError, GameInstallView, GamePlanView, GameVerifyView};
-use crate::{engine, state};
+use crate::engine;
 
 /// What a download into `target` would do — the numbers behind the confirm dialog. Read-only and
 /// fast for the fresh-install case (an empty folder plans without hashing anything).
@@ -59,6 +59,7 @@ pub async fn game_plan(
             files: statuses.iter().filter(|s| s.action == BaseAction::Write).count() as u32,
             total_files: statuses.len() as u32,
             bytes,
+            cached_bytes: install::base_cached_bytes(&dir, &statuses),
             free_bytes: install::free_space(&dir),
         })
     })
@@ -205,12 +206,20 @@ pub async fn game_verify(
         let settings = Settings::load();
         let dir = settings.resolve_game_dir().map_err(CmdError::from)?;
         // refuse folders that are not a game at all — "everything is damaged" would be a lie
-        // pointing at a download, when the truth is a wrong folder in settings
-        if !dir.join("game").join("dota").exists() && state::InstalledState::load(&dir).is_none() {
-            return Err(CmdError::from(format!(
-                "{} does not look like a game folder (no game/dota inside)",
-                dir.display()
-            )));
+        // pointing at a download, when the truth is a wrong folder in settings... or an
+        // interrupted download, which deserves to be named as exactly that
+        if !install::game_present(&dir) {
+            let pending = install::pending_base_bytes(&dir);
+            return Err(CmdError::from(if pending > 0 {
+                format!(
+                    "{} holds an interrupted game download (~{} MB fetched), not a game yet — \
+                     resume the download instead of verifying",
+                    dir.display(),
+                    pending / (1024 * 1024)
+                )
+            } else {
+                format!("{} does not look like a game folder (no game/dota inside)", dir.display())
+            }));
         }
         let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
         let manifest = engine::manifest_of(dl.as_ref(), &release).map_err(CmdError::from)?;

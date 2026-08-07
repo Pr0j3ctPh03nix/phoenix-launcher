@@ -94,6 +94,18 @@ pub async fn apply(
     tauri::async_runtime::spawn_blocking(move || {
         let _op = st.begin_op("install")?;
         let settings = Settings::load();
+        // The backend line behind the frontend not OFFERING Install here: the shim into a folder
+        // with no game in it yields a folder that still has no game, reported as "up to date".
+        // A presence gate, NOT a build gate (that stays removed by decision — any folder with a
+        // game/dota in it is still accepted, whatever build it holds). The CLI bypasses this on
+        // purpose (it talks to the engine directly; decoys are its whole point).
+        let game_dir = settings.resolve_game_dir().map_err(CmdError::from)?;
+        if !install::game_present(&game_dir) {
+            return Err(CmdError::from(format!(
+                "{} has no game in it — download the game first (Settings → Game files)",
+                game_dir.display()
+            )));
+        }
         let dl = downloader(&settings);
         // the engine's progress ticks go straight to the webview
         let emit = |p: engine::OpProgress| {

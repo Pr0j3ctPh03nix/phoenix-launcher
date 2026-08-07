@@ -1162,6 +1162,52 @@ fn plan_one(
     BaseStatus { action, entry: fe.clone(), target }
 }
 
+/// Does this folder hold a game at all — `game/dota` on disk, or a shim install record (a shim
+/// install is evidence a game was here even if the folder is damaged)? The check view derives
+/// its "no game here" state from this, the apply command refuses on it, and game_verify words
+/// its refusal with it. NOT a build gate (that stays removed by decision): it asks "is there
+/// anything to update INTO", never "is it the right version".
+pub fn game_present(game_dir: &Path) -> bool {
+    game_dir.join("game").join("dota").exists()
+        || crate::state::InstalledState::load(game_dir).is_some()
+}
+
+/// Bytes an interrupted base-game download left in the cache (complete entries + `.part`s).
+/// Metadata only — this is the "a download is waiting here" signal for the UI, not a verification
+/// (obtain re-verifies every entry it reuses). 0 when the cache is absent.
+pub fn pending_base_bytes(game_dir: &Path) -> u64 {
+    let Ok(rd) = std::fs::read_dir(game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR)) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// How many of the plan's to-download bytes are ALREADY in the base cache: a full entry counts
+/// whole, a `.part` counts its current length (both capped at the asset size — an over-long
+/// leftover must not report more than the plan asked for). Metadata only, unique by hash like
+/// every other byte total. Drives the resume confirm's "X of Y GB already downloaded".
+pub fn base_cached_bytes(game_dir: &Path, statuses: &[BaseStatus]) -> u64 {
+    let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
+    let mut seen = HashSet::new();
+    statuses
+        .iter()
+        .filter(|s| s.action == BaseAction::Write)
+        .filter(|s| seen.insert(s.entry.sha256.as_str()))
+        .map(|s| {
+            if let Ok(md) = std::fs::metadata(cache.join(&s.entry.sha256)) {
+                return md.len().min(s.entry.size);
+            }
+            std::fs::metadata(cache.join(format!("{}.part", s.entry.sha256)))
+                .map(|m| m.len().min(s.entry.size))
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
 /// Does this folder hold a DIFFERENT game build than the manifest describes?
 ///
 /// `game/dota/steam.inf` carries the build identity, so a local copy that EXISTS but does not
@@ -2096,6 +2142,61 @@ mod tests {
         assert_eq!(r.skipped, 1);
         assert_eq!(std::fs::read(dir.join(".phoenix-vanilla/game/dota/cfg/a.cfg")).unwrap(), b"CFG");
         assert!(!dir.join("game/dota/cfg/a.cfg").exists(), "the removal must stick");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn game_presence_and_pending_download_bytes() {
+        let dir = tempdir("presence");
+        // empty folder: no game, nothing pending
+        assert!(!game_present(&dir));
+        assert_eq!(pending_base_bytes(&dir), 0);
+
+        // an interrupted download's cache: still not a game, but bytes are pending
+        let cache = dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(sha(b"a")), b"12345").unwrap();
+        std::fs::write(cache.join(format!("{}.part", sha(b"b"))), b"123").unwrap();
+        assert!(!game_present(&dir));
+        assert_eq!(pending_base_bytes(&dir), 8);
+
+        // game/dota appearing makes it a game folder
+        std::fs::create_dir_all(dir.join("game/dota")).unwrap();
+        assert!(game_present(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // ...and so does a shim install record alone (game/ deleted but state intact)
+        let dir2 = tempdir("presence-state");
+        InstalledState {
+            version: "1.0.0".into(),
+            files: vec![],
+            winmm_orig_created: false,
+            restored: vec![],
+        }
+        .save(&dir2)
+        .unwrap();
+        assert!(game_present(&dir2));
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn base_cached_bytes_counts_full_entries_and_part_prefixes() {
+        let dir = tempdir("cached-bytes");
+        let (m, _) = base_release();
+        let manifest = crate::manifest::Manifest::parse(m.as_bytes()).unwrap();
+        let statuses = base_plan(&dir, &manifest, None, "plan", None).unwrap();
+
+        let cache = dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        // EXE (3 bytes) fully cached; PAK has a 2-byte .part; CFG absent entirely
+        std::fs::write(cache.join(sha(b"EXE")), b"EXE").unwrap();
+        std::fs::write(cache.join(format!("{}.part", sha(b"PAK"))), b"PA").unwrap();
+        // 3 (full) + 2 (part) — CFG contributes 0, and the shared-content cfg pair counts once
+        assert_eq!(base_cached_bytes(&dir, &statuses), 5);
+
+        // an over-long leftover must not report more than the plan asked for
+        std::fs::write(cache.join(sha(b"EXE")), b"EXE-OVERLONG").unwrap();
+        assert_eq!(base_cached_bytes(&dir, &statuses), 5);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -186,6 +186,18 @@ function statusFor(v) {
         : t("detail.localChanged", { version: v.version, n: v.changes }),
     ];
   }
+  // No game to update: the folder has no game/ and no install record, so everything below —
+  // "update available", the change count, Install — would describe installing a shim into
+  // nothing. Say what is actually in the folder and offer the download (or its resume) instead.
+  if (!v.gamePresent) {
+    return [
+      t("status.noGame"),
+      "update",
+      v.pendingBaseBytes > 0
+        ? t("detail.resumeDl", { gb: (v.pendingBaseBytes / GB).toFixed(1) })
+        : t("detail.noGame"),
+    ];
+  }
   if (v.changes === 0) {
     if (!v.installed) {
       // files all hash-match but no install state — the primary runs the no-op heal. Worded as
@@ -231,6 +243,7 @@ function renderPrimary() {
       check: "btn.check",
       play: "btn.play",
       updateLauncher: "btn.updateLauncher",
+      downloadGame: state.lastCheck?.pendingBaseBytes > 0 ? "btn.resumeDl" : "btn.downloadGame",
       apply: heal ? "btn.repair" : state.lastCheck?.installed ? "btn.update" : "btn.install",
     }[state.primaryMode];
     p.textContent = t(label);
@@ -328,7 +341,9 @@ function applyCheck(v) {
   }
   setStatus(word, kind, detail);
 
-  renderFiles(v);
+  // an empty list, not the shim manifest's diff: rows of "install" pending under a "no game
+  // here" status read as two contradicting verdicts about one folder
+  renderFiles(v.gamePresent ? v : { files: [], changes: 0 });
 
   const pl = $("game-path");
   pl.textContent = v.gameDir;
@@ -337,12 +352,15 @@ function applyCheck(v) {
   // always offered once checked: the history view serves older releases' notes even when the
   // latest release carries none (the backend is built for exactly that case)
   $("btn-whatsnew").classList.remove("hidden");
-  $("btn-customize").classList.toggle("hidden", !(v.options && v.options.length));
+  $("btn-customize").classList.toggle("hidden", !(v.options && v.options.length) || !v.gamePresent);
 
   // a pending launcher update takes the primary: this build may not be able to read the current
-  // manifest at all, so replacing it comes before installing anything described by that manifest
+  // manifest at all, so replacing it comes before installing anything described by that manifest.
+  // Then "no game": with nothing to install into, the download IS the next step — as the primary,
+  // not an error message pointing at a settings tab.
   state.primaryMode = state.launcherUpdate
     ? "updateLauncher"
+    : !v.gamePresent ? "downloadGame"
     : v.primaryAction === "apply" ? "apply" : v.canPlay ? "play" : "check";
   renderPrimary();
 }
@@ -611,6 +629,7 @@ function onPrimary() {
   if (state.primaryMode === "apply") doApply();
   else if (state.primaryMode === "play") doPlay();
   else if (state.primaryMode === "updateLauncher") doLauncherUpdate();
+  else if (state.primaryMode === "downloadGame") startGameResume();
   else doCheck();
 }
 
@@ -1085,6 +1104,20 @@ async function startGameDownload(origin) {
     dir = await invoke("browse_folder", { title: t("dlg.pickTarget") });
   } catch (e) { /* dialog failed — stay put */ }
   if (!dir) return;
+  gdOpen(origin, dir);
+}
+
+// Resume/continue into the CONFIGURED folder — the one entry point that reuses it instead of
+// asking, because here "where" was already answered: the folder is configured AND (usually)
+// holds the interrupted download's cache. The confirm still names the exact path and now says
+// how much is already fetched, so no byte moves on an assumption.
+function startGameResume() {
+  if (state.busy) return;
+  const dir = state.lastCheck && state.lastCheck.gameDir;
+  if (dir) gdOpen(null, dir);
+}
+
+async function gdOpen(origin, dir) {
   gd.mode = "install";
   gd.origin = origin;
   gd.dir = dir;
@@ -1120,9 +1153,14 @@ async function startGameDownload(origin) {
   if ($("gd-modal").classList.contains("hidden")) return;
   gd.bytes = plan.bytes;
   gd.files = plan.files;
-  $("gd-summary").textContent = t("gd.confirm", {
-    gb: (plan.bytes / GB).toFixed(1), n: plan.files, dir,
-  });
+  // an interrupted attempt left verified-size entries/.parts in the cache: say how much of the
+  // plan is already here — the answer to "did my 5 GB survive the restart?"
+  $("gd-summary").textContent = plan.cachedBytes > 0
+    ? t("gd.confirmResume", {
+        have: (plan.cachedBytes / GB).toFixed(1), gb: (plan.bytes / GB).toFixed(1),
+        n: plan.files, dir,
+      })
+    : t("gd.confirm", { gb: (plan.bytes / GB).toFixed(1), n: plan.files, dir });
   // refuse up front what the backend would refuse a click later — same margin (512 MB)
   const short = plan.freeBytes != null && plan.freeBytes < plan.bytes + 512 * 1024 * 1024;
   $("gd-space").hidden = !short;

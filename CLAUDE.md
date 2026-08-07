@@ -100,6 +100,12 @@ WebView2 runtime required (present on current Win10/11).
     #              (Remove-Item Env:\PHOENIX_FORCE_SETUP afterwards — it persists per terminal)
     PHOENIX_FORCE_SETUP=1 bun run tauri dev
 
+App/exe icon: `src-tauri/icons/` is generated with `bun run tauri icon <png>` from the master at
+`E:\project-phoenix\src\phx_icon.png` (outside this repo) — the master has an OPAQUE black
+background, so regeneration must go through the background-key + square-pad step first
+(flood-fill from the borders, so the artwork's own dark interior survives; a naive black key
+would punch holes in it).
+
 `PHOENIX_FORCE_SETUP` makes `game_dir_status` report "never configured, no game beside the exe"
 (the condition boot() shows setup on) without touching saved settings — the only way to see that
 view once a folder was ever chosen. Read-side only: actually picking a folder in it saves for
@@ -341,6 +347,18 @@ a game folder silently, with no confirmation and no output. Release builds ignor
   `doPlay` run the two checks concurrently (`Promise.allSettled` — Play latency is the slower
   fetch, not the sum, which matters most offline) and only *evaluate* launcher-first;
   `launcher_check` failing means *unknown*, and the frontend never collapses that into "current".
+- **A folder with no game in it is SAID to have no game in it.** `CheckView.game_present`
+  (game/dota exists, or an install record does) gates the whole update surface: without it a
+  check of an empty folder said "Update available" and Install happily placed a shim into
+  nothing. The UI shows "No game here", suppresses the file list and Customize, and the primary
+  becomes the game download — **Resume download** when `pending_base_bytes` (bytes in
+  `.phoenix-cache/base/`) shows an interrupted download waiting. `apply` refuses backend-side.
+  A PRESENCE gate, not a build gate — the no-install-gate decision stands untouched.
+  `startGameResume` is the ONE download flow that reuses the configured folder instead of
+  asking: "where" was already answered by the folder holding the cache, and the confirm still
+  names the exact path plus how much is already fetched (`GamePlanView.cached_bytes`, full
+  entries + `.part` prefixes, metadata-only). `game_verify`'s not-a-game refusal names the
+  interrupted download when one is present instead of "doesn't look like a game folder".
 - **A failed check falls back to `local_check`, never to a dead end.** Play and Uninstall are
   purely local, and both are gated on `state.lastCheck`, which only a SUCCESSFUL check used to
   write — so an offline cold start left nothing but a Check button that failed again. `local_check`
@@ -519,7 +537,9 @@ a game folder silently, with no confirmation and no output. Release builds ignor
 ## Invariants & gotchas — do not break these
 
 - **No install gate** (removed by decision 2026-07-30): the updater installs into any chosen
-  folder; wrong-build installs are the user's responsibility. (Historical note: the real 6.88
+  folder; wrong-build installs are the user's responsibility. The later PRESENCE gate (`apply`
+  refuses a folder with no game/dota and no install record — see "no game in it" above) does not
+  reverse this: it asks "is there anything here at all", never "is it the right build". (Historical note: the real 6.88
   build is ClientVersion `1805`; `6869` was a polluted value — never use it as a reference.)
 - **`winmm_orig.dll`** is a copy of the system `winmm.dll`. **Never overwrite an existing one** —
   that would make the proxy's forwarders point at themselves. Uninstall deletes it only when

@@ -33,6 +33,10 @@ window.addEventListener("load", () => {
       doGameVerify();
       setStatus(t("status.working"), "busy", t("gv.progress", { i: 1342, n: 4635 }));
       if (h.endsWith("stopping")) fireStop(); // the after-click state: Stop pressed, now disabled
+    } else if (h === "nogame") {
+      // the configured folder holds no game — only an interrupted download's cache
+      applyCheck({ ...CHECK, gamePresent: false, pendingBaseBytes: 5.2 * GB,
+        installed: false, changes: 0, files: [], options: [], canPlay: false, canUninstall: false });
     } else if (h === "gd:run") {
       // mid-download, ETA included: one synthetic 20-second-old rate sample, then a real tick
       // through onGdProgress so the line renders exactly as it would live
