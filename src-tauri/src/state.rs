@@ -15,6 +15,14 @@ pub struct InstalledState {
     /// pre-existing winmm_orig.dll leaves this false, so uninstall never deletes it.
     #[serde(default)]
     pub winmm_orig_created: bool,
+    /// Dests where a removal RESTORED a preserved vanilla original — the file sitting there now is
+    /// stock, not ours. Without this record the next plan sees a file at a `remove[]` dest and
+    /// flags it Remove again, so the very original the removal put back was then re-preserved and
+    /// the dest emptied: the restore undone one release later, with a bogus "1 to change" in
+    /// between. `plan` skips remove[] dests recorded here. `#[serde(default)]` keeps state files
+    /// written before this field loading clean (empty = the old behavior, converging as before).
+    #[serde(default)]
+    pub restored: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,12 +77,19 @@ mod tests {
             version: "1.0.0".into(),
             files: vec![InstalledFile { dest: "game/bin/win64/winmm.dll".into(), sha256: "aa".into() }],
             winmm_orig_created: true,
+            restored: vec!["game/dota/old.vpk".into()],
         };
         s.save(&dir).unwrap();
         let loaded = InstalledState::load(&dir).unwrap();
         assert_eq!(loaded.version, "1.0.0");
         assert_eq!(loaded.files.len(), 1);
         assert!(loaded.winmm_orig_created);
+        assert_eq!(loaded.restored, vec!["game/dota/old.vpk".to_string()]);
+
+        // a state file from a build that predates `restored` still loads (serde default)
+        let legacy = r#"{ "version": "0.9", "files": [], "winmm_orig_created": false }"#;
+        std::fs::write(InstalledState::path(&dir), legacy).unwrap();
+        assert!(InstalledState::load(&dir).unwrap().restored.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

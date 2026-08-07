@@ -31,10 +31,20 @@ pub fn open_url(url: String) -> Result<(), CmdError> {
     Ok(())
 }
 
+/// Pick a folder. The caller supplies the dialog title because the two uses mean opposite things:
+/// LOCATING an existing install ("the folder that contains game\") vs choosing a DESTINATION for a
+/// fresh download (a folder that contains nothing yet) — one title cannot be honest about both.
+/// It comes from the frontend since that is what owns the language; `start` pre-selects a folder
+/// (the current game dir) so the dialog opens somewhere useful instead of at the last shell path.
 #[tauri::command]
-pub fn browse_folder() -> Option<String> {
-    rfd::FileDialog::new()
-        .set_title("Select the game folder (the one that contains game\\)")
-        .pick_folder()
-        .map(|p| p.display().to_string())
+pub fn browse_folder(title: Option<String>, start: Option<String>) -> Option<String> {
+    let mut d = rfd::FileDialog::new()
+        .set_title(title.as_deref().unwrap_or("Select a folder"));
+    if let Some(s) = start.filter(|s| !s.is_empty()) {
+        let p = std::path::PathBuf::from(s);
+        if p.is_dir() {
+            d = d.set_directory(p);
+        }
+    }
+    d.pick_folder().map(|p| p.display().to_string())
 }

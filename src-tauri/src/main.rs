@@ -20,6 +20,7 @@ mod github;
 mod install;
 mod launch;
 mod manifest;
+mod selfupdate;
 mod state;
 mod steaminf;
 mod verify;
@@ -29,6 +30,9 @@ use std::sync::Arc;
 use tauri_plugin_window_state::StateFlags;
 
 fn run_gui() {
+    // Collect the previous binary if a self-update just restarted us. Detached and best-effort:
+    // the outgoing process may still hold its image, so this retries in the background.
+    selfupdate::cleanup_old();
     tauri::Builder::default()
         // remember where the window was: position + maximized (the plugin itself validates the
         // saved spot against the connected monitors and lets the OS decide if it's gone).
@@ -48,10 +52,19 @@ fn run_gui() {
             cmd::settings::set_selection,
             cmd::settings::game_dir_status,
             cmd::update::check,
+            cmd::update::local_check,
             cmd::update::replan,
             cmd::update::apply,
             cmd::update::uninstall,
+            cmd::game::game_plan,
+            cmd::game::game_install,
+            cmd::game::game_repair,
+            cmd::game::game_verify,
+            cmd::game::game_cancel,
             cmd::notes::release_notes,
+            cmd::selfupdate::launcher_check,
+            cmd::selfupdate::launcher_update,
+            cmd::selfupdate::launcher_info,
             cmd::launch::play,
             cmd::launch::game_running,
             cmd::launch::read_autoexec,
@@ -66,18 +79,30 @@ fn run_gui() {
 }
 
 fn main() {
+    // The CLI is an engine test harness (`cargo run -- check …`), and it is DEBUG-ONLY on purpose:
+    // release builds are `windows_subsystem = "windows"` and have no console, so a shipped exe
+    // that honoured `phoenix-launcher.exe uninstall` would revert someone's game folder silently,
+    // with no confirmation and no output. Release builds ignore argv and open the window.
+    #[cfg(debug_assertions)]
+    if let Some(r) = cli_dispatch() {
+        if let Err(e) = r {
+            eprintln!("error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    run_gui();
+}
+
+#[cfg(debug_assertions)]
+fn cli_dispatch() -> Option<anyhow::Result<()>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let r = match args.first().map(String::as_str) {
+    Some(match args.first().map(String::as_str) {
         Some("check") => cli::run_check(&args[1..]),
         Some("install") => cli::run_install(&args[1..]),
         Some("uninstall") => cli::run_uninstall(&args[1..]),
-        _ => {
-            run_gui();
-            return;
-        }
-    };
-    if let Err(e) = r {
-        eprintln!("error: {e:#}");
-        std::process::exit(1);
-    }
+        Some("game-install") => cli::run_game_install(&args[1..]),
+        Some("game-verify") => cli::run_game_verify(&args[1..]),
+        _ => return None, // not a CLI invocation — the caller opens the window
+    })
 }

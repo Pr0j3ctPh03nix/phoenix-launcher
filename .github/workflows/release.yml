@@ -28,6 +28,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The version lives in three files and the git tag, and self-update compares the TAG against
+      # the binary's CARGO_PKG_VERSION. Ship a tag ahead of Cargo.toml and every client offers an
+      # update whose installed build reports the old version — so it offers it again, forever, with
+      # the pending-update banner outranking Play. Unrecoverable without cutting another release,
+      # so it is checked before anything is built.
+      - name: Check version agreement (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v',''
+          $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $conf  = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          $pkg   = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          "tag=$tag Cargo.toml=$cargo tauri.conf.json=$conf package.json=$pkg"
+          $bad = @()
+          if ($cargo -ne $tag) { $bad += "src-tauri/Cargo.toml ($cargo)" }
+          if ($conf  -ne $tag) { $bad += "src-tauri/tauri.conf.json ($conf)" }
+          if ($pkg   -ne $tag) { $bad += "package.json ($pkg)" }
+          if ($bad.Count) {
+            Write-Error "tag $tag does not match: $($bad -join ', ')"
+            exit 1
+          }
+
       - uses: oven-sh/setup-bun@v2
 
       - uses: dtolnay/rust-toolchain@stable
@@ -56,15 +79,49 @@ jobs:
           # time (config.rs). Absent secret -> no token baked, private repos need a user token.
           PHOENIX_BAKED_TOKEN: ${{ secrets.PHOENIX_BAKED_TOKEN }}
 
+      # Self-update REQUIRES this sidecar: the launcher refuses to swap itself for a binary it
+      # can't verify (selfupdate.rs), because a truncated exe written over a working launcher
+      # leaves the user with no launcher at all. A release published without it can still be
+      # downloaded by hand — it just can't auto-update. `sha256sum` layout ("<hex>  <name>").
+      - name: Checksum the exe
+        run: |
+          $exe = "src-tauri/target/release/phoenix-launcher.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          # ascii, so no BOM lands in front of the digest (the parser reads the first token)
+          "$hash  phoenix-launcher.exe" | Out-File -Encoding ascii "$exe.sha256"
+          Get-Content "$exe.sha256"
+
       - name: Upload build artifacts (manual runs)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: phoenix-launcher
-          path: src-tauri/target/release/phoenix-launcher.exe
+          path: |
+            src-tauri/target/release/phoenix-launcher.exe
+            src-tauri/target/release/phoenix-launcher.exe.sha256
+
+      # The annotated tag's message IS the changelog, and the RELEASE BODY is where it must land:
+      # the launcher renders release notes in its update banner (lu-banner), and self-update reads
+      # `release.body` — a body-less release shows the user a version number and nothing else.
+      # softprops does not copy tag annotations itself, so extract it here. `contents:body` skips
+      # the subject line (redundant with the release title). The re-fetch is required: checkout
+      # peels annotated tags to their commit, so the annotation isn't present without it.
+      - name: Extract tag message as the release body (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
+          git tag -l --format='%(contents:body)' "${{ github.ref_name }}" | Out-File -Encoding utf8 release_body.md
+          Get-Content release_body.md
 
       - name: Publish release (tag pushes)
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: src-tauri/target/release/phoenix-launcher.exe
+          # a release missing the sidecar cannot be auto-installed by any client — fail the run
+          # rather than publish one, instead of relying on the checksum step having failed first
+          fail_on_unmatched_files: true
+          body_path: release_body.md
+          files: |
+            src-tauri/target/release/phoenix-launcher.exe
+            src-tauri/target/release/phoenix-launcher.exe.sha256

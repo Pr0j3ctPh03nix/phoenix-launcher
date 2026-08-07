@@ -5,8 +5,8 @@
 use serde::Serialize;
 
 use crate::downloader::NetKind;
-use crate::engine::{self, Action, GameRunning, TooOld};
-use crate::manifest::{Label, OptionKind};
+use crate::engine::{self, Action, Cancelled, GameRunning};
+use crate::manifest::{Label, OptionKind, UnsupportedSchema};
 use crate::state;
 
 // ---------------- view types serialized to the webview ----------------
@@ -75,6 +75,11 @@ pub struct CheckView {
     pub primary_action: String, // "check" | "apply"
     pub can_play: bool,
     pub can_uninstall: bool,
+    /// This verdict came from the install record alone — no manifest was fetched, so it describes
+    /// what WE installed, not what the latest release is. The UI must word it as "couldn't check"
+    /// rather than "up to date" (see `local_check`).
+    #[serde(default)]
+    pub local: bool,
 }
 
 #[derive(Serialize)]
@@ -102,6 +107,76 @@ pub struct UninstallView {
     pub restored: Vec<String>,
     pub deleted: Vec<String>,
     pub winmm_orig_removed: bool,
+}
+
+/// A launcher release newer than this build. The command returns `Option<Self>`; `None` means
+/// current, and a command FAILURE means unknown — the frontend must not collapse the two.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LauncherUpdateView {
+    pub tag: String,
+    pub version: String,
+    pub current: String,
+    pub notes: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LauncherInfoView {
+    pub version: String,
+    /// This process was started by a self-update that just completed.
+    pub just_updated: bool,
+}
+
+/// One `launcher-progress` tick while the new launcher downloads. `bytesTotal` is absent when the
+/// server sends no Content-Length.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct LauncherProgress {
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+}
+
+/// What a fresh base-game download would do — the confirm dialog's numbers, before any bytes.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GamePlanView {
+    pub version: String,
+    /// Files that would download.
+    pub files: u32,
+    pub total_files: u32,
+    /// Bytes that would download (unique content).
+    pub bytes: u64,
+    /// Free bytes on the target volume; absent when undeterminable.
+    pub free_bytes: Option<u64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameInstallView {
+    pub game_version: String,
+    pub written: u32,
+    pub up_to_date: u32,
+    pub bytes: u64,
+    /// The chained shim install's version — a fresh download ends playable, not merely present.
+    pub shim_version: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameVerifyView {
+    pub version: String,
+    pub total: u32,
+    pub ok: u32,
+    /// Dests under shim management with no preserved original — not checkable, not damaged.
+    pub skipped: u32,
+    pub damaged: Vec<String>,
+    /// Unique bytes a repair would download — the repair progress bar's full extent.
+    pub damaged_bytes: u64,
+    /// The folder holds a DIFFERENT game build (its steam.inf exists but doesn't match). Every
+    /// file then reads as "damaged" while nothing is actually broken, and a repair would
+    /// overwrite an unrelated installation — so the UI must say that, not offer a casual fix.
+    pub foreign_build: bool,
 }
 
 #[derive(Serialize)]
@@ -137,7 +212,7 @@ pub struct GameDirStatus {
 /// Every command failure crosses to the webview as `{kind, message}`: `message` for display,
 /// `kind` so the UI can react (prompt for a token on "auth", tell the user to update on
 /// "tooOld", close-the-game on "gameRunning", …). Kinds: network | auth | notFound | io |
-/// tooOld | gameRunning | internal.
+/// tooOld | gameRunning | cancelled | restartFailed | internal.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CmdError {
@@ -146,7 +221,7 @@ pub struct CmdError {
 }
 
 /// Classify an anyhow chain: a `NetKind` from the transport edge wins, then the typed markers
-/// (`TooOld`, `GameRunning`), then any io error; anything else is internal.
+/// (`UnsupportedSchema`, `GameRunning`), then any io error; anything else is internal.
 fn wire_kind(e: &anyhow::Error) -> &'static str {
     for c in e.chain() {
         if let Some(n) = c.downcast_ref::<NetKind>() {
@@ -157,17 +232,33 @@ fn wire_kind(e: &anyhow::Error) -> &'static str {
                 NetKind::Status(_) => "network",
             };
         }
-        if c.downcast_ref::<TooOld>().is_some() {
+        // wire kind stays "tooOld": from the user's side an unreadable manifest schema IS an
+        // out-of-date launcher, and the frontend already words it that way
+        if c.downcast_ref::<UnsupportedSchema>().is_some() {
             return "tooOld";
         }
         if c.downcast_ref::<GameRunning>().is_some() {
             return "gameRunning";
+        }
+        // the user asked for this stop — the UI closes quietly rather than painting an error
+        if c.downcast_ref::<Cancelled>().is_some() {
+            return "cancelled";
         }
         if c.downcast_ref::<std::io::Error>().is_some() {
             return "io";
         }
     }
     "internal"
+}
+
+impl CmdError {
+    /// The self-update swapped the exe but could not start it. Its own kind because every other
+    /// failure on that path means "nothing was replaced, you are still on the old build" — here
+    /// the new build IS installed and the only thing missing is a relaunch. Telling the user the
+    /// update failed would be false, and would send them round the same loop again.
+    pub fn restart_failed(message: String) -> Self {
+        Self { kind: "restartFailed".to_string(), message }
+    }
 }
 
 impl From<anyhow::Error> for CmdError {
@@ -258,5 +349,46 @@ pub fn build_check_view(r: engine::CheckResult) -> CheckView {
         primary_action: if changes > 0 || !installed { "apply" } else { "check" }.to_string(),
         can_play: installed && changes == 0,
         can_uninstall: installed,
+        local: false,
+    }
+}
+
+/// A verdict built from the install record alone, for when the network check failed.
+///
+/// The launcher must not become useless because GitHub is unreachable: Play and Uninstall are both
+/// purely local operations, and refusing them turns "we could not ask about updates" into "your
+/// game is unusable". What this CAN honestly say is whether the files we installed are still the
+/// files we installed — every dest is re-hashed against the sha256 recorded at install time.
+///
+/// It deliberately never offers `apply`: repairing needs the assets, and those need the network
+/// that just failed. A mismatch leaves the primary on Check so the user retries the real thing.
+pub fn build_local_check_view(game_dir: &std::path::Path, st: &state::InstalledState) -> CheckView {
+    let files: Vec<FileView> = st
+        .files
+        .iter()
+        .map(|f| {
+            let ok = crate::verify::sha256_file_cached(&game_dir.join(&f.dest))
+                .map(|h| h.eq_ignore_ascii_case(&f.sha256))
+                .unwrap_or(false);
+            FileView {
+                dest: f.dest.clone(),
+                status: if ok { "ok" } else { "update" }.to_string(),
+            }
+        })
+        .collect();
+    let changes = files.iter().filter(|f| f.status != "ok").count() as u32;
+    CheckView {
+        tag: String::new(), // no release was fetched — there is no tag to name
+        version: st.version.clone(),
+        game_dir: game_dir.display().to_string(),
+        installed: true,
+        changes,
+        files,
+        notes: None,
+        options: Vec::new(), // options live in the manifest we could not fetch
+        primary_action: "check".to_string(),
+        can_play: changes == 0,
+        can_uninstall: true,
+        local: true,
     }
 }

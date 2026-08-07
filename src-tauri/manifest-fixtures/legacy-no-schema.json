@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "files": [
+    {
+      "name": "winmm.dll",
+      "dest": "game/bin/win64/winmm.dll",
+      "sha256": "d508058f7eba5f70d1daf7de8c2d5fc35b39d9cbbcbf00762bf55b77dbac517a",
+      "size": 1560
+    }
+  ],
+  "remove": []
+}

@@ -44,6 +44,16 @@
           </div>
         </div>
 
+        <!-- launcher self-update notes: shown only while an update is pending AND its release
+             carries notes (the status line already names the versions) -->
+        <div class="lu-banner hidden" id="lu-banner">
+          <div class="lu-head">
+            <span class="eyebrow" data-i18n="lu.title"></span>
+            <span class="lu-ver" id="lu-ver"></span>
+          </div>
+          <div class="notes lu-notes" id="lu-notes"></div>
+        </div>
+
         <div class="files-head rise" style="--d:.1s">
           <span class="eyebrow" data-i18n="files.title"></span>
           <span class="files-count" id="files-count"></span>
@@ -56,10 +66,18 @@
 
         <footer class="actions rise" style="--d:.18s">
           <button class="btn" id="btn-primary"></button>
-          <button class="btn ghost hidden" id="btn-customize" data-i18n="link.customize"></button>
+          <button class="btn ghost hidden" id="btn-customize" data-i18n="btn.customize"></button>
           <div class="actions-aux">
-            <button class="link neutral hidden" id="btn-whatsnew" data-i18n="link.whatsnew"></button>
-            <button class="link hidden" id="btn-uninstall" data-i18n="link.uninstall"></button>
+            <!-- the release-notes chip: the one place the project gets to talk, so it is a
+                 lit-up pill rather than another muted link. data-i18n sits on the inner span —
+                 applyStatic writes textContent, which would otherwise wipe the icon. -->
+            <button class="chip hidden" id="btn-whatsnew">
+              <svg class="chip-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z" />
+                <path d="M14 3v5h5M9 13h6M9 17h4" />
+              </svg>
+              <span data-i18n="btn.whatsnew"></span>
+            </button>
           </div>
         </footer>
 
@@ -82,9 +100,16 @@
 
         <div class="setup-spacer"></div>
 
+        <!-- what the third button actually gets you, stated where it is pressed -->
+        <div class="setup-note">
+          <span class="tag" data-i18n="tag.build"></span>
+          <span class="hint" data-i18n="setup.dlNote"></span>
+        </div>
+
         <footer class="actions">
           <button class="btn" id="btn-setup-browse" data-i18n="btn.browse"></button>
           <button class="btn ghost" id="btn-setup-autofind" data-i18n="btn.autofind"></button>
+          <button class="btn ghost" id="btn-setup-download" data-i18n="btn.downloadGame"></button>
         </footer>
       </section>
 
@@ -95,72 +120,114 @@
           <span class="brand"><span class="brand-dot"></span><span data-i18n="head.settings"></span></span>
         </header>
 
-        <div class="fields">
-          <div class="field">
-            <span class="label" data-i18n="set.language"></span>
-            <div class="seg" id="seg-lang">
-              <button class="seg-btn" data-value="en">English</button>
-              <button class="seg-btn" data-value="ru">Русский</button>
-            </div>
-          </div>
+        <!-- Tabs, not one long scroll: the panes are three unrelated concerns (what the launcher
+             is pointed at / how the game starts / operations on the game's files), and only the
+             first two hold form state. Save is tab-agnostic — the form is one settings object no
+             matter which pane is visible, so every field below stays in the DOM. -->
+        <div class="tabs" id="settings-tabs" role="tablist">
+          <button class="tab active" data-tab="general" role="tab" aria-selected="true" data-i18n="tab.general"></button>
+          <button class="tab" data-tab="launch" role="tab" aria-selected="false" data-i18n="tab.launch"></button>
+          <button class="tab" data-tab="files" role="tab" aria-selected="false" data-i18n="tab.files"></button>
+        </div>
 
-          <label class="field">
-            <span class="label" data-i18n="set.gameFolder"></span>
-            <div class="row">
-              <input id="in-game" type="text" spellcheck="false" data-i18n-ph="ph.gameAuto" />
-              <button class="btn ghost inline" id="btn-browse" data-i18n="btn.browse"></button>
-              <button class="btn ghost inline" id="btn-autofind" data-i18n="btn.autofind"></button>
-            </div>
-            <span class="hint" data-i18n="set.gameHint"></span>
-          </label>
+        <div class="panels" id="settings-panels">
 
-          <label class="field">
-            <span class="label" data-i18n="set.launch"></span>
-            <div class="launch-base"><code>-insecure -console +exec autoexec.cfg</code><span class="hint" data-i18n="set.launchHint"></span></div>
-            <input id="in-launch" type="text" spellcheck="false" data-i18n-ph="set.launchPh" />
-          </label>
-
-          <!-- one plate per launch::LAUNCH_FLAGS entry, rendered by main.js -->
-          <div class="field" id="launch-flags">
-            <span class="label" data-i18n="set.flags"></span>
-            <div class="flag-list" id="flag-list"></div>
-          </div>
-
-          <div class="field-row">
+          <div class="fields" data-panel="general" role="tabpanel">
             <div class="field">
-              <span class="label" data-i18n="set.renderer"></span>
-              <div class="seg" id="seg-renderer">
-                <button class="seg-btn" data-value="dx11">DX11</button>
-                <button class="seg-btn" data-value="dx9">DX9</button>
+              <span class="label" data-i18n="set.language"></span>
+              <div class="seg" id="seg-lang">
+                <button class="seg-btn" data-value="en">English</button>
+                <button class="seg-btn" data-value="ru">Русский</button>
               </div>
             </div>
-            <div class="field">
-              <span class="label" data-i18n="set.autoexec"></span>
-              <button class="btn ghost inline" id="btn-autoexec" data-i18n="set.autoexecBtn"></button>
+
+            <label class="field">
+              <span class="label" data-i18n="set.gameFolder"></span>
+              <div class="row">
+                <input id="in-game" type="text" spellcheck="false" data-i18n-ph="ph.gameAuto" />
+                <button class="btn ghost inline" id="btn-browse" data-i18n="btn.browse"></button>
+                <button class="btn ghost inline" id="btn-autofind" data-i18n="btn.autofind"></button>
+              </div>
+              <span class="hint" data-i18n="set.gameHint"></span>
+            </label>
+
+            <details class="advanced" id="advanced">
+              <summary><span class="label" data-i18n="set.advanced"></span><span class="chev"></span></summary>
+              <div class="advanced-body">
+                <label class="field">
+                  <span class="label" data-i18n="set.repo"></span>
+                  <input id="in-repo" type="text" spellcheck="false" placeholder="Pr0j3ctPh03nix/client-dist-staging" />
+                  <span class="hint" data-i18n="set.repoHint"></span>
+                </label>
+                <label class="field">
+                  <span class="label" data-i18n="set.token"></span>
+                  <div class="row">
+                    <input id="in-token" type="password" spellcheck="false" />
+                    <button class="btn ghost inline hidden" id="btn-token-clear" data-i18n="btn.clearToken"></button>
+                  </div>
+                  <span class="hint" data-i18n="set.tokenHint"></span>
+                </label>
+              </div>
+            </details>
+          </div>
+
+          <div class="fields hidden" data-panel="launch" role="tabpanel">
+            <label class="field">
+              <span class="label" data-i18n="set.launch"></span>
+              <div class="launch-base"><code>-insecure -console +exec autoexec.cfg</code><span class="hint" data-i18n="set.launchHint"></span></div>
+              <input id="in-launch" type="text" spellcheck="false" data-i18n-ph="set.launchPh" />
+            </label>
+
+            <!-- one plate per launch::LAUNCH_FLAGS entry, rendered by main.js -->
+            <div class="field" id="launch-flags">
+              <span class="label" data-i18n="set.flags"></span>
+              <div class="flag-list" id="flag-list"></div>
+            </div>
+
+            <div class="field-row">
+              <div class="field">
+                <span class="label" data-i18n="set.renderer"></span>
+                <div class="seg" id="seg-renderer">
+                  <button class="seg-btn" data-value="dx11">DX11</button>
+                  <button class="seg-btn" data-value="dx9">DX9</button>
+                </div>
+              </div>
+              <div class="field">
+                <span class="label" data-i18n="set.autoexec"></span>
+                <button class="btn ghost inline" id="btn-autoexec" data-i18n="set.autoexecBtn"></button>
+              </div>
             </div>
           </div>
 
-          <details class="advanced" id="advanced">
-            <summary><span class="label" data-i18n="set.advanced"></span><span class="chev"></span></summary>
-            <div class="advanced-body">
-              <label class="field">
-                <span class="label" data-i18n="set.repo"></span>
-                <input id="in-repo" type="text" spellcheck="false" placeholder="Pr0j3ctPh03nix/client-dist-staging" />
-                <span class="hint" data-i18n="set.repoHint"></span>
-              </label>
-              <label class="field">
-                <span class="label" data-i18n="set.token"></span>
-                <div class="row">
-                  <input id="in-token" type="password" spellcheck="false" />
-                  <button class="btn ghost inline hidden" id="btn-token-clear" data-i18n="btn.clearToken"></button>
-                </div>
-                <span class="hint" data-i18n="set.tokenHint"></span>
-              </label>
+          <!-- operations on the game folder's contents: acquiring/repairing the GAME, and
+               reverting the Phoenix files the main view manages. Nothing here is form state —
+               every control acts immediately (and leaves settings, since they all report through
+               the status line on main). -->
+          <div class="fields hidden" data-panel="files" role="tabpanel">
+            <div class="field">
+              <div class="label-row">
+                <span class="label" data-i18n="set.gameInstall"></span>
+                <span class="tag" data-i18n="tag.build"></span>
+              </div>
+              <div class="row">
+                <button class="btn ghost inline" id="btn-fresh" data-i18n="btn.downloadGame"></button>
+                <button class="btn ghost inline" id="btn-verify" data-i18n="btn.verify"></button>
+              </div>
+              <span class="hint" data-i18n="set.gameInstallHint"></span>
             </div>
-          </details>
 
-          <div class="msg" id="settings-msg" hidden></div>
+            <div class="field">
+              <span class="label" data-i18n="set.phoenix"></span>
+              <div class="row">
+                <button class="btn ghost inline danger" id="btn-uninstall" data-i18n="btn.uninstallPhoenix"></button>
+              </div>
+              <span class="hint" data-i18n="set.uninstallHint"></span>
+            </div>
+          </div>
+
         </div>
+
+        <div class="msg" id="settings-msg" hidden></div>
 
         <footer class="actions">
           <button class="btn" id="btn-save" data-i18n="btn.save"></button>
@@ -182,6 +249,10 @@
         <div class="opts-area">
           <div id="opts"></div>
         </div>
+
+        <!-- selection failures used to be painted onto the (hidden) main view, so a selection
+             that failed to save looked like it had worked -->
+        <div class="msg" id="opts-msg" hidden></div>
 
         <footer class="actions">
           <button class="btn" id="btn-options-back" data-i18n="btn.back"></button>
@@ -267,6 +338,58 @@
         <div class="msg hidden" id="af-msg"></div>
         <div class="modal-actions">
           <button class="btn ghost" id="btn-af-done" data-i18n="btn.close"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===================== GAME DOWNLOAD / REPAIR MODAL ===================== -->
+  <div class="modal hidden" id="gd-modal">
+    <div class="modal-card">
+      <!-- the tag rides the title in BOTH modes: a repair restores the same pristine 6.88f
+           bytes a fresh download installs -->
+      <div class="modal-head">
+        <span class="modal-title" id="gd-title"></span>
+        <span class="tag" data-i18n="tag.build"></span>
+      </div>
+
+      <div id="gd-plan">
+        <div class="af-progress">
+          <span class="spinner"></span>
+          <div class="af-lines">
+            <div class="af-count" id="gd-plan-line" data-i18n="gd.planning"></div>
+            <div class="af-current" id="gd-plan-sub"></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="gd-confirm" class="hidden">
+        <p class="modal-note" data-i18n="gd.pristine"></p>
+        <!-- pre-line: the summary is deliberately two lines (size/count, then the target) -->
+        <p class="modal-text pre" id="gd-summary"></p>
+        <div class="msg" id="gd-space" hidden></div>
+        <div class="modal-actions">
+          <button class="btn" id="btn-gd-go" data-i18n="btn.download"></button>
+          <button class="btn ghost" id="btn-gd-close" data-i18n="btn.cancel"></button>
+        </div>
+      </div>
+
+      <div id="gd-run" class="hidden">
+        <div class="gd-bar"><span class="gd-bar-fill" id="gd-fill"></span></div>
+        <div class="af-lines">
+          <div class="af-count" id="gd-line1"></div>
+          <div class="af-current" id="gd-line2"></div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="btn-gd-cancel" data-i18n="btn.stop"></button>
+        </div>
+      </div>
+
+      <div id="gd-err" class="hidden">
+        <div class="msg" id="gd-err-msg"></div>
+        <div class="modal-actions">
+          <button class="btn hidden" id="btn-gd-retry" data-i18n="gd.retry"></button>
+          <button class="btn ghost" id="btn-gd-err-close" data-i18n="btn.close"></button>
         </div>
       </div>
     </div>

@@ -146,10 +146,26 @@ fn steam_libraries() -> Vec<PathBuf> {
     libs
 }
 
-/// Present fixed/available drive roots (`C:\`, `D:\`, …).
+/// Present FIXED drive roots (`C:\`, `D:\`, …).
+///
+/// The drive-type filter is what keeps the promise: a mapped network drive walked six levels deep
+/// is one SMB round trip per directory and per `steam.inf` probe, and the scan has no wall-clock
+/// budget — a scan that used to look hung for tens of minutes was usually a NAS share. Optical and
+/// removable media are excluded for the same reason (spin-up, and nobody installs Dota there).
 fn drives() -> Vec<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    /// `DRIVE_FIXED` — windows-sys 0.59 exports `GetDriveTypeW` but not the return constants.
+    const DRIVE_FIXED: u32 = 3;
     (b'A'..=b'Z')
         .map(|c| PathBuf::from(format!("{}:\\", c as char)))
+        .filter(|p| {
+            let wide: Vec<u16> = p.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+            // SAFETY: a NUL-terminated UTF-16 path that outlives the call, which only reads it.
+            let t = unsafe {
+                windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide.as_ptr())
+            };
+            t == DRIVE_FIXED
+        })
         .filter(|p| std::fs::read_dir(p).is_ok())
         .collect()
 }

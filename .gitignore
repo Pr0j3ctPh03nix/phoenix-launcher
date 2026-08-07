@@ -8,6 +8,9 @@
 # Generated decoy game folder for local testing (see dev/make_decoy.sh)
 /dev/decoy_game/
 
+# Headless frontend screenshots + their working copy (see dev/shoot.sh)
+/dev/preview/.out/
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

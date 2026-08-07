@@ -2,14 +2,14 @@
 //! user's option selections, and diff it against what is installed. `check` is the read-only
 //! surface over this; `install` (in install.rs) reuses `fetch`, `resolve` and `plan`.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::Settings;
 use crate::downloader::{Downloader, Release};
-use crate::manifest::{FileEntry, Manifest, OptionEntry, OptionKind};
+use crate::manifest::{FileEntry, Manifest, OptionEntry, OptionKind, UnsupportedSchema};
 use crate::state::InstalledState;
 use crate::verify;
 
@@ -82,26 +82,6 @@ impl CheckResult {
 
 }
 
-/// The manifest requires a newer launcher than this build. Rooted in the error chain so the
-/// shell can put a "tooOld" kind on the wire (the UI then tells the user to update the launcher).
-#[derive(Debug, Clone)]
-pub struct TooOld {
-    pub required: String,
-    pub current: String,
-}
-
-impl std::fmt::Display for TooOld {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "this release needs launcher {} or newer (you have {}) — update the launcher first",
-            self.required, self.current
-        )
-    }
-}
-
-impl std::error::Error for TooOld {}
-
 /// A file the install must replace or delete is locked by a live process — the game keeps its
 /// loaded DLLs and mmapped VPKs open. Rooted in the error chain so the shell puts a
 /// "gameRunning" kind on the wire (the UI tells the user to close the game and retry).
@@ -118,7 +98,10 @@ impl std::error::Error for GameRunning {}
 
 /// Lenient dotted-numeric compare: is version `a` older than `b`? ("1.10.0" > "1.9.9"; a leading
 /// "v" and missing segments are tolerated, unparsable pieces count as 0).
-fn version_lt(a: &str, b: &str) -> bool {
+///
+/// Used by `selfupdate` to compare this build against the launcher repo's release tags. Note it
+/// has nothing to do with manifest compatibility — that is `manifest::schema` alone.
+pub(crate) fn version_lt(a: &str, b: &str) -> bool {
     fn parts(v: &str) -> Vec<u64> {
         v.trim_start_matches('v').split('.').map(|s| s.parse().unwrap_or(0)).collect()
     }
@@ -133,26 +116,68 @@ fn version_lt(a: &str, b: &str) -> bool {
 }
 
 /// Fetch the release and its manifest.json. Returned together so an install can reuse the release's
-/// asset list (for private downloads) without a second round trip. Fails with `TooOld` when the
-/// manifest's `min_launcher` is newer than this build — a stale launcher must refuse a manifest
-/// it doesn't understand rather than misinstall it.
+/// asset list (for private downloads) without a second round trip. Fails with `UnsupportedSchema`
+/// when the manifest declares a format this build cannot read — a stale launcher must refuse a
+/// manifest it doesn't understand rather than misinstall it.
 pub fn fetch(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Result<(Release, Manifest)> {
     let release = dl
         .fetch_release(&settings.source_repo, tag)
         .context("fetching the release")?;
+    let manifest = manifest_of(dl, &release)?;
+    Ok((release, manifest))
+}
+
+/// The manifest.json of an already-fetched release — for callers that resolved the release
+/// themselves (the base-game commands probe repo credentials first and hold a `Release` by the
+/// time they need the manifest). Same schema gate as `fetch`.
+pub fn manifest_of(dl: &dyn Downloader, release: &Release) -> Result<Manifest> {
     let manifest_asset = release
         .asset("manifest.json")
         .context("the release has no manifest.json asset")?;
     let bytes = dl.download(manifest_asset).context("downloading manifest.json")?;
-    let manifest: Manifest = serde_json::from_slice(&bytes).context("parsing manifest.json")?;
-    if let Some(min) = &manifest.min_launcher {
-        let current = env!("CARGO_PKG_VERSION").to_string();
-        if version_lt(&current, min) {
-            return Err(anyhow!(TooOld { required: min.clone(), current }));
+    // Manifest::parse owns the compatibility gate: it reads `schema` before deserializing, so a
+    // manifest from the future fails as "update the launcher", never as a syntax error
+    Manifest::parse(&bytes)
+}
+
+/// Merge every release of the game repo's assets into the manifest release.
+///
+/// GitHub caps a release at 1,000 assets and the base-game tree is ~4.6k files, so game-dist
+/// SHARDS them: the versioned release (always the repo's latest — shards are prereleases, which
+/// `/releases/latest` never resolves to) carries manifest.json, and `<tag>-assets-N` prereleases
+/// carry the files. Folding every shard's assets into the main `Release` keeps the entire
+/// download machinery on its single-release worldview — nothing downstream knows shards exist.
+/// First name wins on a clash (the manifest release outranks shards); an unsharded repo merges
+/// to itself.
+pub fn merged_game_release(dl: &dyn Downloader, repo: &str, mut main: Release) -> Result<Release> {
+    let all = dl.fetch_releases(repo).context("listing the game repo's asset shards")?;
+    let mut have: HashSet<String> = main.assets.iter().map(|a| a.name.clone()).collect();
+    for r in all {
+        if r.tag_name == main.tag_name {
+            continue;
+        }
+        for a in r.assets {
+            if have.insert(a.name.clone()) {
+                main.assets.push(a);
+            }
         }
     }
-    Ok((release, manifest))
+    Ok(main)
 }
+
+/// The user cancelled a long operation (the base-game download). Rooted in the error chain so the
+/// shell can put a `cancelled` kind on the wire — the UI closes quietly instead of painting an
+/// error for something the user asked for.
+#[derive(Debug, Clone, Copy)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 /// One release's "What's new" entry, for the version-history view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,11 +262,32 @@ pub fn fetch_notes_history(
                 let (i, rel) = (jobs[j], &releases[jobs[j]]);
                 let Some(asset) = rel.asset("manifest.json") else { continue };
                 let Ok(bytes) = dl.download(asset) else { continue };
-                let Ok(m) = serde_json::from_slice::<Manifest>(&bytes) else { continue };
-                if let Some(notes) = m.notes.filter(|n| !n.trim().is_empty()) {
+                // A garbage manifest is skipped (not fatal — one bad release must not sink the
+                // whole history). A FUTURE-schema one is different: the full parse is off the
+                // table, but `version`/`notes` are additive-stable strings, and its notes are
+                // the ones most worth showing — they're where "update the launcher" gets
+                // explained. Read just those two permissively instead of leaving a hole in the
+                // history exactly there.
+                let (version, notes) = match Manifest::parse(&bytes) {
+                    Ok(m) => (m.version, m.notes),
+                    Err(e) if e.chain().any(|c| c.downcast_ref::<UnsupportedSchema>().is_some()) => {
+                        let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                            continue;
+                        };
+                        (
+                            doc.get("version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(rel.tag_name.trim_start_matches('v'))
+                                .to_string(),
+                            doc.get("notes").and_then(|v| v.as_str()).map(str::to_string),
+                        )
+                    }
+                    Err(_) => continue,
+                };
+                if let Some(notes) = notes.filter(|n| !n.trim().is_empty()) {
                     fetched.lock().unwrap().push((
                         i,
-                        NotesEntry { tag: rel.tag_name.clone(), version: m.version, notes },
+                        NotesEntry { tag: rel.tag_name.clone(), version, notes },
                     ));
                 }
             });
@@ -349,6 +395,13 @@ pub fn plan(
         .collect();
 
     let managed: HashSet<&str> = resolved.iter().map(|f| f.dest.as_str()).collect();
+    // Dests where an earlier removal restored a preserved vanilla original: the file there is
+    // STOCK, not ours. Without this skip it re-flags as Remove on every plan, and the next apply
+    // undoes the restore (displaces the original back into the vanilla store) — the removal and
+    // the restore chasing each other forever.
+    let restored: HashSet<&str> = prev
+        .map(|p| p.restored.iter().map(String::as_str).collect())
+        .unwrap_or_default();
     let mut removed: HashSet<&str> = HashSet::new();
     if let Some(prev) = prev {
         for f in &prev.files {
@@ -362,6 +415,7 @@ pub fn plan(
     }
     for r in remove {
         if !managed.contains(r.dest.as_str())
+            && !restored.contains(r.dest.as_str())
             && removed.insert(r.dest.as_str())
             && game_dir.join(&r.dest).exists()
         {
@@ -413,20 +467,104 @@ mod tests {
     }
 
     #[test]
-    fn fetch_refuses_a_too_new_manifest() {
+    fn fetch_refuses_a_manifest_schema_it_cannot_read() {
+        use crate::manifest::{UnsupportedSchema, MAX_SCHEMA};
         let settings = Settings::default();
+        let future = MAX_SCHEMA + 1;
         let too_new = Fake::new(
             "v9.9.9",
-            r#"{ "version": "9.9.9", "min_launcher": "999.0.0", "files": [] }"#,
+            &format!(r#"{{ "schema": {future}, "version": "9.9.9", "files": [] }}"#),
             vec![],
         );
         let err = fetch(&settings, &too_new, None).unwrap_err();
-        let too_old = err.chain().find_map(|c| c.downcast_ref::<TooOld>());
-        assert_eq!(too_old.unwrap().required, "999.0.0");
+        let refused = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<UnsupportedSchema>())
+            .expect("refused for the schema, not as a parse error");
+        assert_eq!(refused.found, future);
 
-        // and the same manifest WITHOUT the gate installs fine
-        let ok = Fake::new("v1.0.0", r#"{ "version": "1.0.0", "files": [] }"#, vec![]);
+        // a supported schema, and a legacy manifest with no `schema` key at all, both pass
+        let ok = Fake::new("v1.0.0", r#"{ "schema": 2, "version": "1.0.0", "files": [] }"#, vec![]);
         assert!(fetch(&settings, &ok, None).is_ok());
+        let legacy = Fake::new("v1.0.0", r#"{ "version": "1.0.0", "files": [] }"#, vec![]);
+        assert!(fetch(&settings, &legacy, None).is_ok());
+    }
+
+    #[test]
+    fn merged_game_release_folds_shards_into_the_main_release() {
+        use crate::downloader::{Asset, ChunkProgress};
+        // a two-release repo: the Fake serves one release, so hand-roll a tiny double here
+        struct Sharded;
+        fn rel(tag: &str, names: &[&str]) -> Release {
+            Release {
+                tag_name: tag.into(),
+                body: None,
+                assets: names
+                    .iter()
+                    .map(|n| Asset {
+                        name: (*n).into(),
+                        url: String::new(),
+                        browser_download_url: String::new(),
+                    })
+                    .collect(),
+            }
+        }
+        impl Downloader for Sharded {
+            fn fetch_release(&self, _r: &str, _t: Option<&str>) -> Result<Release> {
+                Ok(rel("v1805", &["manifest.json"]))
+            }
+            fn fetch_releases(&self, _r: &str) -> Result<Vec<Release>> {
+                Ok(vec![
+                    rel("v1805", &["manifest.json"]),
+                    rel("v1805-assets-1", &["a.vpk", "b.vpk"]),
+                    // a stale shard repeating a name must not shadow the first-seen asset
+                    rel("v1805-assets-2", &["c.vpk", "a.vpk"]),
+                ])
+            }
+            fn download(&self, _a: &Asset) -> Result<Vec<u8>> {
+                unreachable!()
+            }
+            fn download_to(&self, _a: &Asset, _d: &Path, _r: u64, _p: ChunkProgress) -> Result<(u64, String)> {
+                unreachable!()
+            }
+        }
+
+        let dl = Sharded;
+        let main = dl.fetch_release("r", None).unwrap();
+        let merged = merged_game_release(&dl, "r", main).unwrap();
+        let mut names: Vec<&str> = merged.assets.iter().map(|a| a.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["a.vpk", "b.vpk", "c.vpk", "manifest.json"]);
+        assert_eq!(merged.tag_name, "v1805");
+    }
+
+    #[test]
+    fn notes_history_keeps_a_future_schema_release() {
+        use crate::manifest::MAX_SCHEMA;
+        let settings = Settings::default();
+        // installable? no. But its notes are exactly where "update the launcher" is explained,
+        // so the What's new history must not develop a hole at it
+        // json!, not a string literal: the notes' markdown heading (`"###`) embeds every raw
+        // string delimiter an r#-string could use
+        let future = Fake::new(
+            "v9.9.9",
+            &serde_json::json!({
+                "schema": MAX_SCHEMA + 1,
+                "version": "9.9.9",
+                "notes": "### Requires a newer launcher",
+                "files": []
+            })
+            .to_string(),
+            vec![],
+        );
+        let cache = fetch_notes_history(&settings, &future, &[]).unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.entries[0].version, "9.9.9");
+        assert!(cache.entries[0].notes.contains("newer launcher"));
+
+        // truly malformed stays skipped, not fatal
+        let garbage = Fake::new("v1.0.0", r#"{ "version": 42 }"#, vec![]);
+        assert!(fetch_notes_history(&settings, &garbage, &[]).unwrap().entries.is_empty());
     }
 
     fn manifest() -> Manifest {
@@ -495,6 +633,7 @@ mod tests {
             version: "0.9".into(),
             files: vec![InstalledFile { dest: "game/dota/fx.vpk".into(), sha256: "dd".into() }],
             winmm_orig_created: false,
+            restored: Vec::new(),
         };
         let statuses = plan(&dir, &resolved, Some(&prev), &[]);
         let orphan = statuses.iter().find(|s| s.dest == "game/dota/fx.vpk").unwrap();

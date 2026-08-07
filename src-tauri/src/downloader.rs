@@ -20,11 +20,23 @@ pub struct Asset {
 pub struct Release {
     pub tag_name: String,
     pub assets: Vec<Asset>,
+    /// The release description. The dist repo's "What's new" comes from its manifests instead, so
+    /// this is only read for the launcher's own releases (selfupdate.rs). Absent or JSON `null`
+    /// both land as None.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 impl Release {
     pub fn asset(&self, name: &str) -> Option<&Asset> {
         self.assets.iter().find(|a| a.name == name)
+    }
+
+    /// Name -> asset, built once. `asset()` is a linear scan, which is fine for the handful of
+    /// lookups the shim does but quadratic for the base game: 4,635 jobs against a merged release
+    /// carrying 4,636 assets is ~10 million string comparisons.
+    pub fn asset_index(&self) -> std::collections::HashMap<&str, &Asset> {
+        self.assets.iter().map(|a| (a.name.as_str(), a)).collect()
     }
 }
 
@@ -94,6 +106,7 @@ pub mod fake {
         fn release(&self) -> Release {
             Release {
                 tag_name: self.tag.clone(),
+                body: None,
                 assets: self
                     .assets
                     .keys()
@@ -134,7 +147,11 @@ pub mod fake {
             }
             out.extend_from_slice(&bytes[out.len()..]);
             std::fs::write(dest, &out).with_context(|| format!("writing {}", dest.display()))?;
-            let _ = progress(out.len() as u64, Some(out.len() as u64));
+            // honor the abort contract like the real impl: false = fail the transfer, keep the
+            // partial file (cancellation tests depend on this being honest)
+            if !progress(out.len() as u64, Some(out.len() as u64)) {
+                anyhow::bail!("download aborted");
+            }
             Ok((out.len() as u64, hex::encode(sha2::Sha256::digest(&out))))
         }
     }

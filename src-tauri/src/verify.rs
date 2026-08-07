@@ -2,6 +2,12 @@
 //! downloads. `sha256_file_cached` memoizes by (size, mtime), so repeated plans (every check /
 //! selection change re-diffs the whole file set) don't re-read unchanged files — a rewrite
 //! changes the mtime and naturally invalidates the entry.
+//!
+//! GRANULARITY CAVEAT: Windows resolves file times coarsely (measured: two writes microseconds
+//! apart share an mtime ~90% of the time), so a SAME-SIZE rewrite within the same tick as the
+//! last hash is invisible to the memo. Harmless in practice — every real path puts UI, network
+//! or user time between a hash and an edit — but tests that corrupt a file immediately after
+//! planning must change its LENGTH, or the memo will keep reporting the file as intact.
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};

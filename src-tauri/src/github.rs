@@ -17,15 +17,36 @@ const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Per socket read/write op — detects stalls without capping total transfer time of large assets.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle connections the pool keeps PER HOST. ureq's default is 1 — with the 4-worker download
+/// pool (and the 4-worker notes fetch) all hitting one host, every moment two workers were
+/// between files the pool closed one connection and the next file paid a full DNS+TCP+TLS
+/// handshake again: exactly the 663-vs-159 ms/file cost the pooled-agent design (below) exists
+/// to avoid, resurfacing across thousands of base-game files. Sized past every worker pool.
+const POOL_PER_HOST: usize = 8;
 
-/// The GitHub-backed `Downloader`. Cheap to construct; holds only the optional auth token.
+/// The GitHub-backed `Downloader`. Holds the optional auth token and its pooled HTTP agents.
+///
+/// The agents are stored, not built per request, because ureq keeps its CONNECTION POOL inside
+/// the Agent: a fresh one each time forces a full DNS + TCP + TLS handshake for every file.
+/// Measured against this repo's small assets that is 663 ms/file versus 159 ms/file pooled — a
+/// 4.2x difference, and the base game is thousands of small files where the handshake *is* the
+/// transfer time. Construct one Github and reuse it (install/warm already do).
 pub struct Github {
     token: Option<String>,
+    /// Follows redirects — API calls and public asset URLs.
+    agent: ureq::Agent,
+    /// Never follows redirects: the private-asset path must see the 302 itself and re-issue
+    /// WITHOUT the auth header, since storage URLs are pre-signed and 403 if they see one.
+    no_redirect: ureq::Agent,
 }
 
 impl Github {
     pub fn new(token: Option<&str>) -> Self {
-        Self { token: token.map(str::to_string) }
+        Self {
+            token: token.map(str::to_string),
+            agent: agent(5),
+            no_redirect: agent(0),
+        }
     }
 }
 
@@ -35,6 +56,7 @@ fn agent(redirects: u32) -> ureq::Agent {
         .timeout_read(IO_TIMEOUT)
         .timeout_write(IO_TIMEOUT)
         .redirects(redirects)
+        .max_idle_connections_per_host(POOL_PER_HOST)
         .build()
 }
 
@@ -60,6 +82,21 @@ fn net_err(e: ureq::Error) -> anyhow::Error {
     }
 }
 
+/// `net_err` for the pre-signed storage hop, where the URL must NOT reach the message.
+///
+/// That URL's query string is a time-limited read capability for the asset, and ureq's transport
+/// errors include the URL they were fetching — which would put it in the UI's mono detail line and
+/// in any log a user pastes into a bug report. The error kind is preserved (that is what the shell
+/// classifies on); only the URL, and the response body, are dropped.
+fn net_err_redacted(e: ureq::Error, what: &str) -> anyhow::Error {
+    match e {
+        ureq::Error::Status(code, _) => anyhow::Error::new(NetKind::Status(code))
+            .context(format!("HTTP {code} fetching {what} from storage")),
+        ureq::Error::Transport(t) => anyhow::Error::new(NetKind::Transport)
+            .context(format!("transport error fetching {what} from storage: {}", t.kind())),
+    }
+}
+
 /// Start an asset request and return the response whose body is the asset bytes.
 ///
 /// Public (no token): the direct `browser_download_url`.
@@ -68,7 +105,7 @@ fn net_err(e: ureq::Error) -> anyhow::Error {
 /// if it sees one.
 /// `resume_from` > 0 adds a Range header; the answer is then 206, or 200 if the server declined
 /// to resume (the caller restarts from zero in that case).
-fn asset_response(asset: &Asset, token: Option<&str>, resume_from: u64) -> Result<ureq::Response> {
+fn asset_response(gh: &Github, asset: &Asset, resume_from: u64) -> Result<ureq::Response> {
     let range = |req: ureq::Request| {
         if resume_from > 0 {
             req.set("Range", &format!("bytes={resume_from}-"))
@@ -76,11 +113,11 @@ fn asset_response(asset: &Asset, token: Option<&str>, resume_from: u64) -> Resul
             req
         }
     };
-    let Some(t) = token else {
-        return range(agent(5).get(&asset.browser_download_url).set("User-Agent", UA)).call().map_err(net_err);
+    let Some(t) = gh.token.as_deref() else {
+        return range(gh.agent.get(&asset.browser_download_url).set("User-Agent", UA)).call().map_err(net_err);
     };
     let resp = range(
-        agent(0)
+        gh.no_redirect
             .get(&asset.url)
             .set("User-Agent", UA)
             .set("Accept", "application/octet-stream")
@@ -94,8 +131,14 @@ fn asset_response(asset: &Asset, token: Option<&str>, resume_from: u64) -> Resul
                 .header("Location")
                 .context("redirect response without a Location header")?
                 .to_string();
-            // no auth on the storage hop — but the Range header rides along (S3 honors it)
-            range(agent(5).get(&loc).set("User-Agent", UA)).call().map_err(net_err)
+            // no auth on the storage hop — but the Range header rides along (S3 honors it).
+            // The error is re-contexted with the ASSET name: `loc` is a pre-signed URL whose
+            // query string is a time-limited read capability, and ureq's transport errors carry
+            // the URL they were fetching — which would put that capability in the UI's detail
+            // line and in any log the user pastes into a bug report.
+            range(gh.agent.get(&loc).set("User-Agent", UA))
+                .call()
+                .map_err(|e| net_err_redacted(e, &asset.name))
         }
         Ok(r) => bail!("asset download returned HTTP {}", r.status()),
         Err(e) => Err(net_err(e)),
@@ -105,7 +148,8 @@ fn asset_response(asset: &Asset, token: Option<&str>, resume_from: u64) -> Resul
 impl Downloader for Github {
     /// List releases, newest first (GitHub's order). One page, up to 100 — plenty for this project.
     fn fetch_releases(&self, repo: &str) -> Result<Vec<Release>> {
-        let mut req = agent(5)
+        let mut req = self
+            .agent
             .get(&format!("https://api.github.com/repos/{repo}/releases?per_page=100"))
             .set("User-Agent", UA)
             .set("Accept", "application/vnd.github+json")
@@ -119,8 +163,7 @@ impl Downloader for Github {
 
     /// Fetch a release by tag (or the latest). `token` is only required for private repos.
     fn fetch_release(&self, repo: &str, tag: Option<&str>) -> Result<Release> {
-        let mut req = agent(5)
-            .get(&api_url(repo, tag))
+        let mut req = self.agent.get(&api_url(repo, tag))
             .set("User-Agent", UA)
             .set("Accept", "application/vnd.github+json")
             .set("X-GitHub-Api-Version", "2022-11-28");
@@ -134,7 +177,7 @@ impl Downloader for Github {
     /// Download an asset into memory (small files, e.g. manifest.json).
     fn download(&self, asset: &Asset) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        asset_response(asset, self.token.as_deref(), 0)?.into_reader().read_to_end(&mut buf)?;
+        asset_response(self, asset, 0)?.into_reader().read_to_end(&mut buf)?;
         Ok(buf)
     }
 
@@ -152,7 +195,7 @@ impl Downloader for Github {
                 std::io::copy(&mut f.take(prefix), &mut hasher)?;
             }
         }
-        let resp = asset_response(asset, self.token.as_deref(), prefix)?;
+        let resp = asset_response(self, asset, prefix)?;
         if prefix > 0 && resp.status() != 206 {
             prefix = 0; // server declined the Range — restart from zero
             hasher = Sha256::new();

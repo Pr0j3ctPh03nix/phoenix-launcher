@@ -1,0 +1,75 @@
+{
+  "schema": 3,
+  "version": "1.0.0",
+  "notes": "### Added\n- Something a player can see.",
+  "files": [
+    {
+      "name": "winmm.dll",
+      "dest": "game/bin/win64/winmm.dll",
+      "sha256": "d508058f7eba5f70d1daf7de8c2d5fc35b39d9cbbcbf00762bf55b77dbac517a",
+      "size": 1560
+    },
+    {
+      "name": "regions.txt",
+      "dest": "game/dota_phoenix/scripts/regions.txt",
+      "sha256": "9b73a25d93b7fbaf9895e03bfe89ad98fac432055911dd4a568b10262697731f",
+      "size": 4819
+    }
+  ],
+  "remove": [
+    {
+      "dest": "game/dota/scripts/regions.txt"
+    }
+  ],
+  "options": [
+    {
+      "id": "lighting",
+      "kind": "choice",
+      "label": {
+        "en": "Lighting",
+        "ru": "Освещение"
+      },
+      "default": "original",
+      "dest": "game/dota_phoenix/maps/dota.vpk",
+      "variants": [
+        {
+          "name": "opt__lighting__mod.vpk",
+          "sha256": "ffe9dacff9bbaa5d508a84be9a1a20869eaaf5324de853c067ca6d3a57270f80",
+          "size": 3537,
+          "id": "mod",
+          "label": {
+            "en": "New lighting",
+            "ru": "Новое освещение"
+          }
+        },
+        {
+          "name": "opt__lighting__original.vpk",
+          "sha256": "37b5d4462d71d85f4eee306a80c93c4827c6e8bb42df31dc8635ab201618df6e",
+          "size": 6285,
+          "id": "original",
+          "label": {
+            "en": "Original lighting",
+            "ru": "Оригинальное освещение"
+          }
+        }
+      ]
+    },
+    {
+      "id": "terrain",
+      "kind": "toggle",
+      "label": {
+        "en": "Less acidic Radiant terrain",
+        "ru": "Менее кислотная трава"
+      },
+      "default": false,
+      "files": [
+        {
+          "name": "opt__terrain__pak01_dir.vpk",
+          "dest": "game/dota_phoenix/pak01_dir.vpk",
+          "sha256": "634c0f4d9c199e010a28c8e2aaf48b86c005ffa33c6458936d2cb2b788c4d2c4",
+          "size": 8444
+        }
+      ]
+    }
+  ]
+}

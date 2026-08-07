@@ -23,7 +23,14 @@
 
   --text:      #e7e3da;
   --text-dim:  #928d84;
-  --text-mute: #5a564f;
+  /* Was #5a564f — 2.65:1 on the ground, under the 4.5:1 floor and used for the smallest type in
+     the app, including the mono line that carries error diagnoses and the settings hints. The
+     quiet look survives at 5.1:1; being unreadable exactly when something has gone wrong does
+     not. Kept for genuinely decorative marks below. */
+  --text-mute: #8d887e;
+  /* the old value, for non-text uses (the idle status dot, off-state switch tracks) where it is
+     a shape rather than something to read */
+  --mark-mute: #5a564f;
 
   --gold:      #c9a86a;
   --gold-soft: #e6cf98;
@@ -143,7 +150,7 @@ body {
 .status { display: flex; align-items: flex-start; gap: var(--marker-gap); padding: var(--gap-head) 0 var(--band); }
 /* the slot is fixed-width, so swapping the dot for the busy spinner never shifts the text */
 .status-dot { margin-top: 0.6875rem; }
-.status-dot::after { width: 0.5625rem; height: 0.5625rem; background: var(--text-mute); }
+.status-dot::after { width: 0.5625rem; height: 0.5625rem; background: var(--mark-mute); }
 .status-lines { min-width: 0; }
 .status-word {
   font-size: 1.8125rem; font-weight: 600; letter-spacing: -0.025rem; line-height: 1.1; color: var(--text);
@@ -168,6 +175,35 @@ body {
 }
 .status[data-kind="busy"]   .status-word { color: var(--gold-soft); }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---- game download modal: one aggregate bar (the payload is GBs, per-file rows would be noise) ---- */
+.gd-bar {
+  height: 0.375rem; border-radius: 0.1875rem; overflow: hidden;
+  background: rgba(255, 255, 255, 0.06); margin-bottom: 0.875rem;
+}
+.gd-bar-fill {
+  display: block; height: 100%; width: 0;
+  background: var(--gold); border-radius: inherit;
+  transition: width 0.25s ease;
+}
+
+/* ---- launcher self-update notes ---- */
+/* gold accent = action/attention, same grammar as the .msg plate's terracotta-for-error;
+   capped height so long release notes never squeeze the files list off the column */
+.lu-banner {
+  margin-bottom: var(--band);
+  padding: 0.625rem 0.75rem;
+  border-left: 2px solid var(--gold);
+  background: rgba(201, 168, 106, 0.06);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+.lu-head { display: flex; align-items: baseline; justify-content: space-between; }
+.lu-ver { font-family: "Mono", monospace; font-size: 0.71875rem; color: var(--gold-soft); }
+/* viewport-relative as well as absolute: at the window's minimum size a full-height banner left
+   the files list under one row tall, which is not what "never squeeze the list off the column"
+   was supposed to mean */
+.lu-notes { max-height: min(8.5rem, 20vh); overflow-y: auto; margin-top: 0.375rem; }
+.lu-notes h4:first-child { margin-top: 0; }
 
 /* ---- files ---- */
 /* the head carries the scroll area's gutter too, so its right-aligned count sits directly
@@ -242,6 +278,13 @@ body {
 .btn.ghost:not(:disabled):hover { background: rgba(201, 168, 106, 0.06); border-color: var(--gold); }
 /* inline ghosts sit in a row of inputs — they size to their label instead */
 .btn.inline { min-width: 0; height: var(--ctl-h); padding: 0 1.125rem; }
+/* Destructive: terracotta replaces gold wholesale, so an irreversible action never wears the
+   colour that means "recommended". Solid (a confirm dialog's OK) and ghost (a settings row) both.
+   The ghost pair must come second — .btn.ghost.danger outranks .btn.danger. */
+.btn.danger { color: #22100c; background: var(--terra); border-color: var(--terra); }
+.btn.danger:not(:disabled):hover { background: #e08c7c; border-color: #e08c7c; }
+.btn.ghost.danger { color: var(--terra); background: transparent; border-color: var(--line); }
+.btn.ghost.danger:not(:disabled):hover { background: rgba(212, 119, 103, 0.07); border-color: var(--terra); }
 
 .link {
   background: none; border: none; cursor: pointer; padding: 0.25rem 0.125rem;
@@ -253,6 +296,51 @@ body {
 .link:disabled { opacity: 0.5; pointer-events: none; }
 .link.hidden { display: none; }
 
+/* ---- chip: the What's-new pill ---- */
+/* The one control that ANNOUNCES rather than acts, so it gets the only lit surface outside the
+   primary: a gold-tinted pill with a spark that breathes at rest and sweeps a sheen on hover.
+   Deliberately not a .btn — it must not compete with the primary's solid gold mass. */
+.chip {
+  position: relative; overflow: hidden;
+  display: inline-flex; align-items: center; gap: 0.4375rem;
+  height: 2.125rem; padding: 0 0.9375rem; border-radius: 999px;
+  font-family: "Inter", sans-serif; font-size: 0.78125rem; font-weight: 600; letter-spacing: 0.0125rem;
+  color: var(--gold-soft); cursor: pointer; white-space: nowrap;
+  background: linear-gradient(180deg, rgba(201, 168, 106, 0.11), rgba(201, 168, 106, 0.04));
+  border: 1px solid rgba(201, 168, 106, 0.28);
+  transition: border-color 0.15s, background 0.15s, box-shadow 0.15s, transform 0.05s;
+}
+.chip:hover {
+  border-color: rgba(201, 168, 106, 0.65);
+  background: linear-gradient(180deg, rgba(201, 168, 106, 0.18), rgba(201, 168, 106, 0.07));
+  box-shadow: 0 0 14px rgba(201, 168, 106, 0.14);
+}
+.chip:active { transform: translateY(1px); }
+.chip:disabled { opacity: 0.45; pointer-events: none; }
+/* Sheen: parked off the left edge. It catches the light on its own every ~9s (the idle keyframes
+   spend 88% of the cycle parked, so it reads as an occasional glint, not a running animation) and
+   sweeps at once on hover — the same element, so the hover rule simply replaces the animation.
+   The MOTION lives here rather than on the icon: a document that pulses reads as broken. */
+.chip::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(100deg, transparent 30%, rgba(230, 207, 152, 0.22) 50%, transparent 70%);
+  transform: translateX(-130%);
+  animation: sheen-idle 9s var(--ease) 2s infinite;
+}
+.chip:hover::after { animation: sheen 0.85s var(--ease); }
+@keyframes sheen { to { transform: translateX(130%); } }
+@keyframes sheen-idle {
+  0%, 88% { transform: translateX(-130%); }
+  100%    { transform: translateX(130%); }
+}
+/* stroked, like the header icons — the chip is the lit surface, the glyph is line art on it */
+.chip-icon {
+  width: 0.9375rem; height: 0.9375rem; flex: none;
+  fill: none; stroke: var(--gold); stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+  transition: stroke 0.15s, transform 0.15s var(--ease);
+}
+.chip:hover .chip-icon { stroke: var(--gold-soft); transform: translateY(-1px); }
+
 /* the install path is a caption under the actions, not a third row of controls — it gets its
    own air so the footer reads as [rule of air] buttons [smaller air] path */
 .path {
@@ -262,10 +350,48 @@ body {
 }
 
 /* ---- settings ---- */
-.fields { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 1.375rem; padding-top: var(--gap-head); padding-right: var(--gutter); overflow-y: auto; }
+/* Tabs own the head gap the single column used to; the panel area below scrolls, so switching
+   tabs never moves the tab row or the footer. The rule under them is the same hairline .files-head
+   draws — one grammar for "a section starts here" — and carries the same --gutter inset, so it
+   ends where the scrolling pane's content does and the column keeps one right edge. */
+.tabs { display: flex; gap: 1.5rem; margin-top: var(--gap-head); padding-right: var(--gutter); border-bottom: 1px solid var(--line); }
+.tab {
+  position: relative; padding: 0 0 0.75rem; background: none; border: none; cursor: pointer;
+  font-family: "Inter", sans-serif; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem;
+  text-transform: uppercase; color: var(--text-mute);
+  transition: color 0.15s;
+}
+.tab:hover { color: var(--text-dim); }
+.tab.active { color: var(--gold-soft); }
+/* the indicator sits ON the rule (bottom:-1px), so it reads as the rule lighting up */
+.tab::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: -1px; height: 2px;
+  background: var(--gold); border-radius: 1px;
+  transform: scaleX(0); transition: transform 0.2s var(--ease);
+}
+.tab.active::after { transform: scaleX(1); }
+
+/* the negative margin pays back the left/bottom padding: an ancestor with overflow:auto clips
+   descendant outlines at its padding box, which sliced the focus ring off every control sitting
+   flush with the column's left edge (and off the bottom-most row) */
+.panels {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 1.375rem var(--gutter) 3px 3px;
+  margin-left: -3px;
+}
+.fields { display: flex; flex-direction: column; gap: 1.375rem; }
 .field { display: flex; flex-direction: column; gap: 0.5rem; }
 .label { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase; color: var(--text-dim); }
+/* a label with a tag beside it — the tag keeps its own size, the row keeps the label's baseline */
+.label-row { display: flex; align-items: center; gap: 0.625rem; flex-wrap: wrap; }
 .hint { font-size: 0.71875rem; color: var(--text-mute); }
+/* provenance chip: mono, gold, pill — states a fact about the payload, never clickable */
+.tag {
+  font-family: "Mono", monospace; font-size: 0.65625rem; line-height: 1.5; white-space: nowrap;
+  color: var(--gold-soft); background: rgba(201, 168, 106, 0.09);
+  border: 1px solid rgba(201, 168, 106, 0.28); border-radius: 999px; padding: 0.0625rem 0.5rem;
+}
+#settings-msg { margin-top: 0.875rem; }
 /* inline code chips: mono on a quiet plate, like the notes' snippets */
 .label code, .hint code {
   font-family: "Mono", monospace; font-size: 0.9em; color: var(--gold-soft);
@@ -404,6 +530,8 @@ input::placeholder { color: #4d4941; }
 .setup-text { margin-top: 0.75rem; font-size: 0.84375rem; line-height: 1.5; color: var(--text-dim); max-width: 30rem; }
 .setup-spacer { flex: 1; min-height: var(--band); }
 #setup-msg { margin-top: 1.25rem; }
+/* caption for the third button, directly above the row it explains */
+.setup-note { display: flex; align-items: center; gap: 0.625rem; flex-wrap: wrap; }
 
 /* ---- modal (autofind) ---- */
 .modal {
@@ -411,17 +539,35 @@ input::placeholder { color: #4d4941; }
   background: rgba(5, 4, 7, 0.6); backdrop-filter: blur(3px);
 }
 .modal.hidden { display: none; }
+/* --modal-w is per-modal: a card is only as wide as its content needs (the confirm dialog is two
+   lines of prose; the autofind results are paths). Override it on the modal, not here. */
 .modal-card {
-  width: min(30rem, calc(100vw - 4rem)); max-height: min(28rem, calc(100vh - 4rem));
+  width: min(var(--modal-w, 30rem), calc(100vw - 4rem)); max-height: min(28rem, calc(100vh - 4rem));
   display: flex; flex-direction: column;
   background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
   padding: 1.5rem 1.625rem 1.375rem; box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
 }
-.modal-card > div:not(.hidden) { display: flex; flex-direction: column; min-height: 0; }
+#cf-modal { --modal-w: 26.5rem; }
+/* every STAGE div is a flex column that can shrink around its own scroll area — the head is not a
+   stage, and must keep its own row layout (this selector outranks .modal-head's) */
+.modal-card > div:not(.hidden):not(.modal-head) { display: flex; flex-direction: column; min-height: 0; }
 /* same micro-caps role as .eyebrow / .label, in the accent */
 .modal-title { font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase; color: var(--gold-soft); margin-bottom: 0.875rem; }
-.modal-text { font-size: 0.84375rem; line-height: 1.55; color: var(--text); }
-.modal-actions { display: flex; gap: 0.75rem; margin-top: var(--band); }
+.modal-head { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; margin-bottom: 0.875rem; }
+.modal-head .modal-title { margin-bottom: 0; }
+/* balance keeps a two-line question from ending in one orphaned word — the shape of the card's
+   right edge is what made these read as half-empty */
+.modal-text { font-size: 0.84375rem; line-height: 1.55; color: var(--text); text-wrap: balance; }
+.modal-text.pre { white-space: pre-line; }
+.modal-note { font-size: 0.78125rem; line-height: 1.5; color: var(--text-dim); margin-bottom: 0.625rem; text-wrap: balance; }
+/* Equal columns, edge to edge: the buttons ARE the card's bottom rule, so no dead space can open
+   on the right, and a pair always reads as one balanced unit whatever the labels say. One-button
+   stages (Stop / Close) get a full-width target for free. */
+.modal-actions {
+  display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
+  gap: 0.75rem; margin-top: var(--band);
+}
+.modal-actions .btn { min-width: 0; width: 100%; }
 
 .spinner {
   width: 1rem; height: 1rem; flex: none; border-radius: 50%;
@@ -473,7 +619,7 @@ input::placeholder { color: #4d4941; }
 .variant.active { color: var(--text); }
 .radio {
   width: 0.875rem; height: 0.875rem; flex: none; border-radius: 50%;
-  border: 1.5px solid var(--text-mute); display: grid; place-items: center;
+  border: 1.5px solid var(--mark-mute); display: grid; place-items: center;
   transition: border-color 0.15s;
 }
 .variant.active .radio { border-color: var(--gold); }
@@ -489,7 +635,7 @@ input::placeholder { color: #4d4941; }
 }
 .switch::after {
   content: ""; position: absolute; top: 50%; left: 0.1875rem; transform: translateY(-50%);
-  width: 0.8125rem; height: 0.8125rem; border-radius: 50%; background: var(--text-mute);
+  width: 0.8125rem; height: 0.8125rem; border-radius: 50%; background: var(--mark-mute);
   transition: left 0.15s, background 0.15s;
 }
 .switch.on { background: rgba(201, 168, 106, 0.18); border-color: var(--gold); }
@@ -529,8 +675,26 @@ input::placeholder { color: #4d4941; }
 /* ---- accessibility ---- */
 :focus-visible { outline: 2px solid var(--gold-soft); outline-offset: 2px; border-radius: 4px; }
 input:focus-visible { outline: none; }
+/* the blanket rule above squares the focus ring off — keep the pill a pill */
+.chip:focus-visible { border-radius: 999px; }
+/* ...and a destructive button must not wear the gold that means "recommended", least of all as
+   the ring around the one control that erases something. confirmDialog focuses it on open, so
+   this is the keyboard path's default appearance, not an edge case. */
+.btn.danger:focus-visible { outline-color: var(--terra); }
 
 @media (prefers-reduced-motion: reduce) {
+  /* Blanket: the old list named four things and missed a dozen (switch knobs, radio dots, bar
+     fills, every :active nudge), so the claim to honour this preference was only partly true.
+     Everything is neutralized here, then the spinners are put back — they are the only signal
+     that a long operation is alive, and freezing them would read as a hang. */
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
   #view-main.revealed .rise { animation: none; opacity: 1; transform: none; }
-  .loader { transition: none; }
+  .loader-ring, .spinner, .status[data-kind="busy"] .status-dot::after {
+    animation-duration: 0.75s !important;
+    animation-iteration-count: infinite !important;
+  }
 }

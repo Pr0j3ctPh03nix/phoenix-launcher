@@ -9,7 +9,12 @@ const SHOW_ADVANCED = false;
 const state = {
   busy: false,
   lastCheck: null,     // last CheckView
-  primaryMode: "check", // "check" | "apply" | "play"
+  primaryMode: "check", // "check" | "apply" | "play" | "updateLauncher"
+  launcherUpdate: null, // LauncherUpdateView while a newer launcher is pending, else null.
+                        // Only ever set from a SUCCESSFUL launcher_check — a failed one leaves it
+                        // untouched, so "couldn't ask" never reads as "nothing to install".
+  launcherVersion: "",  // this build's version, from launcher_info
+  justUpdated: false,   // this process was started by a self-update; shown once, then cleared
   hasToken: false,
   renderer: "dx11",
   launchFlags: [],    // [{id, args, enabled}] as loaded from settings, toggled in place
@@ -19,9 +24,12 @@ const state = {
   aeDirty: false,
   aeReadOnly: false,   // autoexec shown read-only (non-UTF-8 file or failed read)
   gameRunning: false,  // polled — the game is currently running
+  busyOwner: null,     // token of the flow holding the busy lock (see acquireBusy)
+  gameDamaged: 0,      // files a verify reported damaged and the user declined to repair
   fileEls: new Map(),  // dest -> its <li> in the managed-files list (keyed for live dl bars)
   settingsSnap: null,  // settings-form snapshot at open, for the discard-changes guard
   settingsLoaded: null, // {repo, game} as loaded — a save that changes them re-checks
+  settingsTab: "general", // remembered for the session: a repeat visit lands where the user was
   tokenClear: false,   // "Clear" was pressed: the saved token is removed on save
 };
 
@@ -76,6 +84,24 @@ function renderNotes(md) {
   return html;
 }
 
+// ---- modals ----
+// The visible modal, if any. Modals live OUTSIDE .stage, so the view underneath is made `inert`
+// while one is open: without it Tab walked into the view behind the dialog and Space activated
+// whatever it landed on — including Play, from behind a "repair these files?" confirm.
+function openModal() {
+  return document.querySelector(".modal:not(.hidden)");
+}
+function syncModalLayer() {
+  const open = !!openModal();
+  document.querySelector(".stage").inert = open;
+  if (!open) return;
+  // focus something inside the dialog if the click that opened it left focus behind
+  const card = openModal().querySelector(".modal-card");
+  if (card && !card.contains(document.activeElement)) {
+    (card.querySelector("button:not(.hidden):not(:disabled)") || card).focus?.();
+  }
+}
+
 // ---- views ----
 const VIEWS = ["main", "setup", "settings", "options", "autoexec", "whatsnew"];
 function showView(name) {
@@ -83,6 +109,45 @@ function showView(name) {
 }
 function currentView() {
   return VIEWS.find((v) => !$("view-" + v).classList.contains("hidden"));
+}
+
+// ---- busy: one owner at a time ----
+// `busy` used to be a bare boolean that every flow set and cleared. Nothing stopped a second flow
+// from starting (nothing checked before setting), and worse, whichever finished FIRST cleared the
+// flag for both — so a `finally` from a quick check could unlock the whole UI while a multi-GB
+// download was still streaming, re-enabling Play against a folder being rewritten. A token means
+// only the flow that acquired the lock can release it.
+let busySeq = 0;
+function acquireBusy() {
+  if (state.busy) return null;
+  state.busy = true;
+  state.busyOwner = ++busySeq;
+  renderPrimary();
+  return state.busyOwner;
+}
+function releaseBusy(token) {
+  if (token == null || state.busyOwner !== token) return;
+  state.busy = false;
+  state.busyOwner = null;
+  renderPrimary();
+}
+
+// ---- stop: an op's own offer to be interrupted ----
+// Only a flow that can actually honour a stop puts one up (`offerStop`) — a Stop button the
+// backend would ignore is worse than none. Today that is the game-files verify: minutes of hashing
+// on the main view, writing nothing, with no way out but waiting for it. While the offer stands
+// the PRIMARY becomes that Stop (see renderPrimary), and Escape fires the same offer.
+// `asked` latches the request so late progress ticks can't paint over "Stopping…" and a second
+// press can't fire a second cancel.
+let stopOp = null;
+let stopAsked = false;
+function offerStop(fn) { stopOp = fn; stopAsked = false; renderPrimary(); }
+function clearStop() { stopOp = null; stopAsked = false; renderPrimary(); }
+function fireStop() {
+  if (!stopOp || stopAsked) return;
+  stopAsked = true;
+  renderPrimary();
+  stopOp();
 }
 
 // ---- status ----
@@ -96,7 +161,31 @@ function setIdleStatus() {
   setStatus(t("status.notChecked"), "idle", t("status.checkHint"));
 }
 
+// A pending launcher update outranks every game status: until it is installed we can't trust
+// that this build can even read the current manifest, so that is the only thing worth saying.
+function launcherStatusParts() {
+  const lu = state.launcherUpdate;
+  return [
+    t("status.launcherUpdate"),
+    "update",
+    t("detail.launcherUpdate", { from: lu.current, to: lu.version }),
+  ];
+}
+
 function statusFor(v) {
+  // A verdict from the install record alone (the network check failed). It knows whether our own
+  // files are intact; it CANNOT know whether a newer release exists — so it never says "up to
+  // date", and never wears the settled colour. Play stays available: being unable to ask about
+  // updates is not a reason to make the game unplayable.
+  if (v.local) {
+    return [
+      t("status.unverified"),
+      "error",
+      v.changes === 0
+        ? t("detail.localOk", { version: v.version })
+        : t("detail.localChanged", { version: v.version, n: v.changes }),
+    ];
+  }
   if (v.changes === 0) {
     if (!v.installed) {
       // files all hash-match but no install state — the primary runs the no-op heal. Worded as
@@ -119,13 +208,19 @@ function renderPrimary() {
   const c = $("btn-check");
   // busy wins over "in game": a running op keeps everything locked either way
   if (state.busy) {
-    p.textContent = t("status.working");
-    p.disabled = true;
+    // An op that can be interrupted takes the primary over rather than adding a fourth control:
+    // the status word right above already says "Working…", so a button repeating it was the least
+    // useful thing on the screen — and a fourth button pushed the What's-new chip off the edge at
+    // the minimum window size in Russian. Ghost, not gold: stopping is a way out, not the
+    // recommended move. Same shape the download dialog's run stage has always had.
+    p.textContent = stopOp ? t("btn.stop") : t("status.working");
+    p.disabled = !stopOp || stopAsked; // pressed: it stays legible but can't fire twice
     c.disabled = true;
-  } else if (state.gameRunning && state.primaryMode !== "check") {
-    // the game is up: nothing mutating is offered (the backend interlock backs this up);
-    // check stays available — it's read-only. In "check" mode the primary IS the check
-    // button, so it falls through to the normal branch and stays clickable.
+  } else if (state.gameRunning && state.primaryMode !== "check" && state.primaryMode !== "updateLauncher") {
+    // the game is up: nothing that touches the GAME folder is offered (the backend interlock
+    // backs this up); check stays available — it's read-only — and so does the launcher update,
+    // which only renames the launcher's own exe. In those modes the primary is already the right
+    // button, so they fall through to the normal branch and stay clickable.
     p.textContent = t("btn.ingame");
     p.disabled = true;
     c.disabled = false;
@@ -135,21 +230,51 @@ function renderPrimary() {
     const label = {
       check: "btn.check",
       play: "btn.play",
+      updateLauncher: "btn.updateLauncher",
       apply: heal ? "btn.repair" : state.lastCheck?.installed ? "btn.update" : "btn.install",
     }[state.primaryMode];
     p.textContent = t(label);
     p.disabled = false;
     c.disabled = false;
   }
+  // set from ONE place, outside the branches: a ghost left behind by a finished op would paint
+  // the next Play/Install in the wrong weight entirely
+  p.classList.toggle("ghost", state.busy && !!stopOp);
   // the header refresh icon appears whenever the primary is something else
   c.classList.toggle("hidden", state.primaryMode === "check");
 
-  const u = $("btn-uninstall");
-  u.classList.toggle("hidden", !state.lastCheck?.canUninstall);
-  u.disabled = state.busy || state.gameRunning;
   $("btn-customize").disabled = state.busy;
   $("btn-settings").disabled = state.busy;
   $("btn-whatsnew").disabled = state.busy;
+  // Save was the one control left live during an op: reachable behind a modal, and a save that
+  // changes the folder/repo/token kicks off a check whose completion would fight the running flow
+  $("btn-save").disabled = state.busy;
+  // Settings' game-files tab: every control there mutates (or leads to mutating) the game folder,
+  // so they share one lock — a repair rewrites mmapped VPKs, uninstall restores originals.
+  // Uninstall stays VISIBLE with nothing to uninstall: inside a settings tab a control that
+  // vanishes reads as a missing feature, while a disabled one reads as "not installed".
+  const locked = state.busy || state.gameRunning;
+  $("btn-verify").disabled = locked;
+  $("btn-fresh").disabled = locked;
+  $("btn-uninstall").disabled = locked || !state.lastCheck?.canUninstall;
+  renderLauncherUpdate();
+}
+
+// The notes surface for a pending self-update. Shown only when the release carries notes — the
+// status line already names the versions, so a notes-less banner would say nothing. Hooked into
+// renderPrimary (every flow's finally lands there), so it tracks state.launcherUpdate with no
+// call sites of its own; the content is only re-rendered when the offered release changes, so a
+// scroll position inside the notes box survives unrelated re-renders (busy toggles, game polls).
+let luRenderedTag = null;
+function renderLauncherUpdate() {
+  const lu = state.launcherUpdate;
+  const show = !!(lu && lu.notes);
+  $("lu-banner").classList.toggle("hidden", !show);
+  if (!show) { luRenderedTag = null; return; }
+  if (luRenderedTag === lu.tag) return;
+  luRenderedTag = lu.tag;
+  $("lu-ver").textContent = `${lu.current} → ${lu.version}`;
+  $("lu-notes").innerHTML = renderNotes(lu.notes);
 }
 
 // Rebuild the managed-files list from a CheckView. Separate from applyCheck so a failed apply
@@ -185,9 +310,22 @@ function renderFiles(v) {
 function applyCheck(v) {
   state.lastCheck = v;
   // a check completing while the game runs must not overwrite the "in game" status
-  const [word, kind, detail] = state.gameRunning
+  // launcher update FIRST, then "in game". The order is the documented invariant: until the
+  // launcher is replaced we can't trust that this build reads the current manifest at all, and a
+  // self-update touches nothing but the launcher's own exe — so a running game is no reason to
+  // hide it (or, as the reversed order did, to paint it in the settled colour behind a dead
+  // "In game" button that offered no way to install it).
+  let [word, kind, detail] = state.launcherUpdate
+    ? launcherStatusParts()
+    : state.gameRunning
     ? [t("status.ingame"), "ok", t("detail.ingame")]
     : statusFor(v);
+  // one-shot confirmation that a self-update landed — kept ALONGSIDE the real status rather than
+  // replacing it, since the game's state is still the more useful half of the line
+  if (state.justUpdated) {
+    detail = t("detail.justUpdated", { version: state.launcherVersion }) + " · " + detail;
+    state.justUpdated = false;
+  }
   setStatus(word, kind, detail);
 
   renderFiles(v);
@@ -201,7 +339,11 @@ function applyCheck(v) {
   $("btn-whatsnew").classList.remove("hidden");
   $("btn-customize").classList.toggle("hidden", !(v.options && v.options.length));
 
-  state.primaryMode = v.primaryAction === "apply" ? "apply" : v.canPlay ? "play" : "check";
+  // a pending launcher update takes the primary: this build may not be able to read the current
+  // manifest at all, so replacing it comes before installing anything described by that manifest
+  state.primaryMode = state.launcherUpdate
+    ? "updateLauncher"
+    : v.primaryAction === "apply" ? "apply" : v.canPlay ? "play" : "check";
   renderPrimary();
 }
 
@@ -223,15 +365,46 @@ function onError(e) {
 
 // ---- actions ----
 async function doCheck() {
-  state.busy = true; renderPrimary();
+  const busy = acquireBusy();
+  if (busy == null) return;
   setStatus(t("status.working"), "busy", t("detail.reading"));
+  // The launcher checks ITSELF on the same trip — different repo, so the two run in parallel.
+  // allSettled, not all: both must have landed before we decide what to paint, and checkLauncher
+  // never rejects, so a launcher-side failure can't turn a good game check into an error.
+  const [, game] = await Promise.allSettled([checkLauncher(), invoke("check")]);
   try {
-    applyCheck(await invoke("check"));
+    if (game.status === "rejected") throw game.reason;
+    applyCheck(game.value);
   } catch (e) {
     onError(e);
+    // a pending launcher update is more actionable than a failed game check — and may well be
+    // its cause (a manifest this build can't read). Say that instead.
+    if (state.launcherUpdate) {
+      state.primaryMode = "updateLauncher";
+      setStatus(...launcherStatusParts());
+    } else {
+      await fallBackToLocal(e);
+    }
   } finally {
-    state.busy = false; renderPrimary();
+    releaseBusy(busy);
   }
+}
+
+// A failed check must not leave the launcher useless. Play and Uninstall are entirely local, and
+// `lastCheck` is what unlocks them — so when the network verdict is unavailable, ask the install
+// record instead. The result is worded as what it is (we could not check), never as "up to date":
+// it describes the files WE installed, not the latest release.
+async function fallBackToLocal(cause) {
+  let v;
+  try {
+    v = await invoke("local_check");
+  } catch (_) {
+    return; // nothing installed to fall back to — the original error stands
+  }
+  // applyCheck words a local verdict for itself (statusFor), so it stays correct through a
+  // language switch or a game-close refresh too; only the reason is appended here
+  applyCheck(v);
+  $("status-detail").textContent += " · " + errText(cause);
 }
 
 async function doReplan() {
@@ -243,7 +416,8 @@ async function doReplan() {
 }
 
 async function doApply() {
-  state.busy = true; renderPrimary();
+  const busy = acquireBusy();
+  if (busy == null) return;
   setStatus(t("status.working"), "busy", t("detail.installing"));
   // the engine streams phase-1 progress as op-progress events; downloads run in parallel, so
   // ticks for different files interleave. Each file's own bar (keyed by dest in state.fileEls)
@@ -273,11 +447,21 @@ async function doApply() {
         const pct = Math.min(100, (p.bytesDone / p.bytesTotal) * 100);
         if (fill) fill.style.width = pct.toFixed(1) + "%";
         st.className = "fstate dl";
-        st.textContent = `${(p.bytesDone / 1048576).toFixed(1)}/${(p.bytesTotal / 1048576).toFixed(1)} MB`;
+        // localized like every other size string — this was the one hardcoded "MB", sitting four
+        // rows under a status line that says "МБ"
+        st.textContent = t("fstate.dlSize", {
+          done: (p.bytesDone / 1048576).toFixed(1),
+          total: (p.bytesTotal / 1048576).toFixed(1),
+        });
       }
       setStatus(t("status.working"), "busy", t("detail.dl", { i: doneDests.size, n: dlTotal || p.total }));
     });
-    await invoke("apply");
+    // pinned to the release this button is DESCRIBING (state.lastCheck) — same rule as the
+    // launcher self-update: what the button offers is what the button installs. A local (offline)
+    // verdict carries no tag and never offers apply, so null only means "no prior check".
+    const tag = state.lastCheck && !state.lastCheck.local && state.lastCheck.tag
+      ? state.lastCheck.tag : null;
+    await invoke("apply", { tag });
     // no network: apply refreshed the backend's manifest cache from the release it installed
     await doReplan();
   } catch (e) {
@@ -287,12 +471,13 @@ async function doApply() {
     if (state.lastCheck) renderFiles(state.lastCheck);
   } finally {
     if (unlisten) unlisten();
-    state.busy = false; renderPrimary();
+    releaseBusy(busy);
   }
 }
 
 async function doUninstall() {
-  state.busy = true; renderPrimary();
+  const busy = acquireBusy();
+  if (busy == null) return;
   setStatus(t("status.working"), "busy", t("detail.reverting"));
   try {
     await invoke("uninstall");
@@ -302,27 +487,130 @@ async function doUninstall() {
   } catch (e) {
     onError(e);
   } finally {
-    state.busy = false; renderPrimary();
+    releaseBusy(busy);
   }
 }
 
-async function doPlay() {
-  if (state.busy) return;
-  state.busy = true; renderPrimary();
+// ---- launcher self-update ----
+// Errors are swallowed on purpose and reported as a boolean: a failed check means UNKNOWN, and
+// `state.launcherUpdate` keeps whatever it held. Collapsing "couldn't ask" into "nothing to
+// install" is the one mistake that would let a stale launcher through the Play gate.
+async function checkLauncher() {
   try {
+    state.launcherUpdate = await invoke("launcher_check");
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function doLauncherUpdate() {
+  const busy = acquireBusy();
+  if (busy == null) return;
+  setStatus(t("status.working"), "busy", t("detail.launcherDl", { pct: 0 }));
+  let unlisten = null;
+  try {
+    unlisten = await listen("launcher-progress", (ev) => {
+      const p = ev.payload;
+      setStatus(t("status.working"), "busy", p.bytesTotal
+        ? t("detail.launcherDl", { pct: Math.min(100, (p.bytesDone / p.bytesTotal) * 100).toFixed(0) })
+        : t("detail.launcherDlSize", { mb: (p.bytesDone / 1048576).toFixed(1) }));
+    });
+    // pinned to the release the banner is showing — see the command's own note on why
+    // re-resolving "latest" at install time is not the same thing
+    await invoke("launcher_update", { tag: state.launcherUpdate?.tag });
+    // the swap succeeded and the backend is exiting into the new binary — stay busy, since
+    // there is nothing left for this window to do
+    setStatus(t("status.restarting"), "busy", t("detail.restarting"));
+  } catch (e) {
+    if (e && e.kind === "restartFailed") {
+      // The swap DID happen — the new build is already on disk under the launcher's name and
+      // only the relaunch failed. Saying "update failed" would be false and would send the user
+      // round the same loop; clearing the pending update stops the primary re-offering it.
+      state.launcherUpdate = null;
+      setStatus(t("status.restartNeeded"), "update", t("detail.restartNeeded") + " · " + errText(e));
+    } else {
+      // nothing was replaced: apply() verifies before it swaps, and rolls the rename back if the
+      // second one fails. The running launcher is still intact, so hand control back.
+      onError(e);
+    }
+    releaseBusy(busy);
+  } finally {
+    if (unlisten) unlisten();
+  }
+}
+
+// ---- play ----
+// Play is a GATE, not just a launch: a "up to date" verdict from an hour ago must not put an
+// outdated client on a server. Order matters — the launcher is verified FIRST, because a newer
+// release can ship a manifest format this build cannot read, and checking the game first would
+// only dead-end on that (`tooOld`).
+//
+// Being unable to verify is not the same as being outdated. When the checks fail for these
+// reasons we launch anyway and say so in the detail line: Play is only reachable when the last
+// known state was installed and clean, and GitHub being unreachable — or the dist release being
+// pulled/renamed (notFound) — must not make the game unplayable. A check that SUCCEEDS and
+// reports work to do still blocks.
+const SOFT_ERR = new Set(["network", "auth", "notFound"]);
+
+async function doPlay() {
+  const busy = acquireBusy();
+  if (busy == null) return;
+  // a verify said these game files are damaged and the user declined the repair — launching would
+  // start the client the launcher just called broken
+  if (state.gameDamaged) {
+    setStatus(t("status.gvDamaged"), "error", t("gv.playBlocked", { n: state.gameDamaged }));
+    releaseBusy(busy);
+    return;
+  }
+  setStatus(t("status.working"), "busy", t("detail.verifying"));
+  let unverified = null;
+  try {
+    // both verifications in flight AT ONCE (different repos) — Play's latency is the slower of
+    // the two, not their sum, which matters most offline where both are eating a connect
+    // timeout. The launcher verdict still gates FIRST below: a newer release can ship a
+    // manifest format this build cannot read, so the game result must not be acted on before
+    // the launcher one. checkLauncher never rejects (it reports a boolean), so lu.value is safe.
+    const [lu, game] = await Promise.allSettled([checkLauncher(), invoke("check")]);
+    // paint whatever the game check learned — applyCheck sees the fresh launcherUpdate state
+    // (both are settled) and words/arms the UI for it by itself
+    if (game.status === "fulfilled") applyCheck(game.value);
+    if (lu.value !== true) unverified = t("detail.unverified");
+
+    if (state.launcherUpdate) {
+      // verified-outdated launcher: blocked. The game check ran too — one fetch of waste in the
+      // rare blocked case buys the parallel fast path everywhere else.
+      state.primaryMode = "updateLauncher";
+      if (game.status !== "fulfilled") setStatus(...launcherStatusParts());
+      return;
+    }
+
+    if (game.status === "rejected") {
+      const e = game.reason;
+      // tooOld here means the manifest wants a launcher newer than any release we could find —
+      // onError says exactly that, and there is nothing to offer beyond it
+      if (!SOFT_ERR.has(e && e.kind)) { onError(e); return; }
+      unverified = t("detail.unverified");
+    } else if (game.value.changes > 0 || !game.value.installed) {
+      setStatus(t("status.updateRequired"), "update", t("detail.updateRequired"));
+      return;
+    }
+
     await invoke("play");
-    setStatus(t("status.launched"), "ok", t("detail.launched"));
+    setStatus(t("status.launched"), "ok", unverified || t("detail.launched"));
   } catch (e) {
     onError(e);
   } finally {
-    state.busy = false; renderPrimary();
+    releaseBusy(busy);
   }
 }
 
 function onPrimary() {
+  if (stopOp) { fireStop(); return; } // while an op offers a stop, that IS the primary
   if (state.busy) return;
   if (state.primaryMode === "apply") doApply();
   else if (state.primaryMode === "play") doPlay();
+  else if (state.primaryMode === "updateLauncher") doLauncherUpdate();
   else doCheck();
 }
 
@@ -386,6 +674,20 @@ function wireSeg(seg, onPick) {
 }
 
 // ---- settings ----
+// Tabs are pure display: every field stays in the DOM whichever pane is shown, so the snapshot
+// guard and Save keep seeing one whole form.
+function setSettingsTab(name) {
+  state.settingsTab = name;
+  for (const b of $("settings-tabs").querySelectorAll(".tab")) {
+    const on = b.dataset.tab === name;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", String(on));
+  }
+  for (const p of $("settings-panels").querySelectorAll("[data-panel]"))
+    p.classList.toggle("hidden", p.dataset.panel !== name);
+  $("settings-panels").scrollTop = 0; // the panes share one scroller — never inherit an offset
+}
+
 function setSettingsMsg(text) {
   const m = $("settings-msg");
   if (text) { m.textContent = text; m.hidden = false; } else { m.hidden = true; }
@@ -477,6 +779,7 @@ async function openSettings() {
   setSeg($("seg-lang"), LANG);
   $("advanced").classList.toggle("hidden", !SHOW_ADVANCED);
   $("advanced").open = false;
+  setSettingsTab(state.settingsTab);
   setSettingsMsg(null);
   state.settingsLoaded = { repo: s.sourceRepo || "", game: s.gameDir || "" };
   state.settingsSnap = settingsSnapshot();
@@ -498,10 +801,15 @@ async function saveSettings() {
     // a save that changes where updates come from (folder, repo, credentials) makes every bit
     // of the shown state stale — the status, the file list, and above all Play, which would
     // launch the NEW folder while the UI still describes the old one. Invalidate and re-check.
+    const dirChanged = $("in-game").value.trim() !== state.settingsLoaded.game.trim();
     const invalidates =
-      $("in-game").value.trim() !== state.settingsLoaded.game.trim() ||
+      dirChanged ||
       $("in-repo").value.trim() !== state.settingsLoaded.repo.trim() ||
       $("in-token").value !== "" || state.tokenClear;
+    // the damaged-files verdict describes ONE folder — pointing at another must release it (a
+    // repo/token change keeps it: same folder, same files). The old verdict otherwise blocked
+    // Play forever, counting files in a folder the launcher no longer even looks at.
+    if (dirChanged) state.gameDamaged = 0;
     if ($("in-token").value) state.hasToken = true;
     if (state.tokenClear) state.hasToken = false;
     state.tokenClear = false;
@@ -525,6 +833,8 @@ async function saveSettings() {
 
 // Back/Escape out of settings: same protection the autoexec editor has — unsaved edits ask
 // before being dropped.
+/// Leave settings, asking first if the form is dirty. Returns false when the user kept editing —
+/// callers that do something AFTER closing (Verify, which runs on main) must not proceed then.
 async function maybeCloseSettings() {
   if (state.settingsSnap !== null && settingsSnapshot() !== state.settingsSnap) {
     const ok = await confirmDialog({
@@ -532,16 +842,19 @@ async function maybeCloseSettings() {
       text: t("cf.discardSettingsText"),
       confirm: t("cf.discardConfirm"),
     });
-    if (!ok) return;
+    if (!ok) return false;
   }
   state.tokenClear = false;
   state.settingsSnap = null;
   showView("main");
+  return true;
 }
 
+// Locating an EXISTING install. The title says so — the same picker also serves "where should the
+// download go", where "the folder that contains game\" would be a lie.
 async function browseInto(input) {
   try {
-    const dir = await invoke("browse_folder");
+    const dir = await invoke("browse_folder", { title: t("dlg.pickGame"), start: input.value });
     if (dir) input.value = dir;
   } catch (e) {
     setSettingsMsg(errText(e));
@@ -558,10 +871,22 @@ async function adoptGameDir(path) {
   try {
     await invoke("set_game_dir", { path });
   } catch (e) {
-    setSetupMsg(errText(e));
+    // If the autofind modal is up (this is reached from its "Use" buttons), the setup view's
+    // plate is BEHIND it — writing there made a failed pick look like a dead button. The modal
+    // has its own plate for exactly this.
+    if (!$("af-modal").classList.contains("hidden")) {
+      const m = $("af-msg");
+      m.textContent = errText(e);
+      m.classList.remove("hidden");
+    } else {
+      setSetupMsg(errText(e));
+    }
     return;
   }
   closeAutofind();
+  // a different folder: whatever a verify said about the OLD one no longer describes anything
+  // this UI points at — without this, "N files damaged" from folder A blocked Play in folder B
+  state.gameDamaged = 0;
   showView("main");
   setIdleStatus();
   doCheck();
@@ -569,7 +894,7 @@ async function adoptGameDir(path) {
 
 async function setupBrowse() {
   try {
-    const dir = await invoke("browse_folder");
+    const dir = await invoke("browse_folder", { title: t("dlg.pickGame") });
     if (dir) adoptGameDir(dir); // any folder is accepted
   } catch (e) {
     setSetupMsg(errText(e));
@@ -577,6 +902,8 @@ async function setupBrowse() {
 }
 
 // ---- autofind ----
+let afSeq = 0; // drops a cancelled scan's results when the dialog was reopened meanwhile
+
 function afStage(stage) {
   for (const s of ["af-warn", "af-run", "af-results"]) $(s).classList.toggle("hidden", s !== "af-" + stage);
 }
@@ -593,8 +920,17 @@ function closeAutofind() {
 }
 
 async function runAutofind() {
-  if (state.afBusy) return; // a scan invoke is already in flight
+  // A cancelled scan keeps running until the backend's walk notices the flag, so the dialog can
+  // be reopened while one is still in flight. Showing the RUN stage (rather than returning with
+  // no feedback, which read as a dead Continue button) both explains the wait and lets the
+  // sequence check below decide whose results the dialog gets.
+  if (state.afBusy) {
+    afStage("run");
+    $("af-count").textContent = t("af.scanning");
+    return;
+  }
   state.afBusy = true;
+  const seq = ++afSeq;
   afStage("run");
   $("af-count").textContent = t("af.scanning");
   $("af-current").textContent = "";
@@ -616,6 +952,9 @@ async function runAutofind() {
   // the modal was closed mid-scan (Escape) — discard the results instead of staging them
   // under a hidden modal
   if ($("af-modal").classList.contains("hidden")) return;
+  // ...and a scan the user cancelled must not take over a dialog that has since been reopened:
+  // its partial results would appear as if the new run had produced them
+  if (seq !== afSeq) return;
   renderCandidates(found || []);
   // a failed scan says WHY instead of masquerading as "Nothing found"
   const msg = $("af-msg");
@@ -665,12 +1004,297 @@ function cancelAutofind() {
   // runAutofind(). (Escape cancels AND closes вЂ” runAutofind then discards the results.)
 }
 
+// ---- base game: fresh download / verify / repair ----
+// One modal serves download and repair — both are the same backend pipeline (plan-diff, then
+// fetch what's missing), so the UI difference is only the title and whether a confirm step runs.
+// Progress is ONE aggregate bar: the payload is gigabytes across hundreds of files, and per-file
+// rows at that scale are noise, not information.
+const GB = 1024 * 1024 * 1024;
+const gd = {
+  mode: null,      // "install" | "repair"
+  origin: null,    // "setup" | "settings" — where to land after a successful install
+  dir: null,
+  bytes: 0,        // planned unique download bytes (the bar's full extent)
+  files: 0,        // planned file count
+  perFile: null,   // Map dest -> bytesDone (ticks fan out per dest; clamp the sum to `bytes`)
+  sum: 0,          // running total of perFile's values, maintained by delta (never re-summed)
+  doneFiles: 0,
+  unlisten: null,
+};
+
+function gdStage(stage) {
+  for (const s of ["gd-plan", "gd-confirm", "gd-run", "gd-err"])
+    $(s).classList.toggle("hidden", s !== "gd-" + stage);
+}
+
+function gdClose() {
+  // Closing during the PLAN stage has to stop the plan: it hashes an existing install for minutes,
+  // and it used to keep reading the disk flat out after the dialog was gone, for a number nobody
+  // would ever see. The run stage cancels through its own Stop button instead, and the closes that
+  // follow a finished op find this stage hidden — so nothing else is touched.
+  if (!$("gd-plan").classList.contains("hidden")) invoke("game_cancel").catch(() => {});
+  $("gd-modal").classList.add("hidden");
+  if (gd.unlisten) { gd.unlisten(); gd.unlisten = null; }
+}
+
+// Fresh download: pick a DESTINATION, plan against it, confirm the numbers, run.
+// The picker always runs — the download never silently reuses the configured game folder — and the
+// files land directly in whatever is picked (no subfolder is invented), which is why the title and
+// the confirm line both name the exact path. `game_install` then adopts that folder as the game
+// dir backend-side, so a fresh download ends pointed at itself.
+async function startGameDownload(origin) {
+  if (state.busy) return;
+  let dir = null;
+  try {
+    dir = await invoke("browse_folder", { title: t("dlg.pickTarget") });
+  } catch (e) { /* dialog failed — stay put */ }
+  if (!dir) return;
+  gd.mode = "install";
+  gd.origin = origin;
+  gd.dir = dir;
+  $("gd-title").textContent = t("gd.title");
+  $("gd-modal").classList.remove("hidden");
+  gdStage("plan");
+  $("gd-plan-line").textContent = t("gd.planning");
+  $("gd-plan-sub").textContent = "";
+  let plan;
+  // planning an empty folder is instant, but a folder that already holds a game gets hashed —
+  // minutes of work that must not look like a hung spinner
+  let planUnlisten = null;
+  try {
+    planUnlisten = await listen("op-progress", (ev) => {
+      const p = ev.payload;
+      if (p.op !== "plan") return;
+      $("gd-plan-line").textContent = t("gd.checking", { i: p.current, n: p.total });
+      $("gd-plan-sub").textContent = p.item || "";
+    });
+    plan = await invoke("game_plan", { target: dir });
+  } catch (e) {
+    if (e && e.kind === "cancelled") return;                // gdClose asked for it — no error theater
+    if ($("gd-modal").classList.contains("hidden")) return; // Escaped while planning
+    $("gd-err-msg").textContent = errText(e);
+    $("btn-gd-retry").classList.add("hidden"); // nothing started — reopening re-plans anyway
+    gdStage("err");
+    return;
+  } finally {
+    // released on every path, including the early returns above — otherwise each reopen of the
+    // dialog would stack another live listener
+    if (planUnlisten) planUnlisten();
+  }
+  if ($("gd-modal").classList.contains("hidden")) return;
+  gd.bytes = plan.bytes;
+  gd.files = plan.files;
+  $("gd-summary").textContent = t("gd.confirm", {
+    gb: (plan.bytes / GB).toFixed(1), n: plan.files, dir,
+  });
+  // refuse up front what the backend would refuse a click later — same margin (512 MB)
+  const short = plan.freeBytes != null && plan.freeBytes < plan.bytes + 512 * 1024 * 1024;
+  $("gd-space").hidden = !short;
+  if (short) {
+    $("gd-space").textContent = t("gd.noSpace", {
+      need: (plan.bytes / GB).toFixed(1), free: (plan.freeBytes / GB).toFixed(1),
+    });
+  }
+  $("btn-gd-go").disabled = short;
+  gdStage("confirm");
+}
+
+// Repair: verify already confirmed via dialog — straight to the run stage.
+async function startGameRepair(v) {
+  gd.mode = "repair";
+  gd.origin = null;
+  gd.bytes = v.damagedBytes;
+  gd.files = v.damaged.length;
+  $("gd-title").textContent = t("gd.repairTitle");
+  $("gd-modal").classList.remove("hidden");
+  gdRun();
+}
+
+function onGdProgress(ev) {
+  const p = ev.payload;
+  if (p.op === "game") {
+    if (p.bytesTotal == null) {
+      // plan/hash phase: no bytes, just the file counter
+      $("gd-line1").textContent = t("gd.checking", { i: p.current, n: p.total });
+      $("gd-line2").textContent = p.item || "";
+    } else {
+      // running total, updated by DELTA. Re-summing the map per tick was O(files) inside an
+      // O(ticks) stream — ~60k ticks against a map growing to 4,635 entries is a few hundred
+      // million iterations of pure waste on the UI thread during the download.
+      gd.sum += p.bytesDone - (gd.perFile.get(p.item) || 0);
+      gd.perFile.set(p.item, p.bytesDone);
+      if (p.done) gd.doneFiles = Math.min(gd.files, gd.doneFiles + 1);
+      const sum = Math.min(gd.sum, gd.bytes); // shared-content dests double-tick; the bar must not
+      const pct = gd.bytes ? (sum / gd.bytes) * 100 : 100;
+      $("gd-fill").style.width = pct.toFixed(1) + "%";
+      $("gd-line1").textContent = t("gd.dl", {
+        done: (sum / GB).toFixed(2), total: (gd.bytes / GB).toFixed(2),
+        i: gd.doneFiles, n: gd.files,
+      });
+      $("gd-line2").textContent = p.item || "";
+    }
+  } else if (p.op === "install") {
+    // the chained shim install after a fresh download — small, so one settled bar + a line
+    $("gd-fill").style.width = "100%";
+    $("gd-line1").textContent = t("gd.shim");
+    $("gd-line2").textContent = p.item || "";
+  }
+}
+
+async function gdRun() {
+  // guarded like every other mutating flow — this one had no check at all, so a second entry
+  // (the modal's Resume button, a re-fired click) could run two game installs at once
+  const busy = acquireBusy();
+  if (busy == null) return;
+  gdStage("run");
+  gd.perFile = new Map();
+  gd.sum = 0;      // running byte total; reset with the map or a resumed run inherits it
+  gd.doneFiles = 0;
+  $("gd-fill").style.width = "0%";
+  $("gd-line1").textContent = t("gd.starting");
+  $("gd-line2").textContent = "";
+  if (gd.unlisten) { gd.unlisten(); gd.unlisten = null; }
+  gd.unlisten = await listen("op-progress", onGdProgress);
+  let result = null;
+  try {
+    result = gd.mode === "repair"
+      ? await invoke("game_repair")
+      : await invoke("game_install", { target: gd.dir });
+  } catch (e) {
+    releaseBusy(busy);
+    if (e && e.kind === "cancelled") {
+      gdClose(); // the user asked for the stop — no error theater; reopening resumes
+      return;
+    }
+    if (gd.unlisten) { gd.unlisten(); gd.unlisten = null; }
+    $("gd-err-msg").textContent = errText(e);
+    // a mid-download failure is resumable by construction — offer that instead of a dead end
+    $("btn-gd-retry").classList.remove("hidden");
+    gdStage("err");
+    return;
+  }
+  releaseBusy(busy);
+  gdClose();
+  if (gd.mode === "repair") {
+    state.gameDamaged = 0;
+    renderPrimary();
+    setStatus(t("status.gvOk"), "ok", t("gv.repaired", { n: result.written }));
+    return;
+  }
+  // fresh install: the folder is the game dir now (backend adopted it before the shim chain) —
+  // and a damaged-verdict from some OTHER folder must not keep blocking Play against bytes that
+  // were just written pristine
+  state.gameDamaged = 0;
+  if (gd.origin === "settings") {
+    // keep the settings form honest — a later Save must not overwrite the new game dir with
+    // the stale input value
+    $("in-game").value = gd.dir;
+    if (state.settingsLoaded) state.settingsLoaded.game = gd.dir;
+    // the snapshot is a STRING (settingsSnapshot serializes) — re-take it, don't try to poke a
+    // field into it, or the folder we just wrote would read as an unsaved edit
+    if (state.settingsSnap !== null) state.settingsSnap = settingsSnapshot();
+  }
+  showView("main");
+  $("view-main").classList.add("revealed");
+  doCheck();
+}
+
+// ---- verify game files ----
+async function doGameVerify() {
+  const busy = acquireBusy();
+  if (busy == null) return;
+  setStatus(t("status.working"), "busy", t("gv.start"));
+  // Reading a whole install is minutes of work that writes nothing — the one op where quitting
+  // costs the user nothing but the hashing already done (and the memo keeps even that).
+  offerStop(() => {
+    // the hash workers stop BETWEEN files, so a multi-GB VPK in flight still has to finish; say
+    // that rather than leaving a dead button over an unchanged line
+    setStatus(t("status.working"), "busy", t("gv.stopping"));
+    invoke("game_cancel").catch(() => {});
+  });
+  let unlisten = null;
+  let damagedResult = null;
+  try {
+    unlisten = await listen("op-progress", (ev) => {
+      const p = ev.payload;
+      if (p.op !== "verify" || stopAsked) return; // ticks in flight must not repaint "Stopping…"
+      setStatus(t("status.working"), "busy", t("gv.progress", { i: p.current, n: p.total }));
+    });
+    const r = await invoke("game_verify");
+    if (r.damaged.length === 0) {
+      // its own word, NOT "Up to date": that one describes the Phoenix files, and the list right
+      // below still shows whatever the shim's own state is. Two different subjects were sharing
+      // one status line, so "Up to date" could sit above "2 to change".
+      state.gameDamaged = 0; // the files are provably fine — clear any earlier declined repair
+      setStatus(t("status.gvOk"), "ok", t("gv.ok", { n: r.ok, version: r.version }));
+    } else if (r.foreignBuild) {
+      // NOT damage: this folder holds a different build, so a "repair" would overwrite a working
+      // unrelated install. Repairing is still allowed — it is the user's folder, and the project
+      // does not gate on build elsewhere either — but it is named for what it is, in the error
+      // colour, and the confirm below spells out the consequence instead of saying "repair".
+      // This verdict SUPERSEDES an older damaged one: the verify just concluded nothing here is
+      // broken, so a damaged count from a previous run must not keep blocking Play.
+      state.gameDamaged = 0;
+      setStatus(t("status.gvForeign"), "error", t("gv.foreign", { version: r.version }));
+      damagedResult = r;
+    } else {
+      setStatus(t("status.gvDamaged"), "update", t("gv.damaged", { n: r.damaged.length, total: r.total }));
+      damagedResult = r;
+    }
+  } catch (e) {
+    // The user asked for this stop, so it is not an error — but it is not a verdict either. The
+    // neutral colour and its own wording keep it from reading as "checked, all fine": the files
+    // nobody got to are exactly the ones this run can say nothing about. An earlier declined
+    // repair still stands (`state.gameDamaged` is untouched), so Play stays blocked if it was.
+    if (e && e.kind === "cancelled") setStatus(t("status.gvStopped"), "idle", t("gv.stopped"));
+    else onError(e);
+  } finally {
+    // unlisten BEFORE clearing the latch: a tick emitted just before the workers joined can still
+    // be in flight, and it would land on the "Stopped" line as "Verifying 1342/4635" — a dead
+    // progress line under a finished op. While the listener lives, `stopAsked` is what holds it.
+    if (unlisten) unlisten();
+    clearStop();
+    releaseBusy(busy);
+  }
+  if (damagedResult) {
+    // a foreign build is not a repair — it is an overwrite of a working installation, so the
+    // dialog says so and its confirm button is worded as the destructive act it is
+    const foreign = damagedResult.foreignBuild;
+    const ok = await confirmDialog({
+      title: foreign ? t("cf.foreignTitle") : t("cf.repairTitle"),
+      text: foreign
+        ? t("cf.foreignText", { n: damagedResult.damaged.length, version: damagedResult.version })
+        : t("cf.repairText", { n: damagedResult.damaged.length }),
+      confirm: foreign ? t("cf.foreignConfirm") : t("btn.repair"),
+      danger: foreign, // a repair restores; an overwrite destroys a working install
+    });
+    if (ok) {
+      startGameRepair(damagedResult);
+    } else if (!foreign) {
+      // Declining leaves the game files damaged. Remember it: Play must not go on offering to
+      // launch a client this very check just reported as broken, and the status line has to keep
+      // saying so rather than being quietly replaced by the shim's verdict.
+      state.gameDamaged = damagedResult.damaged.length;
+      renderPrimary();
+    }
+    // Declining the FOREIGN overwrite is different: verify's own verdict is that nothing is
+    // damaged — the folder holds another build, and the whole point of the distinction is that
+    // it works. Blocking Play here painted a working install as broken with no way out short of
+    // overwriting it (re-verifying re-armed the flag every time). No install gate: the status
+    // line keeps saying "different build", and launching it stays the user's call.
+  }
+}
+
 // ---- confirm modal (destructive actions: uninstall, discard autoexec changes) ----
 let cfResolve = null;
-function confirmDialog({ title, text, confirm }) {
+// `danger` paints the confirm terracotta instead of gold — reserved for the two irreversible
+// acts (uninstall, overwriting a foreign build). Kept rare on purpose: a red button that shows up
+// for "discard my edits" stops meaning anything.
+function confirmDialog({ title, text, confirm, danger }) {
   $("cf-title").textContent = title;
   $("cf-text").textContent = text;
   $("btn-cf-ok").textContent = confirm;
+  $("btn-cf-ok").classList.toggle("danger", !!danger);
   $("cf-modal").classList.remove("hidden");
   $("btn-cf-ok").focus(); // keyboard path: Enter confirms, Escape cancels, Tab reaches Cancel
   return new Promise((resolve) => { cfResolve = resolve; });
@@ -688,15 +1312,26 @@ function settleConfirm(v) {
 // selection persists + the diff refreshes in the background, serialized on one promise chain.
 let selChain = Promise.resolve();
 
-function queueSelection(id, value) {
+// `revert` puts the control back the way it was: the flip is optimistic, so a failure that only
+// logged left the switch reading "on" for a selection that was never saved — and the next install
+// would quietly ship the old variant. The message goes to the OPTIONS view's own plate; onError
+// paints the main view, which is hidden while this one is up.
+function queueSelection(id, value, revert) {
   selChain = selChain.then(async () => {
     try {
       await invoke("set_selection", { id, value });
+      setOptsMsg(null);
       await doReplan(); // cached manifest, no network
     } catch (e) {
-      onError(e);
+      revert?.();
+      setOptsMsg(errText(e));
     }
   });
+}
+
+function setOptsMsg(text) {
+  const m = $("opts-msg");
+  if (text) { m.textContent = text; m.hidden = false; } else { m.hidden = true; }
 }
 
 function renderOptions() {
@@ -720,10 +1355,15 @@ function renderOptions() {
       sw.setAttribute("aria-checked", String(o.value === true));
       sw.addEventListener("click", () => {
         if (state.busy) return;
-        o.value = !(o.value === true);
+        const was = o.value === true;
+        o.value = !was;
         sw.classList.toggle("on", o.value);
         sw.setAttribute("aria-checked", String(o.value));
-        queueSelection(o.id, o.value);
+        queueSelection(o.id, o.value, () => {
+          o.value = was;
+          sw.classList.toggle("on", was);
+          sw.setAttribute("aria-checked", String(was));
+        });
       });
       head.append(sw);
     }
@@ -749,9 +1389,15 @@ function renderOptions() {
         row.append(dot, lb);
         row.addEventListener("click", () => {
           if (state.busy || o.value === v.id) return;
+          const was = o.value;
           o.value = v.id;
           for (const r of list.children) r.classList.toggle("active", r === row);
-          queueSelection(o.id, v.id);
+          queueSelection(o.id, v.id, () => {
+            o.value = was;
+            for (const [i, r] of [...list.children].entries()) {
+              r.classList.toggle("active", o.variants[i]?.id === was);
+            }
+          });
         });
         list.append(row);
       }
@@ -907,14 +1553,25 @@ async function openWhatsNew() {
 // ---- wire ----
 $("btn-primary").addEventListener("click", onPrimary);
 $("btn-check").addEventListener("click", () => !state.busy && doCheck());
+// Uninstall lives in settings' game-files tab but reports through the status line on MAIN, so it
+// leaves settings first — same guard Verify uses. Order differs on purpose: the destructive
+// confirm comes BEFORE the unsaved-changes guard, so backing out of the confirm leaves the user
+// exactly where they were instead of dumping them on main.
 $("btn-uninstall").addEventListener("click", async () => {
   if (state.busy) return;
   const ok = await confirmDialog({
     title: t("cf.uninstallTitle"),
     text: t("cf.uninstallText"),
     confirm: t("cf.uninstallConfirm"),
+    danger: true,
   });
-  if (ok) doUninstall();
+  if (!ok) return;
+  if (currentView() === "settings" && !(await maybeCloseSettings())) return;
+  doUninstall();
+});
+$("settings-tabs").addEventListener("click", (e) => {
+  const b = e.target.closest(".tab");
+  if (b) setSettingsTab(b.dataset.tab);
 });
 $("btn-settings").addEventListener("click", () => !state.busy && openSettings());
 $("btn-whatsnew").addEventListener("click", () => !state.busy && openWhatsNew());
@@ -934,6 +1591,28 @@ $("btn-token-clear").addEventListener("click", () => {
 $("btn-autofind").addEventListener("click", () => openAutofind("settings"));
 $("btn-setup-browse").addEventListener("click", setupBrowse);
 $("btn-setup-autofind").addEventListener("click", () => openAutofind("setup"));
+$("btn-setup-download").addEventListener("click", () => startGameDownload("setup"));
+
+// ---- game download / repair modal ----
+// Like Verify and Uninstall, this ends on main (gdRun's success path calls showView) — so it goes
+// through the same unsaved-changes guard first. Without it a successful download silently threw
+// away edits made in another settings tab.
+$("btn-fresh").addEventListener("click", async () => {
+  if (currentView() === "settings" && !(await maybeCloseSettings())) return;
+  startGameDownload("settings");
+});
+// Verify reports through the status line, which lives on MAIN — so leave settings first (through
+// the same unsaved-changes guard as Back) rather than running a minute-long scan the user can't
+// see. A cancelled guard means the user chose to keep editing: don't start the scan either.
+$("btn-verify").addEventListener("click", async () => {
+  if (currentView() === "settings" && !(await maybeCloseSettings())) return;
+  doGameVerify();
+});
+$("btn-gd-go").addEventListener("click", () => gdRun());
+$("btn-gd-close").addEventListener("click", () => gdClose());
+$("btn-gd-err-close").addEventListener("click", () => gdClose());
+$("btn-gd-retry").addEventListener("click", () => gdRun()); // resumes: done files skip, .parts continue
+$("btn-gd-cancel").addEventListener("click", () => invoke("game_cancel").catch(() => {}));
 $("btn-af-go").addEventListener("click", runAutofind);
 $("btn-af-close").addEventListener("click", closeAutofind);
 $("btn-af-cancel").addEventListener("click", cancelAutofind);
@@ -946,26 +1625,66 @@ $("btn-cf-cancel").addEventListener("click", () => settleConfirm(false));
 wireSeg($("seg-lang"), (l) => switchLang(l));
 wireSeg($("seg-renderer"));
 
+// Watch the modals' own class rather than calling syncModalLayer from all seven open/close
+// sites — this cannot be forgotten when a new dialog is added.
+const modalObserver = new MutationObserver(syncModalLayer);
+for (const m of document.querySelectorAll(".modal")) {
+  modalObserver.observe(m, { attributes: true, attributeFilter: ["class"] });
+}
+
+// The WebView2 default context menu (Back / Reload / Save as / Print) is a browser artifact: none
+// of it means anything here, and half of it would break the illusion that this is an app. Editable
+// fields keep theirs — it is the only mouse route to Paste, and a GitHub token is exactly the kind
+// of string nobody types by hand. Read-only ones (the autoexec editor after a lossy decode) keep it
+// too, so Copy still works there.
+document.addEventListener("contextmenu", (e) => {
+  const tag = e.target && e.target.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || (e.target && e.target.isContentEditable)) return;
+  e.preventDefault();
+});
+
 // Escape backs out (topmost layer first); Enter in settings commits the save. The confirm
 // modal owns the keyboard while open: Enter = confirm (or cancel, if Cancel is focused),
 // Escape = cancel, everything else stays inside it.
 document.addEventListener("keydown", (e) => {
+  // A modal owns the keyboard. Without this the Enter-commits-settings branch below fired while
+  // the autofind or download dialog was up — settings saved and closed BEHIND the dialog, and an
+  // autofind result the user had waited minutes for was then written into a form nobody was
+  // looking at and discarded on the next open.
+  const modal = openModal();
+  if (modal && modal !== $("cf-modal")) {
+    if (e.key !== "Escape") return;
+  }
   if (!$("cf-modal").classList.contains("hidden")) {
     if (e.key === "Escape") settleConfirm(false);
     else if (e.key === "Enter") { e.preventDefault(); settleConfirm(e.target !== $("btn-cf-cancel")); }
     return;
   }
   if (e.key === "Escape") {
+    if (!$("gd-modal").classList.contains("hidden")) {
+      // mid-download: Escape asks the backend to stop (typed cancel closes the modal quietly);
+      // any other stage just closes
+      if (!$("gd-run").classList.contains("hidden")) invoke("game_cancel").catch(() => {});
+      else gdClose();
+      return;
+    }
     if (!$("af-modal").classList.contains("hidden")) {
       if (!$("af-run").classList.contains("hidden")) cancelAutofind();
       closeAutofind();
       return;
     }
     const v = currentView();
-    if (v === "autoexec") { e.preventDefault(); maybeCloseAutoexec(); }
+    // main's running op backs out the same way a dialog does — the Stop button is the visible
+    // route, Escape is the one a keyboard reaches for first
+    if (v === "main" && stopOp) { e.preventDefault(); fireStop(); }
+    else if (v === "autoexec") { e.preventDefault(); maybeCloseAutoexec(); }
     else if (v === "settings") { e.preventDefault(); maybeCloseSettings(); }
     else if (v === "whatsnew" || v === "options") { e.preventDefault(); showView("main"); }
-  } else if (e.key === "Enter" && currentView() === "settings" && !state.busy && e.target.tagName !== "TEXTAREA") {
+  } else if (e.key === "Enter" && currentView() === "settings" && !state.busy
+             && e.target.tagName !== "TEXTAREA" && e.target.tagName !== "BUTTON") {
+    // Enter commits the form from a FIELD. A focused button already means Enter, and swallowing
+    // it here would make a keyboard user's Enter on a tab (or Browse, or Uninstall) silently
+    // save-and-close instead of doing the thing they were pointing at.
     e.preventDefault(); saveSettings();
   }
 });
@@ -994,13 +1713,16 @@ $("ae-text").addEventListener("scroll", () => {
   hl.scrollLeft = ta.scrollLeft;
 });
 
-// changelog links open in the default browser (webview must not navigate away)
-$("notes-body").addEventListener("click", (e) => {
-  const a = e.target.closest("a[data-url]");
-  if (!a) return;
-  e.preventDefault();
-  invoke("open_url", { url: a.dataset.url }).catch(() => {});
-});
+// changelog links open in the default browser (webview must not navigate away); the launcher
+// update banner renders the same markdown, so its links route the same way
+for (const id of ["notes-body", "lu-notes"]) {
+  $(id).addEventListener("click", (e) => {
+    const a = e.target.closest("a[data-url]");
+    if (!a) return;
+    e.preventDefault();
+    invoke("open_url", { url: a.dataset.url }).catch(() => {});
+  });
+}
 
 // ---- boot ----
 async function boot() {
@@ -1008,6 +1730,12 @@ async function boot() {
   try { settings = await invoke("get_settings"); } catch (e) { /* defaults below */ }
   setLang(settings?.language || detectLang());
   state.hasToken = settings?.hasToken || false;
+  try {
+    const info = await invoke("launcher_info");
+    state.launcherVersion = info.version;
+    // set by the self-update that spawned us; applyCheck shows it once on the next check
+    state.justUpdated = info.justUpdated;
+  } catch (e) { /* cosmetic only — never worth failing boot over */ }
   applyStatic();
   setIdleStatus();
   renderPrimary();

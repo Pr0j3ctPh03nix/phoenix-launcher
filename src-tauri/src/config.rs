@@ -14,6 +14,17 @@ const SETTINGS_VERSION: u32 = 1;
 /// the frontend, so for now this is effectively fixed).
 pub const DEFAULT_REPO: &str = "Pr0j3ctPh03nix/client-dist-staging";
 
+/// Where the launcher updates ITSELF from — this repo's own Releases, which publish the portable
+/// `phoenix-launcher.exe`. Meant to be public; see `Settings::launcher_repo` for how it is
+/// authenticated while it is not.
+pub const DEFAULT_LAUNCHER_REPO: &str = "Pr0j3ctPh03nix/phoenix-launcher";
+
+/// The base-game distribution: a release whose assets are the vanilla Dota 2 (build 1805) files
+/// themselves, described by a manifest in the SAME format as the shim's. Fresh installs, "Verify
+/// game files" and repair all run against it. Public by design — game downloads are gigabytes and
+/// must ride the tokenless `browser_download_url` path (free CDN bandwidth, no API rate budget).
+pub const DEFAULT_GAME_REPO: &str = "Pr0j3ctPh03nix/game-dist";
+
 /// Read-only token for the private staging repo, injected at BUILD time:
 ///     PHOENIX_BAKED_TOKEN=github_pat_... bun run tauri build
 /// Deliberately not a source literal — a committed github_pat_ gets blocked/revoked by GitHub
@@ -30,6 +41,15 @@ pub struct Settings {
     /// `owner/name` of the dist repo whose Releases we install from.
     #[serde(default = "default_repo")]
     pub source_repo: String,
+    /// `owner/name` of the repo the launcher self-updates from. None = `DEFAULT_LAUNCHER_REPO`.
+    /// An Option (not a defaulted String) so an absent key keeps tracking the baked default
+    /// instead of pinning whatever repo was current when the file was first written.
+    #[serde(default)]
+    pub launcher_repo: Option<String>,
+    /// `owner/name` of the base-game distribution repo. None = `DEFAULT_GAME_REPO` (same Option
+    /// rationale as `launcher_repo`).
+    #[serde(default)]
+    pub game_repo: Option<String>,
     /// Folder that CONTAINS `game/`. None = resolve to the updater exe's own directory.
     #[serde(default)]
     pub game_dir: Option<PathBuf>,
@@ -71,6 +91,8 @@ impl Default for Settings {
         Self {
             version: SETTINGS_VERSION,
             source_repo: default_repo(),
+            launcher_repo: None,
+            game_repo: None,
             game_dir: None,
             token: None,
             language: None,
@@ -111,6 +133,29 @@ impl Settings {
         }
     }
 
+    /// `load` behind an mtime memo, for POLLING callers only (today: the 3-second game_running
+    /// poll — a bare `load` there was 1,200 disk reads + JSON parses an hour, forever, for a
+    /// value that changes only on a settings save). One stat per call; the file is re-read only
+    /// when its mtime moved, which every save does (temp + rename writes a new file). One-shot
+    /// commands keep calling `load` — strict reads are the default, the memo is the exception.
+    pub fn load_cached() -> Self {
+        static CACHE: Mutex<Option<(std::time::SystemTime, Settings)>> = Mutex::new(None);
+        let Some(p) = Self::config_path() else { return Self::default() };
+        // no file (or unreadable): nothing worth memoizing — load() is one failed read anyway
+        let Ok(mtime) = std::fs::metadata(&p).and_then(|m| m.modified()) else {
+            return Self::load();
+        };
+        let mut guard = CACHE.lock().unwrap();
+        if let Some((t, s)) = guard.as_ref() {
+            if *t == mtime {
+                return s.clone();
+            }
+        }
+        let s = Self::load();
+        *guard = Some((mtime, s.clone()));
+        s
+    }
+
     /// Load → mutate → save, serialized process-wide so concurrent writers (today: commands;
     /// later: background tasks) can't lose each other's changes.
     pub fn update(mutate: impl FnOnce(&mut Self)) -> Result<()> {
@@ -124,6 +169,25 @@ impl Settings {
     /// The token to authenticate with: a user-saved token wins, else the build-time baked one.
     pub fn token(&self) -> Option<&str> {
         self.token.as_deref().or(BAKED_TOKEN)
+    }
+
+    /// The repo the launcher self-updates from. No token FIELD of its own: this repo is meant to
+    /// be public and anonymous GitHub allows 60 requests/hour per IP, which is plenty for one
+    /// check per launch.
+    ///
+    /// It is not, however, "never authenticated" — `open_repo` tries anonymously and retries with
+    /// `Settings::token()` (the dist PAT) if and only if the anonymous attempt was REFUSED by the
+    /// server. That is what keeps self-update working while this repo is still private. The
+    /// header only ever reaches api.github.com and is stripped on redirect, so the retry costs
+    /// nothing but a possible 403 where anonymous would have worked — which is why it is a retry
+    /// and not the first attempt.
+    pub fn launcher_repo(&self) -> &str {
+        self.launcher_repo.as_deref().unwrap_or(DEFAULT_LAUNCHER_REPO)
+    }
+
+    /// The base-game distribution repo (fresh install / verify / repair source).
+    pub fn game_repo(&self) -> &str {
+        self.game_repo.as_deref().unwrap_or(DEFAULT_GAME_REPO)
     }
 
     pub fn save(&self) -> Result<()> {

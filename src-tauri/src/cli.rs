@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 use crate::config::Settings;
+use crate::downloader::Downloader as _;
 use crate::engine::{self, Action};
 use crate::github::Github;
 use crate::install;
@@ -22,6 +23,7 @@ fn settings_from_flags(flags: &[String]) -> (Settings, Option<String>) {
                     s.source_repo = v.clone();
                 }
             }
+            "--game-repo" => s.game_repo = it.next().cloned(),
             "--token" => s.token = it.next().cloned(),
             "--tag" => tag = it.next().cloned(),
             _ => {}
@@ -53,7 +55,7 @@ pub fn run_check(flags: &[String]) -> Result<()> {
 pub fn run_install(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
     let dl = Github::new(settings.token());
-    let r = install::install(&settings, &dl, tag.as_deref(), None)?;
+    let r = install::install(&settings, &dl, tag.as_deref(), None, None)?;
     println!("Installed {}: wrote {}, removed {}", r.version, r.written.len(), r.removed.len());
     // headless: warm the customization cache synchronously (the GUI runs this detached)
     install::warm_cache(&settings, &dl);
@@ -64,5 +66,57 @@ pub fn run_uninstall(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let r = install::uninstall(&settings)?;
     println!("Uninstalled {}: restored {}, deleted {}", r.version, r.restored.len(), r.deleted.len());
+    Ok(())
+}
+
+// ---- base game (game-install / game-verify against Settings::game_repo) ----
+
+fn game_repo_manifest(
+    settings: &Settings,
+) -> Result<(Github, crate::downloader::Release, crate::manifest::Manifest)> {
+    // headless keeps auth simple: the game repo is public by design, and the CLI's token flag /
+    // env var is available for testing against a private one
+    let dl = Github::new(settings.token());
+    let release = dl.fetch_release(settings.game_repo(), None)?;
+    let manifest = engine::manifest_of(&dl, &release)?;
+    // file assets are sharded across prereleases (GitHub caps 1000 assets per release)
+    let release = engine::merged_game_release(&dl, settings.game_repo(), release)?;
+    Ok((dl, release, manifest))
+}
+
+pub fn run_game_install(flags: &[String]) -> Result<()> {
+    let (settings, _tag) = settings_from_flags(flags);
+    let game_dir = settings.resolve_game_dir()?;
+    let (dl, release, manifest) = game_repo_manifest(&settings)?;
+    let r = install::install_base(&game_dir, &dl, &release, &manifest, None, None)?;
+    println!(
+        "Base game {} ({}): wrote {} ({} MB), up-to-date {}, skipped {}",
+        r.version,
+        r.tag,
+        r.written,
+        r.bytes / (1024 * 1024),
+        r.up_to_date,
+        r.skipped
+    );
+    Ok(())
+}
+
+pub fn run_game_verify(flags: &[String]) -> Result<()> {
+    let (settings, _tag) = settings_from_flags(flags);
+    let game_dir = settings.resolve_game_dir()?;
+    let (_dl, _release, manifest) = game_repo_manifest(&settings)?;
+    let statuses = install::base_plan(&game_dir, &manifest, None, "verify", None)?;
+    let mut damaged = 0;
+    for s in &statuses {
+        match s.action {
+            install::BaseAction::Write => {
+                damaged += 1;
+                println!("  [damaged] {}", s.dest());
+            }
+            install::BaseAction::Skipped => println!("  [skipped] {}", s.dest()),
+            install::BaseAction::UpToDate => {}
+        }
+    }
+    println!("Verified {}: {} files, {} damaged", manifest.version, statuses.len(), damaged);
     Ok(())
 }

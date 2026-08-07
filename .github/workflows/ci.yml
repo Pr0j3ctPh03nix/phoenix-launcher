@@ -51,6 +51,18 @@ jobs:
       - name: Install frontend deps
         run: bun install
 
+      # The engine's unit tests, including the vendored manifest conformance suite
+      # (src-tauri/manifest-fixtures/) — the reader's compatibility contract with the dist repo is
+      # only a contract if something checks it on every push.
+      #
+      # --release ON PURPOSE: the cache this workflow shares with release.yml holds
+      # release-profile dependency artifacts (the tauri build below compiles the same profile).
+      # A plain `cargo test` would cold-compile a second, debug copy of the whole tree and near
+      # double the cache for nothing; --release reuses what is already warm.
+      - name: Test
+        working-directory: src-tauri
+        run: cargo test --release
+
       # Same cargo invocation as the release build, minus NSIS/MSI packaging: the dependency
       # artifacts cached here are exactly the ones release.yml restores. Keep the env identical
       # too, so nothing recompiles on the release side for a differing build input.

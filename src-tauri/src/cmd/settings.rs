@@ -99,6 +99,16 @@ pub fn set_selection(id: String, value: serde_json::Value) -> Result<(), CmdErro
 /// Where does the game folder currently resolve to, and is it one? Drives the setup view.
 #[tauri::command]
 pub fn game_dir_status() -> Result<GameDirStatus, CmdError> {
+    // Dev knob: PHOENIX_FORCE_SETUP=1 reports "never configured, no game beside the exe" — the
+    // exact condition boot() shows the first-run setup view on — WITHOUT touching the saved
+    // settings. This is the only way to SEE that view once a folder was ever chosen; it is
+    // otherwise unreachable on a configured machine. Debug-only for the same reason the CLI is:
+    // a shipped build must have no hidden switches that change what the user sees. Note the
+    // override is read-side only — going THROUGH setup (picking a folder) still saves for real.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("PHOENIX_FORCE_SETUP").is_some_and(|v| v != "0") {
+        return Ok(GameDirStatus { dir: String::new(), configured: false, client_version: None });
+    }
     let s = Settings::load();
     let configured = s.game_dir.is_some();
     let dir = s.resolve_game_dir().map_err(CmdError::from)?;
