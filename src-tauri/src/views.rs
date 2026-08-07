@@ -78,7 +78,6 @@ pub struct CheckView {
     /// This verdict came from the install record alone — no manifest was fetched, so it describes
     /// what WE installed, not what the latest release is. The UI must word it as "couldn't check"
     /// rather than "up to date" (see `local_check`).
-    #[serde(default)]
     pub local: bool,
 }
 

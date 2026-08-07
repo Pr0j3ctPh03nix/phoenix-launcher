@@ -60,7 +60,7 @@ the target game build, by editing the dist repo + cutting a release — the upda
         manifest.rs       manifest.json types + `Manifest::parse` (the `schema` compat gate and
                           dest-traversal rejection); conformance tests walk manifest-fixtures/
         steaminf.rs       reads game/dota/steam.inf ClientVersion (info only, no gating)
-        verify.rs         sha256 of files / bytes ((size,mtime)-memoized)
+        verify.rs         sha256 of files ((size,mtime)-memoized)
         engine.rs         fetch (via Manifest::parse) + resolve (options -> effective
                           file set) + plan (diff, incl. orphan Remove) + read-only `check` /
                           offline `evaluate` + OpProgress ticks; unit tests

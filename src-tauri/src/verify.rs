@@ -1,5 +1,5 @@
-//! SHA-256 of local files and byte buffers, for diffing against the manifest and verifying
-//! downloads. `sha256_file_cached` memoizes by (size, mtime), so repeated plans (every check /
+//! SHA-256 of local files, for diffing against the manifest and verifying downloads.
+//! `sha256_file_cached` memoizes by (size, mtime), so repeated plans (every check /
 //! selection change re-diffs the whole file set) don't re-read unchanged files — a rewrite
 //! changes the mtime and naturally invalidates the entry.
 //!

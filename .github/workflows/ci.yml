@@ -19,6 +19,8 @@ on:
     branches: [main]
     paths:
       - "src-tauri/**"
+      - "frontend/**"
+      - "dev/check_i18n.js"
       - "package.json"
       - "bun.lock"
       - ".github/workflows/*.yml"
@@ -50,6 +52,11 @@ jobs:
 
       - name: Install frontend deps
         run: bun install
+
+      # The frontend's own gate: EN/RU key parity and every $("id") main.js reaches for exists.
+      # It was written to gate commits — a gate nothing runs is not a gate.
+      - name: Frontend consistency (i18n parity + DOM ids)
+        run: bun dev/check_i18n.js
 
       # The engine's unit tests, including the vendored manifest conformance suite
       # (src-tauri/manifest-fixtures/) — the reader's compatibility contract with the dist repo is

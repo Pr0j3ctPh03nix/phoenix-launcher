@@ -79,7 +79,6 @@ impl CheckResult {
     pub fn changes(&self) -> usize {
         self.files.iter().filter(|f| f.action != Action::UpToDate).count()
     }
-
 }
 
 /// A file the install must replace or delete is locked by a live process — the game keeps its

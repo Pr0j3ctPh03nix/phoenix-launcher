@@ -454,9 +454,6 @@ fn obtain_all_tagged(
     op: &'static str,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::Mutex;
-
     // unique by sha256: two dests sharing one asset download once (the cache entry is shared)
     let mut seen = HashSet::new();
     let jobs: Vec<&FileEntry> =

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 const STATE_FILE: &str = ".phoenix-state.json";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct InstalledState {
     pub version: String,
     pub files: Vec<InstalledFile>,
