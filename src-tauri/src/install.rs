@@ -2101,6 +2101,54 @@ mod tests {
     }
 
     #[test]
+    fn a_preexisting_loose_original_survives_install_and_uninstall() {
+        // the gameinfo.gi shape: a genuine vanilla loose file the shim substitutes. Install must
+        // preserve it in the vanilla store; uninstall must put it back, not delete the dest.
+        let dir = tempdir("preexisting");
+        std::fs::create_dir_all(dir.join("game/dota")).unwrap();
+        std::fs::write(dir.join("game/dota/a.vpk"), b"STOCK ORIGINAL").unwrap();
+
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None, None).unwrap();
+
+        // shim in place, original preserved
+        assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
+        assert_eq!(
+            std::fs::read(dir.join(VANILLA_DIR).join("game/dota/a.vpk")).unwrap(),
+            b"STOCK ORIGINAL"
+        );
+
+        let r = uninstall(&settings(&dir)).unwrap();
+        assert!(r.restored.iter().any(|d| d == "game/dota/a.vpk"));
+        assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"STOCK ORIGINAL");
+        assert!(!dir.join(VANILLA_DIR).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_adopted_hash_matching_install_deletes_the_dest_on_uninstall() {
+        // the OTHER history: the folder already contains the shim's bytes (a copied
+        // already-patched install, no .phoenix-* metadata). The heal adopts them as ours with no
+        // original ever preserved — uninstall then deletes the dest. Documents the accepted gap:
+        // for a dest that substitutes a vanilla loose file, "revert to stock" leaves a hole.
+        let dir = tempdir("adopted");
+        std::fs::create_dir_all(dir.join("game/bin/win64")).unwrap();
+        std::fs::create_dir_all(dir.join("game/dota")).unwrap();
+        std::fs::write(dir.join("game/bin/win64/winmm.dll"), b"dll").unwrap();
+        std::fs::write(dir.join("game/dota/a.vpk"), b"vpk").unwrap();
+
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None, None).unwrap(); // no-op heal: adopts both
+
+        let r = uninstall(&settings(&dir)).unwrap();
+        assert!(r.deleted.iter().any(|d| d == "game/dota/a.vpk"));
+        assert!(!dir.join("game/dota/a.vpk").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn corrupt_download_fails_and_touches_nothing() {
         let dir = tempdir("corrupt");
         // manifest claims a hash the served bytes don't have
