@@ -15,3 +15,10 @@
 .DS_Store
 Thumbs.db
 *.swp
+
+# Internal dev docs — kept LOCAL, never shipped in the public updater repo.
+# CLAUDE.md / known_bugs.md are AI + dev context; CHANGELOG.md is deleted for good —
+# changelogs live in the GitHub Release sections (annotated-tag bodies), not a tracked file.
+/CLAUDE.md
+/known_bugs.md
+/CHANGELOG.md
