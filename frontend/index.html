@@ -15,7 +15,7 @@
       <section id="view-main" class="view">
 
         <header class="head rise" style="--d:0s">
-          <span class="brand"><span class="brand-dot"></span>PHOENIX</span>
+          <span class="brand"><span class="brand-dot"></span>PHOENIX LAUNCHER</span>
           <div class="head-actions">
           <button class="icon-btn hidden" id="btn-check" data-i18n-title="btn.check">
             <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -81,7 +81,12 @@
           </div>
         </footer>
 
-        <div class="path rise" id="game-path" title="" style="--d:.22s"></div>
+        <!-- bottom line: the folder this UI describes on the left, both builds' versions
+             (launcher / installed mod, labeled) on the right -->
+        <div class="foot rise" style="--d:.22s">
+          <div class="path" id="game-path" title=""></div>
+          <span class="foot-ver" id="app-ver"></span>
+        </div>
       </section>
 
       <!-- ===================== SETUP (first run) ===================== -->
@@ -138,6 +143,16 @@
               <div class="seg" id="seg-lang">
                 <button class="seg-btn" data-value="en">English</button>
                 <button class="seg-btn" data-value="ru">Русский</button>
+              </div>
+            </div>
+
+            <!-- instant-apply, like language: cosmetic and immediately perceivable, so it never
+                 sits as unsaved form state (and stays out of the settings snapshot) -->
+            <div class="field">
+              <span class="label" data-i18n="set.animations"></span>
+              <div class="seg" id="seg-anim">
+                <button class="seg-btn" data-value="on" data-i18n="seg.on"></button>
+                <button class="seg-btn" data-value="off" data-i18n="seg.off"></button>
               </div>
             </div>
 

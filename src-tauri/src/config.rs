@@ -65,6 +65,10 @@ pub struct Settings {
     /// Renderer flag for launch: "dx11" (default) or "dx9".
     #[serde(default = "default_renderer")]
     pub renderer: String,
+    /// UI animations master switch. Purely a frontend concern (off = the `anim-off` kill class);
+    /// persisted backend-side like every other setting. Default ON.
+    #[serde(default = "default_true")]
+    pub animations: bool,
     /// Optional launch flags: `launch::LAUNCH_FLAGS` id -> on. A missing id means the flag's
     /// own default, so a new flag needs no migration.
     #[serde(default)]
@@ -86,6 +90,10 @@ fn default_renderer() -> String {
     "dx11".to_string()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -98,6 +106,7 @@ impl Default for Settings {
             language: None,
             launch_extra: String::new(),
             renderer: default_renderer(),
+            animations: true,
             launch_flags: BTreeMap::new(),
             selections: BTreeMap::new(),
         }

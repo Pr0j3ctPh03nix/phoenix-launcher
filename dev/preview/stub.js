@@ -5,7 +5,7 @@ const CHECK = {
   version: "v1.2.1",
   gameDir: "D:\\Games\\Dota 2 6.88",
   installed: true,
-  changes: 2,
+  changes: 5,
   canPlay: true,
   canUninstall: true,
   gamePresent: true,
@@ -17,6 +17,12 @@ const CHECK = {
     { dest: "game\\bin\\win64\\winmm.dll", status: "update" },
     { dest: "game\\dota\\pak01_dir.vpk", status: "ok" },
     { dest: "game\\dota\\cfg\\autoexec.cfg", status: "install" },
+    // an option-owned set: renders as ONE "New graphics" row, not three paths
+    { dest: "game\\dota_phoenix\\textures_a.vpk", status: "update", groupId: "gfx", group: { en: "New graphics", ru: "Новая графика" } },
+    { dest: "game\\dota_phoenix\\textures_b.vpk", status: "update", groupId: "gfx", group: { en: "New graphics", ru: "Новая графика" } },
+    { dest: "game\\dota_phoenix\\particles.vpk", status: "ok", groupId: "gfx", group: { en: "New graphics", ru: "Новая графика" } },
+    // a choice's shared dest: shows "HUD skin · Classic", never the path
+    { dest: "game\\dota_phoenix\\hud.vpk", status: "ok", groupId: "hud", group: "HUD skin", variant: "Classic" },
     { dest: "game\\dota\\stale_override.vpk", status: "remove" },
   ],
 };
@@ -39,6 +45,7 @@ const HANDLERS = {
     language: LANG_Q,
     launchExtra: "-novid",
     renderer: "dx11",
+    animations: true,
     launchFlags: [{ id: "noCloudKeybinds", args: "+dota_keybindings_cloud_disable 1", enabled: true }],
   }),
   launcher_info: () => ({ version: "1.2.1", justUpdated: false }),
@@ -66,7 +73,13 @@ const HANDLERS = {
     if (FAIL === "check") throw offline;
     return null;
   },
-  release_notes: () => [{ version: "v1.2.1", notes: "## Fixed\n- Launch tweaks" }],
+  release_notes: () => [
+    {
+      version: "v1.2.1",
+      notes: "#### Added\n- New HUD skin option\n\n#### Changed\n- Faster release build caching\n\n#### Fixed\n- Launch tweaks\n- Crash on exit with `-novid`",
+    },
+    { version: "v1.2.0", notes: "#### Fixed\n- Launch tweaks" },
+  ],
   read_autoexec: () => ({ content: '// comment\ndota_camera_distance "1200"\n', lossy: false }),
   set_language: () => null,
   save_settings: () => null,

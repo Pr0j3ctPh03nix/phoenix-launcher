@@ -52,6 +52,7 @@ fn run_gui() {
             cmd::settings::save_settings,
             cmd::settings::set_game_dir,
             cmd::settings::set_language,
+            cmd::settings::set_animations,
             cmd::settings::set_selection,
             cmd::settings::game_dir_status,
             cmd::update::check,

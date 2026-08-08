@@ -25,6 +25,8 @@ window.addEventListener("load", () => {
     } else if (h === "options") {
       renderOptions();
       showView("options");
+    } else if (h === "whatsnew") {
+      await openWhatsNew();
     } else if (h === "confirm") {
       document.getElementById("btn-uninstall").click(); // the real handler, danger flag and all
     } else if (h === "verify" || h === "verify:stopping") {

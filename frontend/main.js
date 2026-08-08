@@ -40,6 +40,17 @@ const state = {
 function escHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
+// Known changelog section headings get an icon + a per-section accent (see .notes h4.sec-* in
+// style.css). Matched on the raw heading text; anything else stays a plain h4.
+const NOTE_SECTIONS = {
+  added:   { cls: "sec-added",   rank: 0, icon: '<path d="M6 2.25v7.5M2.25 6h7.5"/>' },
+  fixed:   { cls: "sec-fixed",   rank: 1, icon: '<path d="M2 6.5l2.5 2.75L10 2.75"/>' },
+  changed: { cls: "sec-changed", rank: 2, icon: '<path d="M1.75 4h6.75L6.25 1.75M10.25 8H3.5L5.75 10.25"/>' },
+};
+const NOTE_SECTION_ALIASES = {
+  new: "added", changed: "changed", improved: "changed", improvements: "changed",
+  added: "added", fixed: "fixed", fixes: "fixed", bugfixes: "fixed", "bug fixes": "fixed",
+};
 function renderNotes(md) {
   const inline = (s) => {
     s = escHtml(s);
@@ -53,18 +64,23 @@ function renderNotes(md) {
     s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
     return s.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[i]}</code>`);
   };
-  let html = "";
+  // Output accumulates in SEGMENTS, one per section, so recognized sections can be reordered to
+  // the canonical Added → Fixed → Changed regardless of how the release author wrote them.
+  // Preamble (before any heading) stays first (-1); unknown headings sink after the known trio
+  // (rank 3) but keep their relative order — the sort is stable.
+  const segs = [{ rank: -1, html: "" }];
+  let cur = segs[0];
   let items = null;    // open list's item texts
   let listTag = "ul";  // tag of the open list
   let para = null;     // open paragraph text
   let fence = null;    // open ``` fence's raw lines
-  const flushList = () => { if (items) { html += `<${listTag}>` + items.map((t) => `<li>${inline(t)}</li>`).join("") + `</${listTag}>`; items = null; } };
-  const flushPara = () => { if (para != null) { html += `<p>${inline(para)}</p>`; para = null; } };
+  const flushList = () => { if (items) { cur.html += `<${listTag}>` + items.map((t) => `<li>${inline(t)}</li>`).join("") + `</${listTag}>`; items = null; } };
+  const flushPara = () => { if (para != null) { cur.html += `<p>${inline(para)}</p>`; para = null; } };
   const flushAll = () => { flushList(); flushPara(); };
   const openList = (tag) => { if (!items || listTag !== tag) { flushList(); items = []; listTag = tag; } };
   for (const raw of md.split(/\r?\n/)) {
     if (fence !== null) {
-      if (/^```/.test(raw.trim())) { html += `<pre><code>${escHtml(fence.join("\n"))}</code></pre>`; fence = null; }
+      if (/^```/.test(raw.trim())) { cur.html += `<pre><code>${escHtml(fence.join("\n"))}</code></pre>`; fence = null; }
       else fence.push(raw);
       continue;
     }
@@ -72,16 +88,24 @@ function renderNotes(md) {
     if (/^```/.test(line)) { flushAll(); fence = []; continue; }
     if (!line) { flushAll(); continue; }
     let m;
-    if ((m = line.match(/^#{1,6}\s+(.*)$/))) { flushAll(); html += `<h4>${inline(m[1])}</h4>`; }
+    if ((m = line.match(/^#{1,6}\s+(.*)$/))) {
+      flushAll();
+      const sec = NOTE_SECTIONS[NOTE_SECTION_ALIASES[m[1].trim().toLowerCase()]];
+      cur = { rank: sec ? sec.rank : 3, html: "" };
+      segs.push(cur);
+      cur.html += sec
+        ? `<h4 class="sec ${sec.cls}"><svg class="sec-ic" viewBox="0 0 12 12" aria-hidden="true">${sec.icon}</svg>${inline(m[1])}</h4>`
+        : `<h4>${inline(m[1])}</h4>`;
+    }
     else if ((m = line.match(/^[-*]\s+(.*)$/))) { flushPara(); openList("ul"); items.push(m[1]); }
     else if ((m = line.match(/^\d+[.)]\s+(.*)$/))) { flushPara(); openList("ol"); items.push(m[1]); }
     // lazy continuation of the current bullet / paragraph (wrapped line)
     else if (items) items[items.length - 1] += " " + line;
     else para = para == null ? line : para + " " + line;
   }
-  if (fence !== null) html += `<pre><code>${escHtml(fence.join("\n"))}</code></pre>`; // unclosed fence
+  if (fence !== null) cur.html += `<pre><code>${escHtml(fence.join("\n"))}</code></pre>`; // unclosed fence
   flushAll();
-  return html;
+  return segs.sort((a, b) => a.rank - b.rank).map((s) => s.html).join(""); // stable — ties keep author order
 }
 
 // ---- modals ----
@@ -154,7 +178,27 @@ function fireStop() {
 function setStatus(word, kind, detail) {
   $("status").dataset.kind = kind || "idle";
   $("status-word").textContent = word;
-  $("status-detail").textContent = detail || "";
+  const d = $("status-detail");
+  if (detail instanceof Node) d.replaceChildren(detail);
+  else d.textContent = detail || "";
+}
+
+// A detail line whose {version} renders as a mono pill (.dver) instead of plain text, so the
+// installed release stands apart from the prose around it. The i18n string stays one template;
+// the placeholder is interpolated as a sentinel and swapped for the chip here.
+function detailVer(key, params) {
+  const frag = document.createDocumentFragment();
+  const parts = t(key, { ...params, version: "\x00" }).split("\x00");
+  parts.forEach((p, i) => {
+    if (i) {
+      const c = document.createElement("span");
+      c.className = "dver";
+      c.textContent = params.version;
+      frag.append(c);
+    }
+    if (p) frag.append(p);
+  });
+  return frag;
 }
 
 function setIdleStatus() {
@@ -182,8 +226,8 @@ function statusFor(v) {
       t("status.unverified"),
       "error",
       v.changes === 0
-        ? t("detail.localOk", { version: v.version })
-        : t("detail.localChanged", { version: v.version, n: v.changes }),
+        ? detailVer("detail.localOk", { version: v.version })
+        : detailVer("detail.localChanged", { version: v.version, n: v.changes }),
     ];
   }
   // No game to update: the folder has no game/ and no install record, so everything below —
@@ -203,14 +247,14 @@ function statusFor(v) {
       // files all hash-match but no install state — the primary runs the no-op heal. Worded as
       // "repair", not "not installed": the list right below says every file is current, and
       // "Install" next to "all current" reads as a contradiction.
-      return [t("status.repair"), "update", t("detail.repair", { version: v.version })];
+      return [t("status.repair"), "update", detailVer("detail.repair", { version: v.version })];
     }
-    return [t("status.upToDate"), "ok", t("detail.okMeta", { version: v.version })];
+    return [t("status.upToDate"), "ok", detailVer("detail.okMeta", { version: v.version })];
   }
   return [
     v.installed ? t("status.updateAvail") : t("status.notInstalled"),
     "update",
-    t("detail.changes", { version: v.version, n: v.changes }),
+    detailVer("detail.changes", { version: v.version, n: v.changes }),
   ];
 }
 
@@ -290,28 +334,87 @@ function renderLauncherUpdate() {
   $("lu-notes").innerHTML = renderNotes(lu.notes);
 }
 
+// Both builds' versions on the bottom line (right of the game path), LABELED — a bare "v1.3.4"
+// read as ambiguous (whose version?). The launcher's is known at boot. The mod's only when the
+// folder is actually ON that version: a network check's `version` names the LATEST release, so
+// with changes pending it would claim an update that isn't installed yet — a local verdict's
+// names the install record itself, so it holds whatever the intact-check says.
+function renderHeadVer() {
+  // launcher_info's version has no "v", a release's usually does — normalize so neither doubles
+  const vv = (s) => "v" + String(s).replace(/^v/i, "");
+  const parts = [];
+  if (state.launcherVersion) parts.push(t("head.launcherVer", { v: vv(state.launcherVersion) }));
+  const c = state.lastCheck;
+  if (c?.installed && c.version && (c.local || c.changes === 0))
+    parts.push(t("head.modVer", { v: vv(c.version) }));
+  $("app-ver").textContent = parts.join(" · ");
+}
+
 // Rebuild the managed-files list from a CheckView. Separate from applyCheck so a failed apply
 // can reset half-filled bars / "N MB" states without touching the (error) status line.
 function renderFiles(v) {
   const ul = $("files");
   ul.innerHTML = "";
   state.fileEls.clear();
-  for (const f of v.files) {
+  // option-owned files collapse into ONE row per group (the option's label instead of member
+  // paths); the row's state is the most actionable member state
+  const grouped = new Map(); // groupId -> its li
+  const rank = { ok: 0, remove: 1, install: 2, update: 3 };
+  const mkRow = (main, status) => {
     const li = document.createElement("li");
-    li.dataset.dest = f.dest;
-    const path = document.createElement("span");
-    path.className = "fpath";
-    path.textContent = f.dest;
     const st = document.createElement("span");
-    st.className = "fstate " + f.status;
-    st.textContent = t("fstate." + f.status);
+    st.className = "fstate " + status;
+    st.textContent = t("fstate." + status);
     // files that will be fetched (update/install) carry a hairline bar, revealed + filled live
     // from op-progress ticks during apply (downloads run in parallel — one bar each)
     const bar = document.createElement("span");
     bar.className = "fbar";
     bar.innerHTML = '<span class="fbar-fill"></span>';
-    li.append(path, st, bar);
+    li.append(main, st, bar);
     ul.append(li);
+    return li;
+  };
+  for (const f of v.files) {
+    if (f.groupId) {
+      let li = grouped.get(f.groupId);
+      if (!li) {
+        const members = v.files.filter((m) => m.groupId === f.groupId);
+        const status = members.reduce((a, m) => (rank[m.status] > rank[a] ? m.status : a), "ok");
+        const name = document.createElement("span");
+        name.className = "fgroup";
+        name.innerHTML =
+          '<svg class="fgroup-ic" viewBox="0 0 12 12" aria-hidden="true">' +
+          '<path d="M6 1.5 10.5 4 6 6.5 1.5 4Z"/><path d="M1.5 6.5 6 9l4.5-2.5"/></svg>';
+        const label = document.createElement("span");
+        label.className = "fgroup-name";
+        label.textContent = mlabel(f.group) || f.groupId;
+        name.append(label);
+        // a choice's row names the SELECTED variant, not the shared dest ("Lighting · Mod")
+        if (f.variant) {
+          const va = document.createElement("span");
+          va.className = "fvariant";
+          va.textContent = mlabel(f.variant);
+          name.append(va);
+        }
+        if (members.length > 1) {
+          const count = document.createElement("span");
+          count.className = "fcount";
+          count.textContent = "× " + members.length; // language-free on purpose
+          name.append(count);
+        }
+        li = mkRow(name, status);
+        // the row goes green only when EVERY downloading member is done, not the first
+        li._pending = members.filter((m) => m.status === "update" || m.status === "install").length;
+        grouped.set(f.groupId, li);
+      }
+      state.fileEls.set(f.dest, li); // every member dest -> the one group row (live dl bars)
+      continue;
+    }
+    const path = document.createElement("span");
+    path.className = "fpath";
+    path.textContent = f.dest;
+    const li = mkRow(path, f.status);
+    li.dataset.dest = f.dest;
     state.fileEls.set(f.dest, li);
   }
   $("files-empty").style.display = v.files.length ? "none" : "flex";
@@ -322,6 +425,7 @@ function renderFiles(v) {
 
 function applyCheck(v) {
   state.lastCheck = v;
+  renderHeadVer(); // the mod half of the header line comes from this check
   // a check completing while the game runs must not overwrite the "in game" status
   // launcher update FIRST, then "in game". The order is the documented invariant: until the
   // launcher is replaced we can't trust that this build reads the current manifest at all, and a
@@ -336,7 +440,11 @@ function applyCheck(v) {
   // one-shot confirmation that a self-update landed — kept ALONGSIDE the real status rather than
   // replacing it, since the game's state is still the more useful half of the line
   if (state.justUpdated) {
-    detail = t("detail.justUpdated", { version: state.launcherVersion }) + " · " + detail;
+    // detail may be a Node now (the version chip) — prepend via a fragment, not string concat
+    const f = document.createDocumentFragment();
+    f.append(t("detail.justUpdated", { version: state.launcherVersion }) + " · ",
+             detail instanceof Node ? detail : detail || "");
+    detail = f;
     state.justUpdated = false;
   }
   setStatus(word, kind, detail);
@@ -422,7 +530,8 @@ async function fallBackToLocal(cause) {
   // applyCheck words a local verdict for itself (statusFor), so it stays correct through a
   // language switch or a game-close refresh too; only the reason is appended here
   applyCheck(v);
-  $("status-detail").textContent += " · " + errText(cause);
+  // append, don't `textContent +=` — that would flatten the version chip back into plain text
+  $("status-detail").append(" · " + errText(cause));
 }
 
 async function doReplan() {
@@ -457,10 +566,16 @@ async function doApply() {
       const st = li.querySelector(".fstate");
       if (p.done) {
         doneDests.add(p.item);
-        li.classList.add("done");
-        if (fill) fill.style.width = "100%";
-        st.className = "fstate ok";
-        st.textContent = t("fstate.ok");
+        // a group row waits for its LAST downloading member before settling (li._pending is the
+        // member count from renderFiles; plain rows have none and settle at once)
+        if (li._pending != null && --li._pending > 0) {
+          st.className = "fstate dl";
+        } else {
+          li.classList.add("done");
+          if (fill) fill.style.width = "100%";
+          st.className = "fstate ok";
+          st.textContent = t("fstate.ok");
+        }
       } else if (p.bytesTotal) {
         const pct = Math.min(100, (p.bytesDone / p.bytesTotal) * 100);
         if (fill) fill.style.width = pct.toFixed(1) + "%";
@@ -662,6 +777,7 @@ async function pollGame() {
 // ---- language ----
 function rerenderDynamic() {
   applyStatic();
+  renderHeadVer(); // labeled, so it re-renders with the language
   if (state.lastCheck) applyCheck(state.lastCheck);
   else { setIdleStatus(); renderPrimary(); }
   updateTokenPlaceholder();
@@ -674,6 +790,12 @@ async function switchLang(l) {
   setSeg($("seg-lang"), l);
   rerenderDynamic();
   try { await invoke("set_language", { language: l }); } catch (e) { /* non-fatal */ }
+}
+
+// The animations master switch: one root class the CSS keys a blanket kill off of. The class is
+// the OFF state so a stub/boot failure fails toward animations on (the default).
+function applyAnimations(on) {
+  document.documentElement.classList.toggle("anim-off", !on);
 }
 
 // ---- segmented controls ----
@@ -796,6 +918,7 @@ async function openSettings() {
   $("btn-token-clear").classList.toggle("hidden", !state.hasToken);
   setSeg($("seg-renderer"), state.renderer);
   setSeg($("seg-lang"), LANG);
+  setSeg($("seg-anim"), s.animations === false ? "off" : "on");
   $("advanced").classList.toggle("hidden", !SHOW_ADVANCED);
   $("advanced").open = false;
   setSettingsTab(state.settingsTab);
@@ -1707,6 +1830,12 @@ $("btn-cf-ok").addEventListener("click", () => settleConfirm(true));
 $("btn-cf-cancel").addEventListener("click", () => settleConfirm(false));
 wireSeg($("seg-lang"), (l) => switchLang(l));
 wireSeg($("seg-renderer"));
+// instant-apply (persist is best-effort — the visual change already happened, and the next
+// save/boot converges); excluded from the settings snapshot like language
+wireSeg($("seg-anim"), (v) => {
+  applyAnimations(v === "on");
+  invoke("set_animations", { on: v === "on" }).catch(() => {});
+});
 
 // Watch the modals' own class rather than calling syncModalLayer from all seven open/close
 // sites — this cannot be forgotten when a new dialog is added.
@@ -1812,10 +1941,12 @@ async function boot() {
   let settings = null;
   try { settings = await invoke("get_settings"); } catch (e) { /* defaults below */ }
   setLang(settings?.language || detectLang());
+  applyAnimations(settings?.animations !== false); // absent/unknown = on
   state.hasToken = settings?.hasToken || false;
   try {
     const info = await invoke("launcher_info");
     state.launcherVersion = info.version;
+    renderHeadVer();
     // set by the self-update that spawned us; applyCheck shows it once on the next check
     state.justUpdated = info.justUpdated;
   } catch (e) { /* cosmetic only — never worth failing boot over */ }

@@ -19,6 +19,7 @@ pub fn get_settings() -> SettingsView {
         language: s.language,
         launch_extra: s.launch_extra,
         renderer: s.renderer,
+        animations: s.animations,
         launch_flags: launch::LAUNCH_FLAGS
             .iter()
             .map(|f| LaunchFlagView {
@@ -85,6 +86,12 @@ pub fn set_game_dir(path: String) -> Result<(), CmdError> {
 #[tauri::command]
 pub fn set_language(language: Option<String>) -> Result<(), CmdError> {
     Settings::update(move |s| s.language = language).map_err(CmdError::from)
+}
+
+/// Save just the animations switch (applies instantly in the settings view, like language).
+#[tauri::command]
+pub fn set_animations(on: bool) -> Result<(), CmdError> {
+    Settings::update(move |s| s.animations = on).map_err(CmdError::from)
 }
 
 /// Save one option selection (customization view control).

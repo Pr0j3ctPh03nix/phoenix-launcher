@@ -20,6 +20,8 @@ pub struct SettingsView {
     pub language: Option<String>,
     pub launch_extra: String,
     pub renderer: String,
+    /// UI animations master switch (frontend-only effect; persisted here).
+    pub animations: bool,
     /// The optional launch flags, in table order — the UI renders one switch per entry.
     pub launch_flags: Vec<LaunchFlagView>,
     pub selections: serde_json::Value,
@@ -39,6 +41,19 @@ pub struct LaunchFlagView {
 pub struct FileView {
     pub dest: String,
     pub status: String, // "ok" | "update" | "install" | "remove"
+    /// The manifest option (group) owning this dest — a choice's shared dest or a toggle's file.
+    /// The UI collapses same-group rows into ONE line carrying the group's label instead of
+    /// listing every member file. Absent for plain files[] entries and for the local (offline)
+    /// verdict, which has no manifest to know groups from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    /// The owning option's label (plain string or `{lang: text}`), resolved frontend-side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<serde_json::Value>,
+    /// For a choice's dest: the SELECTED variant's label — the row then reads "Lighting · Mod"
+    /// instead of the shared dest path. Toggles have no variants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variant: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -329,18 +344,39 @@ fn label_value(l: &Label) -> serde_json::Value {
 pub fn build_check_view(r: engine::CheckResult) -> CheckView {
     let installed = state::InstalledState::load(&r.game_dir).is_some();
     let changes = r.changes() as u32;
+    // dest -> owning option, for the UI's group collapsing. Covers every dest an option manages:
+    // a choice's shared dest (with the SELECTED variant's label riding along) and each of a
+    // toggle's files (a deselected toggle's Remove rows still match — the dests are the same).
+    let owner: std::collections::HashMap<&str, (&str, &Label, Option<&Label>)> = r
+        .options
+        .iter()
+        .flat_map(|o| {
+            let sel = r.selections.get(&o.id).and_then(|v| v.as_str());
+            let var = o.variants.iter().find(|v| Some(v.id.as_str()) == sel).map(|v| &v.label);
+            let choice = o.dest.iter().map(move |d| (d.as_str(), (o.id.as_str(), &o.label, var)));
+            let toggle =
+                o.files.iter().map(move |f| (f.dest.as_str(), (o.id.as_str(), &o.label, None)));
+            choice.chain(toggle)
+        })
+        .collect();
     let files = r
         .files
         .iter()
-        .map(|f| FileView {
-            dest: f.dest.clone(),
-            status: match f.action {
-                Action::UpToDate => "ok",
-                Action::Update => "update",
-                Action::Install => "install",
-                Action::Remove => "remove",
+        .map(|f| {
+            let own = owner.get(f.dest.as_str());
+            FileView {
+                dest: f.dest.clone(),
+                status: match f.action {
+                    Action::UpToDate => "ok",
+                    Action::Update => "update",
+                    Action::Install => "install",
+                    Action::Remove => "remove",
+                }
+                .to_string(),
+                group_id: own.map(|(id, _, _)| id.to_string()),
+                group: own.map(|(_, l, _)| label_value(l)),
+                variant: own.and_then(|(_, _, v)| v.map(label_value)),
             }
-            .to_string(),
         })
         .collect();
 
@@ -406,6 +442,10 @@ pub fn build_local_check_view(game_dir: &std::path::Path, st: &state::InstalledS
             FileView {
                 dest: f.dest.clone(),
                 status: if ok { "ok" } else { "update" }.to_string(),
+                // options live in the manifest we could not fetch — no groups to collapse into
+                group_id: None,
+                group: None,
+                variant: None,
             }
         })
         .collect();

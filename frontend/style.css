@@ -159,6 +159,16 @@ body {
   font-family: "Mono", monospace; font-size: 0.78125rem; color: var(--text-mute);
   margin-top: 0.5625rem; line-height: 1.4; word-break: break-word;
 }
+/* the installed release's version as a pill (like .tag), not plain prose; it follows the
+   status color — gold while something is pending, verdigris when settled */
+.status-detail .dver {
+  font-family: "Mono", monospace; font-size: 0.71875rem; line-height: 1.5; white-space: nowrap;
+  color: var(--gold-soft); background: rgba(201, 168, 106, 0.09);
+  border: 1px solid rgba(201, 168, 106, 0.28); border-radius: 999px; padding: 0 0.4375rem;
+}
+.status[data-kind="ok"] .dver {
+  color: var(--verd); background: rgba(98, 208, 180, 0.08); border-color: rgba(98, 208, 180, 0.3);
+}
 
 .status[data-kind="ok"]     .status-dot::after { background: var(--verd);  box-shadow: 0 0 10px rgba(98, 208, 180, 0.55); }
 .status[data-kind="ok"]     .status-word { color: var(--verd); }
@@ -230,6 +240,24 @@ body {
   flex: 1; min-width: 0; font-family: "Mono", monospace; font-size: 0.78125rem; color: #b7b1a6;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
+/* a collapsed option group's row: its LABEL (Inter, like the customize view names it), a
+   layers glyph marking "several files as one", and a language-free member count */
+.fgroup {
+  flex: 1; min-width: 0; display: inline-flex; align-items: center; gap: 0.5rem;
+  white-space: nowrap; overflow: hidden;
+}
+.fgroup-ic {
+  width: 0.75rem; height: 0.75rem; flex: none;
+  fill: none; stroke: var(--text-mute); stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round;
+}
+.fgroup-name {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  font-size: 0.8125rem; color: #b7b1a6;
+}
+/* the selected variant beside its choice's name, set off by a muted mid-dot */
+.fvariant { flex: none; font-size: 0.8125rem; color: var(--text-dim); }
+.fvariant::before { content: "· "; color: var(--text-mute); }
+.fcount { flex: none; font-family: "Mono", monospace; font-size: 0.6875rem; color: var(--text-mute); }
 .fstate { flex: none; font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.025rem; }
 .fstate.ok      { color: var(--verd); opacity: 0.85; }
 .fstate.update  { color: var(--gold-soft); }
@@ -343,6 +371,14 @@ body {
 
 /* the install path is a caption under the actions, not a third row of controls — it gets its
    own air so the footer reads as [rule of air] buttons [smaller air] path */
+/* the bottom line: game path left, both versions right — two quiet mono facts on one row.
+   The path yields (ellipsis) so the versions never wrap or clip. */
+.foot { display: flex; align-items: baseline; gap: 1.25rem; margin-top: 1.125rem; }
+.foot .path { flex: 1; min-width: 0; margin-top: 0; }
+.foot-ver {
+  flex: none; font-family: "Mono", monospace; font-size: 0.6875rem;
+  color: var(--text-mute); white-space: nowrap;
+}
 .path {
   font-family: "Mono", monospace; font-size: 0.6875rem; color: var(--text-mute);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-height: 0.875rem;
@@ -443,6 +479,25 @@ input::placeholder { color: #4d4941; }
   color: var(--text-dim); margin: 1.125rem 0 0.5625rem;
 }
 .notes h4:first-child { margin-top: 0.125rem; }
+/* recognized changelog sections (Added / Changed / Fixed): icon + per-section accent, and a
+   fading hairline that carries the heading across the column — sections read at a glance */
+.notes h4.sec { display: flex; align-items: center; gap: 0.4375rem; }
+.notes h4.sec::after {
+  content: ""; flex: 1; height: 1px; margin-left: 0.25rem;
+  background: linear-gradient(90deg, currentColor, transparent);
+  opacity: 0.22;
+}
+.notes .sec-ic {
+  width: 0.6875rem; height: 0.6875rem; flex: none;
+  fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round;
+}
+.notes h4.sec-added   { color: var(--verd); }
+.notes h4.sec-changed { color: var(--gold-soft); }
+.notes h4.sec-fixed   { color: var(--terra); }
+/* the section's own list takes its accent on the bullet dots */
+.notes h4.sec-added + ul li::before   { background: var(--verd); }
+.notes h4.sec-changed + ul li::before { background: var(--gold-soft); }
+.notes h4.sec-fixed + ul li::before   { background: var(--terra); }
 .notes p { font-size: 0.8125rem; line-height: 1.5; color: #c2bcb1; margin: 0.5rem 0; }
 .notes ul { list-style: none; margin: 0.375rem 0; }
 .notes li {
@@ -682,19 +737,21 @@ input:focus-visible { outline: none; }
    this is the keyboard path's default appearance, not an edge case. */
 .btn.danger:focus-visible { outline-color: var(--terra); }
 
-@media (prefers-reduced-motion: reduce) {
-  /* Blanket: the old list named four things and missed a dozen (switch knobs, radio dots, bar
-     fills, every :active nudge), so the claim to honour this preference was only partly true.
-     Everything is neutralized here, then the spinners are put back — they are the only signal
-     that a long operation is alive, and freezing them would read as a hang. */
-  *, *::before, *::after {
-    animation-duration: 0.01ms !important;
-    animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
-  }
-  #view-main.revealed .rise { animation: none; opacity: 1; transform: none; }
-  .loader-ring, .spinner, .status[data-kind="busy"] .status-dot::after {
-    animation-duration: 0.75s !important;
-    animation-iteration-count: infinite !important;
-  }
+/* prefers-reduced-motion is deliberately NOT honoured (decision 2026-08-08): the OS setting is
+   ignored. Motion is governed solely by the in-app Animations switch below — `html.anim-off`,
+   set from settings (default on).
+   Blanket rather than a list: the old reduced-motion list named four things and missed a dozen
+   (switch knobs, radio dots, bar fills, every :active nudge). Everything is neutralized, then the
+   spinners are put back — they are the only signal that a long operation is alive, and freezing
+   them would read as a hang. */
+html.anim-off *, html.anim-off *::before, html.anim-off *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}
+html.anim-off #view-main.revealed .rise { animation: none; opacity: 1; transform: none; }
+html.anim-off .loader-ring, html.anim-off .spinner,
+html.anim-off .status[data-kind="busy"] .status-dot::after {
+  animation-duration: 0.75s !important;
+  animation-iteration-count: infinite !important;
 }
