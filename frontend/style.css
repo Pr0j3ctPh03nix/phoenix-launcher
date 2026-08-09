@@ -36,6 +36,10 @@
   --gold-soft: #e6cf98;
   --verd:      #62d0b4;   /* settled / at rest */
   --terra:     #d47767;   /* error */
+  /* yours, kept by choice. Its own hue because it is NOT the same statement as verdigris: a kept
+     file is settled, but it is deliberately not what the release ships, and sharing the
+     up-to-date colour made "current" and "kept" indistinguishable in a column read at a glance. */
+  --kept:      #a3c17e;
 
   --ease: cubic-bezier(0.16, 0.7, 0.3, 1);
 
@@ -240,12 +244,28 @@ body {
   flex: 1; min-width: 0; font-family: "Mono", monospace; font-size: 0.78125rem; color: #b7b1a6;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-/* a collapsed option group's row: its LABEL (Inter, like the customize view names it), a
-   layers glyph marking "several files as one", and a language-free member count */
+/* a category row: its LABEL (Inter, like the customize view names it), a layers glyph when it is
+   an option, and a language-free member count */
 .fgroup {
   flex: 1; min-width: 0; display: inline-flex; align-items: center; gap: 0.5rem;
   white-space: nowrap; overflow: hidden;
 }
+/* the disclosure: rotation is the only thing that says open vs closed, so it gets the transition
+   and the row gets the affordance (cursor + a hairline lift on hover) */
+.files li.fcat { cursor: pointer; }
+.files li.fcat:hover .fgroup-name { color: var(--text); }
+.files li.fcat:hover .fchev { stroke: var(--gold-soft); }
+.files li.fcat:focus-visible { outline: 2px solid rgba(201, 168, 106, 0.5); outline-offset: -2px; border-radius: var(--r-sm); }
+.fchev {
+  width: 0.625rem; height: 0.625rem; flex: none;
+  fill: none; stroke: var(--text-mute); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round;
+  transition: transform 0.18s var(--ease), stroke 0.15s;
+}
+.files li.fcat.open .fchev { transform: rotate(90deg); }
+/* a member row: indented under its category, and quieter than it — the category is the thing
+   being read, the paths are the detail behind it */
+.files li.fkid { padding-left: 1.375rem; height: 2.25rem; }
+.files li.fkid .fpath { font-size: 0.75rem; color: var(--text-dim); }
 .fgroup-ic {
   width: 0.75rem; height: 0.75rem; flex: none;
   fill: none; stroke: var(--text-mute); stroke-width: 1.2; stroke-linecap: round; stroke-linejoin: round;
@@ -263,6 +283,12 @@ body {
 .fstate.update  { color: var(--gold-soft); }
 .fstate.install { color: var(--gold-soft); }
 .fstate.remove  { color: var(--terra); }
+/* somebody else's bytes at one of our dests. Gold, not terracotta: apply repairs these, it does
+   not destroy them — the warning that it will lives in the status line, where it can say so in
+   words. `kept` gets its OWN colour: not gold, because nothing is pending on it, and not the
+   settled verdigris, because it is not what the release ships either. */
+.fstate.modified { color: var(--gold-soft); }
+.fstate.kept     { color: var(--kept); }
 .fstate.dl      { color: var(--gold-soft); font-family: "Mono", monospace; font-weight: 500; letter-spacing: 0; }
 
 /* Per-file download bar: a hairline riding the li's bottom edge, hidden until that file's first
@@ -278,6 +304,197 @@ body {
   transition: width 0.2s ease;
 }
 .files li.done .fbar-fill { background: var(--verd); box-shadow: 0 0 8px rgba(98, 208, 180, 0.5); }
+
+/* ================= files view (verify results) =================
+   The one screen in the app that has to stay readable at four thousand rows. Everything here is
+   sized off --gv-row, because virtual scrolling needs every row to be EXACTLY the same height —
+   JS positions rows by index × that number, so a row that grows by a pixel drifts the whole list.
+   Change the value here and renderGv picks it up (it measures, it does not assume). */
+:root { --gv-row: 2.125rem; }
+
+.gv-summary {
+  padding-top: var(--gap-head); padding-bottom: 0.5rem;
+  font-size: 0.8125rem; color: var(--text-dim);
+}
+.gv-summary b { color: var(--verd); font-weight: 600; }
+
+/* facet chips: a count you can switch off. Muted when excluded, so the row doubles as a legend
+   for the colours used down the list. */
+.facets { display: flex; flex-wrap: wrap; gap: 0.4375rem; padding-bottom: 0.75rem; }
+.facet {
+  display: inline-flex; align-items: center; gap: 0.4375rem;
+  height: 1.75rem; padding: 0 0.625rem; border-radius: 999px;
+  border: 1px solid var(--line); background: transparent; cursor: pointer;
+  font-family: "Inter", sans-serif; font-size: 0.71875rem; letter-spacing: 0.0125rem;
+  color: var(--text-mute); transition: border-color 0.15s, color 0.15s, opacity 0.15s;
+}
+.facet:hover { border-color: var(--text-mute); }
+.facet .facet-n { font-family: "Mono", monospace; font-size: 0.6875rem; }
+/* a dot carries the kind's colour; the label stays quiet so the row does not turn into a rainbow */
+.facet .facet-dot { width: 0.4375rem; height: 0.4375rem; border-radius: 50%; background: currentColor; }
+.facet.on { color: var(--text); border-color: var(--line); background: rgba(255, 255, 255, 0.035); }
+.facet.off { opacity: 0.45; }
+.facet[data-kind="missing"]    .facet-dot { color: var(--gold); }
+.facet[data-kind="modified"]   .facet-dot { color: var(--gold-soft); }
+.facet[data-kind="unreadable"] .facet-dot { color: var(--terra); }
+.facet[data-kind="kept"]       .facet-dot { color: var(--kept); }
+.facet[data-kind="extra"]      .facet-dot { color: #8e7fb8; }
+
+.gv-tools { display: flex; align-items: center; gap: 0.875rem; padding-bottom: 0.625rem; }
+/* The LABEL is the field; the icon and the input are flex siblings inside it. An absolutely
+   positioned icon over a padded input is the obvious way to build this and it only works while
+   the padding and the icon's offset agree — they stop agreeing the moment either is retuned, and
+   the failure is a magnifier sitting on top of the user's text. Here the gap is structural. */
+.gv-search {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 0.5rem;
+  height: 2.125rem; padding: 0 0.75rem;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg-2);
+  transition: border-color 0.15s;
+}
+.gv-search:focus-within { border-color: var(--gold); }
+.gv-search-ic {
+  flex: none; width: 0.875rem; height: 0.875rem;
+  fill: none; stroke: var(--text-mute); stroke-width: 1.6; stroke-linecap: round;
+}
+.gv-search:focus-within .gv-search-ic { stroke: var(--gold-soft); }
+/* Typed on the attribute, not just the element: the generic `input[type="text"]` field style
+   further down this file has the SAME specificity as a bare `.gv-search input` and sits later, so
+   it silently won — the field drew its own border inside this one and re-imposed its padding. */
+.gv-search input[type="text"] {
+  flex: 1; min-width: 0; height: 100%; border: none; background: transparent; padding: 0;
+  box-shadow: none;
+  font-family: "Mono", monospace; font-size: 0.75rem; color: var(--text);
+}
+.gv-search input[type="text"]:focus { outline: none; border: none; box-shadow: none; }
+.gv-search input[type="text"]::placeholder { color: var(--text-mute); font-family: "Inter", sans-serif; }
+
+/* the rule the checkbox column obeys, sitting on the hairline that opens the list — a legend for
+   the thing directly beneath it, not a paragraph somewhere else */
+.gv-legend {
+  padding-bottom: 0.5rem; padding-right: var(--gutter);
+  font-size: 0.71875rem; line-height: 1.45; color: var(--text-mute);
+}
+.gv-legend:empty { display: none; }
+.gv-legend b { color: var(--gold-soft); font-weight: 600; }
+
+/* The scroller. `.gv-list` is a spacer whose HEIGHT is the full row count — that is what gives the
+   scrollbar an honest size while only a screenful of rows exists in the DOM. */
+.gv-area {
+  flex: 1; min-height: 0; overflow-y: auto; position: relative;
+  border-top: 1px solid var(--line); padding-right: var(--gutter);
+}
+.gv-list { position: relative; }
+.gv-empty {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  color: var(--text-mute); font-size: 0.78125rem; text-align: center;
+}
+
+.gv-row {
+  position: absolute; left: 0; right: 0; height: var(--gv-row);
+  display: flex; align-items: center; gap: 0.5rem;
+  border-bottom: 1px solid var(--line-soft);
+}
+.gv-row:hover { background: rgba(255, 255, 255, 0.022); }
+/* the keyboard's row. `inset` rather than an outer ring: rows are absolutely positioned inside a
+   scroller, which clips an outline drawn outside the box */
+.gv-row:focus-visible {
+  outline: 2px solid rgba(201, 168, 106, 0.55); outline-offset: -2px; border-radius: var(--r-sm);
+}
+/* indent is the tree — one step per depth, applied as padding so the hover band still spans */
+.gv-row { padding-left: calc(var(--d) * 0.9375rem); }
+
+/* the disclosure triangle: a rotating chevron, present only on directories */
+.gv-twist {
+  flex: none; width: 0.875rem; height: 0.875rem; display: flex; align-items: center;
+  justify-content: center; cursor: pointer;
+}
+.gv-twist svg { width: 0.5rem; height: 0.5rem; fill: none; stroke: var(--text-mute); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; transition: transform 0.15s var(--ease); }
+.gv-row.open > .gv-twist svg { transform: rotate(90deg); }
+/* a leaf has nothing to disclose — the slot stays (names align under their folder) but the
+   glyph goes, so the column reads as a hierarchy instead of a list of dead arrows */
+.gv-twist.leaf { cursor: default; }
+.gv-twist.leaf svg { display: none; }
+
+/* Restore checkbox. Tri-state on directories: the half-filled middle state is what lets a folder
+   row honestly represent "some of these". */
+.gv-box {
+  flex: none; width: 0.875rem; height: 0.875rem; border-radius: 0.1875rem;
+  border: 1px solid var(--mark-mute); cursor: pointer; position: relative;
+  transition: background 0.12s, border-color 0.12s;
+}
+.gv-box:hover { border-color: var(--gold); }
+.gv-box[data-s="on"] { background: var(--gold); border-color: var(--gold); }
+.gv-box[data-s="on"]::after {
+  content: ""; position: absolute; left: 0.1875rem; top: 0.03125rem;
+  width: 0.25rem; height: 0.4375rem; border: solid #1a1409; border-width: 0 2px 2px 0;
+  transform: rotate(43deg);
+}
+.gv-box[data-s="part"] { border-color: var(--gold); }
+.gv-box[data-s="part"]::after {
+  content: ""; position: absolute; inset: 0.1875rem; background: var(--gold); border-radius: 1px;
+}
+/* an extra has nothing to restore — the slot stays, empty, so every name still starts on one axis */
+.gv-box.none { border: none; cursor: default; }
+
+.gv-name {
+  flex: 1; min-width: 0; font-family: "Mono", monospace; font-size: 0.75rem; color: #b7b1a6;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.gv-row.dir .gv-name { color: var(--text); }
+/* a compressed chain (a/b/c collapsed into one row) greys everything but the last segment, so the
+   eye still lands on the folder this row IS */
+.gv-name .gv-lead { color: var(--text-mute); }
+
+/* whose file this is. Absent for base-game rows — the game is this screen's default subject and
+   badging every row would say nothing. */
+.gv-badge {
+  flex: none; padding: 0 0.3125rem; height: 1rem; display: inline-flex; align-items: center;
+  border-radius: 0.1875rem; border: 1px solid var(--line);
+  font-family: "Mono", monospace; font-size: 0.625rem; letter-spacing: 0.03125rem;
+  color: var(--text-mute);
+}
+.gv-badge.phx { color: var(--gold-soft); border-color: rgba(201, 168, 106, 0.3); }
+
+/* the verdict + its evidence, right-aligned so the states form a scannable column */
+.gv-meta { flex: none; display: flex; align-items: baseline; gap: 0.5rem; font-size: 0.6875rem; }
+.gv-state { font-weight: 600; letter-spacing: 0.0125rem; }
+.gv-state.missing    { color: var(--gold); }
+.gv-state.modified   { color: var(--gold-soft); }
+.gv-state.unreadable { color: var(--terra); }
+/* "there is a newer version of this file" — carried BESIDE the state, never instead of it, so a
+   row can say both things at once. Gold: it wants attention, unlike the settled verdigris. */
+.gv-upd {
+  font-weight: 600; letter-spacing: 0.0125rem; color: var(--gold);
+}
+.gv-upd::before { content: "/ "; color: var(--text-mute); font-weight: 400; }
+.gv-state.kept       { color: var(--kept); }
+.gv-state.extra, .gv-state.extraDir { color: #8e7fb8; }
+.gv-evidence { font-family: "Mono", monospace; color: var(--text-mute); }
+/* a directory's tally: how many rows it holds, how many are picked */
+.gv-count { font-family: "Mono", monospace; font-size: 0.6875rem; color: var(--text-mute); }
+.gv-count b { color: var(--gold-soft); font-weight: 400; }
+
+/* A checked EXTRA wears the danger colour, because checking it means something different: for a
+   file the game or Phoenix owns the box means "put it back", and for one nobody owns it means
+   "delete it". One control, one mental model, and the row says which act it is about to be part
+   of without the user having to read the footer. This replaced a second selection system (a
+   per-row X button) that was invisible enough that the bulk controls looked broken to anyone
+   whose results were all extras — they were skipping every row on screen. */
+.gv-box.del[data-s="on"] { background: var(--terra); border-color: var(--terra); }
+.gv-box.del[data-s="on"]::after { border-color: #22100c; }
+.gv-box.del:hover { border-color: var(--terra); }
+.gv-row.doomed .gv-name { color: var(--terra); text-decoration: line-through; opacity: 0.8; }
+.gv-row.doomed .gv-state { color: var(--terra); }
+
+/* The tally is its own line between the list and the buttons — see index.html. Right-aligned onto
+   the same edge as the list's own right-hand column, so the numbers line up with the states they
+   are totalling. */
+.gv-total {
+  padding-top: 0.75rem; padding-right: var(--gutter); text-align: right;
+  font-family: "Mono", monospace; font-size: 0.71875rem; color: var(--text-mute);
+}
+/* the tally already provides the separation, so the footer does not need the full band on top */
+#view-gv .actions { padding-top: 0.75rem; }
 
 /* ---- actions ---- */
 /* No rule above the footer. The file list already closes itself with its own last hairline,
@@ -427,6 +644,11 @@ body {
   color: var(--gold-soft); background: rgba(201, 168, 106, 0.09);
   border: 1px solid rgba(201, 168, 106, 0.28); border-radius: 999px; padding: 0.0625rem 0.5rem;
 }
+/* "this is the one you are on" — verdigris, because what it states is settled, not actionable.
+   In gold it would read as the release to go get, which is the opposite of what it means. */
+.tag.current {
+  color: var(--verd); background: rgba(98, 208, 180, 0.08); border-color: rgba(98, 208, 180, 0.26);
+}
 #settings-msg { margin-top: 0.875rem; }
 /* inline code chips: mono on a quiet plate, like the notes' snippets */
 .label code, .hint code {
@@ -465,14 +687,17 @@ input::placeholder { color: #4d4941; }
 .loader-word { font-size: 0.75rem; font-weight: 600; letter-spacing: 0.3125rem; color: var(--text-dim); }
 
 /* ---- what's new ---- */
+/* a row, not a line: the version can carry a "current" pill saying this is the build in use */
 .whatsnew-version {
+  display: flex; align-items: center; gap: 0.625rem;
   font-family: "Mono", monospace; font-size: 0.75rem; color: var(--gold-soft);
   padding-bottom: 0.25rem;
 }
 /* every version after the first gets a separator */
 .notes + .whatsnew-version { margin-top: var(--band); padding-top: 1.25rem; border-top: 1px solid var(--line); }
 .notes-loading { margin-top: 1.375rem; }
-.notes-area { flex: 1; min-height: 0; overflow-y: auto; padding-top: var(--gap-head); padding-right: var(--gutter); }
+/* the tab row above owns the head gap now (settings' .panels pays the same 1.375rem back) */
+.notes-area { flex: 1; min-height: 0; overflow-y: auto; padding-top: 1.375rem; padding-right: var(--gutter); }
 .notes { -webkit-user-select: text; user-select: text; cursor: text; }
 .notes h4 {
   font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.1rem; text-transform: uppercase;
@@ -612,9 +837,19 @@ input::placeholder { color: #4d4941; }
 .modal-head .modal-title { margin-bottom: 0; }
 /* balance keeps a two-line question from ending in one orphaned word — the shape of the card's
    right edge is what made these read as half-empty */
-.modal-text { font-size: 0.84375rem; line-height: 1.55; color: var(--text); text-wrap: balance; }
-.modal-text.pre { white-space: pre-line; }
-.modal-note { font-size: 0.78125rem; line-height: 1.5; color: var(--text-dim); margin-bottom: 0.625rem; text-wrap: balance; }
+/* `pretty`, NOT `balance`. Both avoid an orphaned last word, which was the point — but balance
+   equalises the length of EVERY line, so anything past two lines gets squeezed into a narrow
+   column while the card (and the buttons, which span it edge to edge) stay full width. The card
+   then looks broken: a paragraph hugging the left with a band of dead space beside it. `pretty`
+   keeps the full measure and only fixes the rag at the end. */
+/* A newline in a dialog string is a LINE BREAK, everywhere — not an opt-in per element. These
+   cards are narrow and their copy is two or three independent statements ("N files download
+   again" / "the ones you left are kept"); run together they wrapped mid-sentence into each other,
+   so the second statement began at the end of a line and was immediately cut. One statement per
+   line is what makes a card this size readable, and it is the string author who knows where the
+   seams are. (Was a `.pre` variant only #gd-summary asked for.) */
+.modal-text { font-size: 0.84375rem; line-height: 1.55; color: var(--text); text-wrap: pretty; white-space: pre-line; }
+.modal-note { font-size: 0.78125rem; line-height: 1.5; color: var(--text-dim); margin-bottom: 0.625rem; text-wrap: pretty; }
 /* Equal columns, edge to edge: the buttons ARE the card's bottom rule, so no dead space can open
    on the right, and a pair always reads as one balanced unit whatever the labels say. One-button
    stages (Stop / Close) get a full-width target for free. */
@@ -755,3 +990,12 @@ html.anim-off .status[data-kind="busy"] .status-dot::after {
   animation-duration: 0.75s !important;
   animation-iteration-count: infinite !important;
 }
+
+/* the files view's in-flight line: sits exactly where the tally was, so the footer never
+   reflows between "here is what you picked" and "carrying it out" */
+.gv-work {
+  display: flex; align-items: center; gap: 0.5625rem;
+  min-height: 1.125rem; margin-top: 0.75rem;
+  font-size: 0.75rem; color: var(--text-dim);
+}
+.gv-work .spinner { width: 0.8125rem; height: 0.8125rem; border-width: 1.5px; }

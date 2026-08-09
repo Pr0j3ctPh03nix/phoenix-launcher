@@ -231,6 +231,17 @@
               <span class="hint" data-i18n="set.gameInstallHint"></span>
             </div>
 
+            <!-- The cheap counterpart to Verify, and the reason it is its own field rather than a
+                 third button above: it answers a different question (what in here is MINE) and
+                 costs seconds instead of minutes, because it never hashes the install. -->
+            <div class="field">
+              <span class="label" data-i18n="set.yours"></span>
+              <div class="row">
+                <button class="btn ghost inline" id="btn-yours" data-i18n="btn.yourFiles"></button>
+              </div>
+              <span class="hint" data-i18n="set.yoursHint"></span>
+            </div>
+
             <div class="field">
               <span class="label" data-i18n="set.phoenix"></span>
               <div class="row">
@@ -274,6 +285,77 @@
         </footer>
       </section>
 
+      <!-- ===================== FILES (what a verify found) =====================
+           A folder TREE, not a list: a verify can come back with four thousand differences, and
+           the only way to act on that many is to act on the directories they live in. Every row
+           is the same height and only the visible window is in the DOM (see renderGv), so an
+           expanded five-thousand-file folder scrolls like an empty one.
+
+           Two selection systems on purpose, and they look different because they DO different
+           things: a checkbox restores (reversible, gold), the ✕ deletes (irreversible,
+           terracotta). Nothing bulk ever arms the second one. -->
+      <section id="view-gv" class="view hidden">
+
+        <header class="head">
+          <span class="brand"><span class="brand-dot"></span><!-- text set by renderGvChrome, per mode — deliberately NOT data-i18n (applyStatic would
+               sweep it back to the verify label while the update menu was open) -->
+          <span id="gv-head"></span></span>
+          <span class="tag" data-i18n="tag.build"></span>
+        </header>
+
+        <!-- the arithmetic first: how much was checked, and how much of it was fine. Without this
+             line a screen full of differences reads as "everything is broken". -->
+        <div class="gv-summary" id="gv-summary"></div>
+
+        <!-- one chip per KIND of difference: counts, and a click filters that kind in or out.
+             Built by renderGvFacets — the set of kinds present is data, not markup. -->
+        <div class="facets" id="gv-facets"></div>
+
+        <div class="gv-tools">
+          <label class="gv-search">
+            <svg class="gv-search-ic" viewBox="0 0 24 24" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" /><line x1="16.5" y1="16.5" x2="21" y2="21" />
+            </svg>
+            <input id="gv-filter" type="text" spellcheck="false" data-i18n-ph="gv.filterPh" />
+          </label>
+          <button class="link" id="gv-all" data-i18n="gv.all"></button>
+          <button class="link" id="gv-none" data-i18n="gv.none"></button>
+        </div>
+
+        <!-- What a tick MEANS, stated immediately above the ticks. One checkbox column serves
+             three different acts here (put back / take the new version / delete), decided by the
+             row's owner and the screen's mode, and none of that is inferable from a checkbox. -->
+        <div class="gv-legend" id="gv-legend"></div>
+
+        <div class="gv-area" id="gv-area">
+          <div class="gv-empty hidden" id="gv-empty"></div>
+          <div class="gv-list" id="gv-list" role="group"></div>
+        </div>
+
+        <div class="msg hidden" id="gv-msg"></div>
+
+        <!-- the tally sits on its own line: inline in the action row it competed with two button
+             labels for the same width and wrapped into them exactly when it had most to say -->
+        <div class="gv-total" id="gv-total"></div>
+
+        <!-- Takes the tally's place while an act is in flight. Every act on this screen is
+             asynchronous and most of them reach GitHub, so without it the view sat fully live
+             after the press — nothing moving, buttons still armed — and then changed by itself
+             when the work landed. -->
+        <div class="gv-work hidden" id="gv-work">
+          <span class="spinner"></span>
+          <span id="gv-work-text"></span>
+        </div>
+
+        <footer class="actions">
+          <button class="btn" id="btn-gv-restore"></button>
+          <button class="btn ghost danger hidden" id="btn-gv-delete"></button>
+          <div class="actions-aux">
+            <button class="link neutral" id="btn-gv-back" data-i18n="btn.back"></button>
+          </div>
+        </footer>
+      </section>
+
       <!-- ===================== AUTOEXEC EDITOR ===================== -->
       <section id="view-autoexec" class="view hidden">
 
@@ -306,8 +388,22 @@
           <span class="brand"><span class="brand-dot"></span><span data-i18n="head.whatsnew"></span></span>
         </header>
 
-        <div class="notes-area">
+        <!-- Two products, two version lines, two pages: the Phoenix client's releases and the
+             launcher's own. Same tab grammar settings uses. Each pane is its OWN scroller, so
+             switching can never inherit the other's offset, and the trailing message line
+             (loading / offline / nothing yet) lives inside the pane it describes. -->
+        <div class="tabs" id="wn-tabs" role="tablist">
+          <button class="tab active" data-wn="phoenix" role="tab" aria-selected="true" data-i18n="wn.tabMod"></button>
+          <button class="tab" data-wn="launcher" role="tab" aria-selected="false" data-i18n="wn.tabLauncher"></button>
+        </div>
+
+        <div class="notes-area" data-wn-pane="phoenix" role="tabpanel">
           <div id="notes-body"></div>
+          <div class="hint notes-loading hidden" id="wn-msg-phoenix"></div>
+        </div>
+        <div class="notes-area hidden" data-wn-pane="launcher" role="tabpanel">
+          <div id="wn-launcher-body"></div>
+          <div class="hint notes-loading hidden" id="wn-msg-launcher"></div>
         </div>
 
         <footer class="actions">
@@ -381,7 +477,7 @@
       <div id="gd-confirm" class="hidden">
         <p class="modal-note" data-i18n="gd.pristine"></p>
         <!-- pre-line: the summary is deliberately two lines (size/count, then the target) -->
-        <p class="modal-text pre" id="gd-summary"></p>
+        <p class="modal-text" id="gd-summary"></p>
         <div class="msg" id="gd-space" hidden></div>
         <div class="modal-actions">
           <button class="btn" id="btn-gd-go" data-i18n="btn.download"></button>
@@ -410,6 +506,44 @@
     </div>
   </div>
 
+  <!-- ===================== VERIFY (progress) =====================
+       A modal, not a trip through the main view: Verify is launched from Settings → Game files,
+       and bouncing out to main to show a status line, then into a third screen when it finished,
+       made one action look like three. This sits on top of whatever view asked for it, and the
+       files view it opens returns there. -->
+  <div class="modal hidden" id="vf-modal">
+    <div class="modal-card">
+      <!-- the title is set by JS on every open (two flows share this modal: the full verify and
+           the much cheaper your-files read), so it must NOT also carry data-i18n — applyStatic
+           sweeps those and whichever ran last would win -->
+      <div class="modal-head">
+        <span class="modal-title" id="vf-title"></span>
+        <span class="tag" data-i18n="tag.build"></span>
+      </div>
+
+      <div id="vf-run">
+        <div class="af-progress">
+          <span class="spinner"></span>
+          <div class="af-lines">
+            <div class="af-count" id="vf-line1"></div>
+            <div class="af-current" id="vf-line2"></div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn ghost" id="btn-vf-stop" data-i18n="btn.stop"></button>
+        </div>
+      </div>
+
+      <!-- the verdict when there is nothing to show a list of: intact, stopped, or failed -->
+      <div id="vf-done" class="hidden">
+        <p class="modal-text" id="vf-result"></p>
+        <div class="modal-actions">
+          <button class="btn" id="btn-vf-close" data-i18n="btn.close"></button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ===================== CONFIRM MODAL ===================== -->
   <div class="modal hidden" id="cf-modal">
     <div class="modal-card">
@@ -418,7 +552,10 @@
         <p class="modal-text" id="cf-text"></p>
         <div class="modal-actions">
           <button class="btn" id="btn-cf-ok"></button>
-          <button class="btn ghost" id="btn-cf-cancel" data-i18n="btn.cancel"></button>
+          <!-- label set by confirmDialog every time it opens (it defaults to btn.cancel) —
+               deliberately NOT data-i18n, or applyStatic sweeps a custom answer like
+               "Don't remember" back to a generic "Cancel" -->
+          <button class="btn ghost" id="btn-cf-cancel"></button>
         </div>
       </div>
     </div>
