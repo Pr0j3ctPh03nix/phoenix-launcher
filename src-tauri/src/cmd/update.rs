@@ -1,6 +1,7 @@
 //! Update lifecycle commands: check / replan / apply / uninstall. `apply` forwards the engine's
 //! progress ticks to the webview as the `op-progress` event.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tauri::Emitter;
@@ -89,6 +90,7 @@ pub async fn apply(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AppState>>,
     tag: Option<String>,
+    restore: Option<Vec<String>>,
 ) -> Result<InstallView, CmdError> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -111,7 +113,16 @@ pub async fn apply(
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
         };
-        let report = install::install(&settings, &dl, tag.as_deref(), Some(&emit), None);
+        // A selection restricts the run to named dests — the files view restoring Phoenix files
+        // the user changed. Without one this is the ordinary apply, which never touches a pinned
+        // dest; with one, naming a pinned dest IS the user taking the pin back, so it is dropped
+        // after the run rather than left to re-hide the file on the next check.
+        let only: Option<HashSet<String>> = restore.map(|v| v.into_iter().collect());
+        let report =
+            install::install(&settings, &dl, tag.as_deref(), Some(&emit), None, only.as_ref());
+        if let (Ok(_), Some(sel)) = (&report, &only) {
+            let _ = crate::keep::unpin_all(&game_dir, sel);
+        }
         if let Ok(r) = &report {
             // the installed manifest is the freshest there is (install fetches its own) — keep
             // the replan cache in step, so the UI's post-apply refresh is a no-network replan
@@ -162,6 +173,8 @@ pub async fn uninstall(state: tauri::State<'_, Arc<AppState>>) -> Result<Uninsta
                 version: r.version,
                 restored: r.restored,
                 deleted: r.deleted,
+                kept: r.kept,
+                vanilla_kept: r.vanilla_kept,
                 winmm_orig_removed: r.winmm_orig_removed,
             })
             .map_err(CmdError::from)

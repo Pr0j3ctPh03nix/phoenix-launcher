@@ -110,6 +110,18 @@ pub struct Manifest {
     /// a schema-3 document with no bundles is exactly a schema-2 document (R1).
     #[serde(default)]
     pub bundles: Vec<Bundle>,
+    /// Paths the files view must not report as FOREIGN even though the manifest does not ship
+    /// them — the game's own runtime droppings (configs it rewrites, logs, replays, crash dumps).
+    /// Nothing here is ever written, deleted or verified; the list only decides what is worth
+    /// showing a user who asked "what is in my game folder that isn't the game".
+    ///
+    /// Data-driven on purpose. Which files a build scribbles is knowledge about Dota 2, not about
+    /// updaters, and baking it into the launcher would mean a release every time that changed —
+    /// the same reason the file list itself lives here. See `install::ignores_extra` for the three
+    /// match rules (exact / `dir/` prefix / `*.ext` suffix); absent means "quiet nothing", which
+    /// only ever costs noise in a view that is off by default.
+    #[serde(default)]
+    pub ignore: Vec<String>,
 }
 
 fn default_schema() -> u32 {
@@ -156,7 +168,88 @@ impl Manifest {
                 check_dest(&f.dest)?;
             }
         }
+        self.validate_hashes()?;
+        self.validate_dests()?;
         self.validate_bundles()
+    }
+
+    /// Every content hash must be 64 LOWERCASE hex — the form `hex::encode` produces and the only
+    /// form the reader compares against.
+    ///
+    /// Not cosmetic, and not fixable by being lenient here. The verification that matters compares
+    /// a manifest hash against hex the reader computed itself (`obtain_to_cache`, `plan_one`), so a
+    /// manifest written with UPPERCASE digests — what PowerShell's `Get-FileHash` emits, the
+    /// likeliest way a Windows-side producer would compute these — makes every entry mismatch
+    /// forever: the check view reports the whole payload as needing an update, and the install
+    /// downloads correct bytes and then refuses them as "verification failed". Accepting the
+    /// casing here instead would only move the lie: `build_local_check_view` compares
+    /// case-insensitively, so the offline verdict would say "ok" while the online one said
+    /// "update", about the same bytes. Name the defect at parse time, once.
+    ///
+    /// No B-number: this is a reader-side invariant the format spec leaves implicit, not one of
+    /// the producer's enumerated bundle guarantees.
+    fn validate_hashes(&self) -> Result<()> {
+        let malformed = |h: &str| {
+            h.len() != 64 || !h.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        };
+        // `.get`, not `[..12]`: a malformed hash can hold multibyte characters, and slicing on a
+        // non-boundary panics — the same trap check_dest and the B1 check document
+        let short = |h: &str| h.get(..12).unwrap_or(h).to_string();
+        for (_, sha, _) in self.payload_entries() {
+            if malformed(sha) {
+                bail_invalid(format!("entry sha256 {} is not 64 lowercase hex", short(sha)))?;
+            }
+        }
+        for b in &self.bundles {
+            if malformed(&b.psha256) {
+                bail_invalid(format!(
+                    "bundle {} psha256 {} is not 64 lowercase hex",
+                    b.name,
+                    short(&b.psha256)
+                ))?;
+            }
+            for m in &b.members {
+                if malformed(m) {
+                    bail_invalid(format!(
+                        "bundle {} member {} is not 64 lowercase hex",
+                        b.name,
+                        short(m)
+                    ))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// No two entries that can be installed AT THE SAME TIME may target one dest.
+    ///
+    /// Choice variants are exempt by construction — they share the option's single `dest` and
+    /// `resolve` emits exactly one of them — so the set that must be unique is files[] plus each
+    /// choice's dest plus every toggle's files.
+    ///
+    /// A collision is unrecoverable rather than untidy: `resolve` would emit the dest twice with
+    /// two different hashes, `plan` would score it twice, the install would write both and leave
+    /// whichever landed last, and every later check would report the loser as one file still to
+    /// change — an update no amount of applying can ever clear.
+    ///
+    /// `remove[]` is deliberately NOT folded in: `plan` already resolves a dest that is both
+    /// shipped and removed in favour of shipping it (`!managed.contains`), deterministically and
+    /// in the only sensible direction.
+    ///
+    /// No B-number — see `validate_hashes`.
+    fn validate_dests(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        let installable = self.files.iter().map(|f| f.dest.as_str()).chain(
+            self.options.iter().flat_map(|o| {
+                o.dest.as_deref().into_iter().chain(o.files.iter().map(|f| f.dest.as_str()))
+            }),
+        );
+        for dest in installable {
+            if !seen.insert(dest) {
+                bail_invalid(format!("two entries install to the same dest {dest}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Every file-bearing entry in the document — files[], toggle files, and choice variants —
@@ -440,6 +533,14 @@ mod tests {
         e.chain().any(|c| c.downcast_ref::<UnsupportedCodec>().is_some())
     }
 
+    /// A well-formed stand-in content hash: 64 lowercase hex from a repeated byte pair. Every hash
+    /// in a manifest under test has to be one (`validate_hashes`), so a case that is about
+    /// something ELSE — a dest, a schema, a bundle sum — says so by using this instead of a short
+    /// placeholder that would now be refused before its own subject was ever reached.
+    fn hash(pair: &str) -> String {
+        pair.repeat(32)
+    }
+
     /// Walks `index.json` and asserts every documented expectation against the real reader.
     #[test]
     fn dist_repo_conformance_suite() {
@@ -658,8 +759,9 @@ mod tests {
         ] {
             let src = format!(
                 r#"{{"schema":2,"version":"1.0.0","files":[
-                     {{"name":"a","dest":{},"sha256":"aa","size":1}}]}}"#,
-                serde_json::to_string(bad).unwrap()
+                     {{"name":"a","dest":{},"sha256":"{}","size":1}}]}}"#,
+                serde_json::to_string(bad).unwrap(),
+                hash("aa")
             );
             assert!(Manifest::parse(src.as_bytes()).is_err(), "dest {bad:?} must be refused");
         }
@@ -668,35 +770,139 @@ mod tests {
         for ok in ["game/CONFIG.txt", "game/null.txt", "game/COM.txt", "game/COMX.txt", "game/яя.txt"] {
             let src = format!(
                 r#"{{"schema":2,"version":"1.0.0","files":[
-                     {{"name":"a","dest":"{ok}","sha256":"aa","size":1}}]}}"#
+                     {{"name":"a","dest":"{ok}","sha256":"{}","size":1}}]}}"#,
+                hash("aa")
             );
             assert!(Manifest::parse(src.as_bytes()).is_ok(), "dest {ok:?} must be allowed");
         }
         // and the legitimate shapes still pass, including a `remove` and an option dest
-        let good = br#"{"schema":2,"version":"1.0.0",
-            "files":[{"name":"a","dest":"game/bin/win64/winmm.dll","sha256":"aa","size":1}],
-            "remove":[{"dest":"game/dota/old.txt"}],
-            "options":[{"id":"o","kind":"choice","label":"L","default":"v",
+        let good = format!(
+            r#"{{"schema":2,"version":"1.0.0",
+            "files":[{{"name":"a","dest":"game/bin/win64/winmm.dll","sha256":"{}","size":1}}],
+            "remove":[{{"dest":"game/dota/old.txt"}}],
+            "options":[{{"id":"o","kind":"choice","label":"L","default":"v",
                         "dest":"game/dota_phoenix/maps/dota.vpk",
-                        "variants":[{"id":"v","label":"V","name":"n","sha256":"bb","size":2}]}]}"#;
-        assert!(Manifest::parse(good).is_ok());
+                        "variants":[{{"id":"v","label":"V","name":"n","sha256":"{}","size":2}}]}}]}}"#,
+            hash("aa"),
+            hash("bb")
+        );
+        assert!(Manifest::parse(good.as_bytes()).is_ok());
     }
 
-    /// The B1/B3 messages truncate hashes for display; a broken manifest can put multibyte
-    /// garbage where a hash belongs, and a byte-index slice there panics mid-character. Must be
-    /// a clean refusal — a hostile document crashing the parser is strictly worse than the
+    /// Every message that names a hash truncates it for display; a broken manifest can put
+    /// multibyte garbage where a hash belongs, and a byte-index slice there panics mid-character.
+    /// Must be a clean refusal — a hostile document crashing the parser is strictly worse than the
     /// arbitrary-write it failed to achieve. ("aяяяяяя": byte 12 lands mid-я.)
+    ///
+    /// The hash-format check sees such a value first, so it is the one that has to survive it —
+    /// in an entry, in `members`, and in a bundle's `psha256`.
     #[test]
     fn multibyte_garbage_in_hashes_is_refused_without_panicking() {
-        let b1 = r#"{"schema":3,"version":"1","files":[],
-            "bundles":[{"name":"b","codec":"zstd","psize":1,"psha256":"p","size":1,
-                        "members":["aяяяяяя"]}]}"#;
-        let e = Manifest::parse(b1.as_bytes()).unwrap_err();
+        let good = hash("aa");
+        let cases = [
+            format!(
+                r#"{{"schema":3,"version":"1","files":[],
+                     "bundles":[{{"name":"b","codec":"zstd","psize":1,"psha256":"{good}","size":1,
+                                  "members":["aяяяяяя"]}}]}}"#
+            ),
+            format!(
+                r#"{{"schema":3,"version":"1","files":[],
+                     "bundles":[{{"name":"b","codec":"zstd","psize":1,"psha256":"aяяяяяя","size":1,
+                                  "members":["{good}"]}}]}}"#
+            ),
+            r#"{"schema":3,"version":"1",
+                "files":[{"dest":"game/x","sha256":"aяяяяяя","size":4}]}"#
+                .to_string(),
+        ];
+        for src in cases {
+            let e = Manifest::parse(src.as_bytes()).unwrap_err();
+            assert!(format!("{e:#}").contains("64 lowercase hex"), "got: {e:#}");
+        }
+    }
+
+    /// A WELL-FORMED hash that resolves to nothing is a different defect from a malformed one, and
+    /// keeps its own (B-numbered) message — the hash-format check must not swallow B1/B3.
+    #[test]
+    fn well_formed_but_unresolvable_hashes_still_fail_as_b1_and_b3() {
+        let orphan = format!(
+            r#"{{"schema":3,"version":"1","files":[],
+                 "bundles":[{{"name":"b","codec":"zstd","psize":1,"psha256":"{}","size":1,
+                              "members":["{}"]}}]}}"#,
+            hash("aa"),
+            hash("cc")
+        );
+        let e = Manifest::parse(orphan.as_bytes()).unwrap_err();
         assert!(format!("{e:#}").contains("B1"), "got: {e:#}");
-        let b3 = r#"{"schema":3,"version":"1",
-            "files":[{"dest":"game/x","sha256":"aяяяяяя","size":4}]}"#;
-        let e = Manifest::parse(b3.as_bytes()).unwrap_err();
+
+        // no `name`, in no bundle: nothing in the document says where its bytes come from
+        let unbundled = format!(
+            r#"{{"schema":3,"version":"1",
+                 "files":[{{"dest":"game/x","sha256":"{}","size":4}}]}}"#,
+            hash("cc")
+        );
+        let e = Manifest::parse(unbundled.as_bytes()).unwrap_err();
         assert!(format!("{e:#}").contains("B3"), "got: {e:#}");
+    }
+
+    /// An UPPERCASE digest is the realistic version of this defect: PowerShell's `Get-FileHash`
+    /// emits one, and every comparison the reader makes is against lowercase hex it computed
+    /// itself — so accepting it would mean a payload that is permanently "to update" and an
+    /// install that downloads correct bytes and then calls them corrupt.
+    #[test]
+    fn uppercase_and_short_hashes_are_refused_as_a_broken_release() {
+        for bad in ["AA".repeat(32), hash("aa")[..63].to_string(), format!("{}z", &hash("aa")[..63])] {
+            let src = format!(
+                r#"{{"schema":2,"version":"1.0.0",
+                     "files":[{{"name":"a","dest":"game/x","sha256":"{bad}","size":1}}]}}"#
+            );
+            let e = Manifest::parse(src.as_bytes()).unwrap_err();
+            assert!(format!("{e:#}").contains("64 lowercase hex"), "{bad} -> {e:#}");
+            assert!(!refused_for_schema(&e) && !refused_for_codec(&e), "a broken release, not a version gap");
+        }
+    }
+
+    /// Two entries that would be installed at once may not share a dest: `resolve` emits both,
+    /// the install writes both, one survives, and every later check reports the other as a change
+    /// that applying can never clear. Choice VARIANTS sharing the option's one dest is the legal
+    /// case and must keep parsing.
+    #[test]
+    fn two_entries_installing_to_one_dest_are_refused() {
+        let (a, b) = (hash("aa"), hash("bb"));
+        let collisions = [
+            // files[] against itself
+            format!(
+                r#""files":[{{"name":"a","dest":"game/dota/x.vpk","sha256":"{a}","size":1}},
+                            {{"name":"b","dest":"game/dota/x.vpk","sha256":"{b}","size":2}}]"#
+            ),
+            // a toggle's file against a core file
+            format!(
+                r#""files":[{{"name":"a","dest":"game/dota/x.vpk","sha256":"{a}","size":1}}],
+                   "options":[{{"id":"t","kind":"toggle","label":"L","default":false,
+                                "files":[{{"name":"b","dest":"game/dota/x.vpk","sha256":"{b}","size":2}}]}}]"#
+            ),
+            // a choice's dest against a core file
+            format!(
+                r#""files":[{{"name":"a","dest":"game/dota/x.vpk","sha256":"{a}","size":1}}],
+                   "options":[{{"id":"c","kind":"choice","label":"L","default":"v",
+                                "dest":"game/dota/x.vpk",
+                                "variants":[{{"id":"v","label":"V","name":"b","sha256":"{b}","size":2}}]}}]"#
+            ),
+        ];
+        for tail in collisions {
+            let src = format!(r#"{{"schema":2,"version":"1.0.0",{tail}}}"#);
+            let e = Manifest::parse(src.as_bytes()).unwrap_err();
+            assert!(format!("{e:#}").contains("same dest"), "got: {e:#}");
+        }
+
+        // the legal shape: two variants of ONE choice, sharing the option's dest
+        let legal = format!(
+            r#"{{"schema":2,"version":"1.0.0","files":[],
+                 "options":[{{"id":"c","kind":"choice","label":"L","default":"v1",
+                              "dest":"game/dota/x.vpk",
+                              "variants":[{{"id":"v1","label":"A","name":"a","sha256":"{a}","size":1}},
+                                          {{"id":"v2","label":"B","name":"b","sha256":"{b}","size":2}}]}}]}}"#
+        );
+        assert!(Manifest::parse(legal.as_bytes()).is_ok());
     }
 
     /// R8: arriving via a bundle relaxes nothing about `dest` — a nameless entry is checked

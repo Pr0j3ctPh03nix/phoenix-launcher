@@ -46,6 +46,8 @@ pub fn run_check(flags: &[String]) -> Result<()> {
             Action::Update => "update",
             Action::Install => "install",
             Action::Remove => "remove",
+            Action::Modified => "modified",
+            Action::Kept => "kept",
         };
         println!("  [{s:>7}] {}", f.dest);
     }
@@ -55,7 +57,7 @@ pub fn run_check(flags: &[String]) -> Result<()> {
 pub fn run_install(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
     let dl = Github::new(settings.token());
-    let r = install::install(&settings, &dl, tag.as_deref(), None, None)?;
+    let r = install::install(&settings, &dl, tag.as_deref(), None, None, None)?;
     println!("Installed {}: wrote {}, removed {}", r.version, r.written.len(), r.removed.len());
     // headless: warm the customization cache synchronously (the GUI runs this detached)
     install::warm_cache(&settings, &dl);
@@ -88,7 +90,7 @@ pub fn run_game_install(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let game_dir = settings.resolve_game_dir()?;
     let (dl, release, manifest) = game_repo_manifest(&settings)?;
-    let r = install::install_base(&game_dir, &dl, &release, &manifest, None, None)?;
+    let r = install::install_base(&game_dir, &dl, &release, &manifest, None, None, None)?;
     println!(
         "Base game {} ({}): wrote {} ({} MB), up-to-date {}, skipped {}",
         r.version,
@@ -106,17 +108,37 @@ pub fn run_game_verify(flags: &[String]) -> Result<()> {
     let game_dir = settings.resolve_game_dir()?;
     let (_dl, _release, manifest) = game_repo_manifest(&settings)?;
     let statuses = install::base_plan(&game_dir, &manifest, None, "verify", None)?;
-    let mut damaged = 0;
+    let mut differing = 0;
     for s in &statuses {
+        // one word per verdict, straight from the enum — the CLI and the GUI cannot drift into
+        // describing the same state differently
         match s.action {
-            install::BaseAction::Write => {
-                damaged += 1;
-                println!("  [damaged] {}", s.dest());
-            }
-            install::BaseAction::Skipped => println!("  [skipped] {}", s.dest()),
             install::BaseAction::UpToDate => {}
+            a => {
+                if a.writes() {
+                    differing += 1;
+                }
+                println!("  [{:>10}] {}", a.word(), s.dest());
+            }
         }
     }
-    println!("Verified {}: {} files, {} damaged", manifest.version, statuses.len(), damaged);
+    let claimed = std::collections::HashSet::new();
+    let (extras, end) = install::scan_extras(&game_dir, &manifest, &claimed, None);
+    let truncated = end == install::ExtrasEnd::Capped;
+    for e in &extras {
+        if e.files > 0 {
+            println!("  [ extraDir] {} ({} files)", e.path, e.files);
+        } else {
+            println!("  [    extra] {}", e.path);
+        }
+    }
+    println!(
+        "Verified {}: {} files, {} to restore, {} extra{}",
+        manifest.version,
+        statuses.len(),
+        differing,
+        extras.len(),
+        if truncated { " (scan truncated)" } else { "" }
+    );
     Ok(())
 }

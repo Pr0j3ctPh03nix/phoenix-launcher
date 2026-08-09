@@ -20,16 +20,31 @@ pub struct Asset {
 pub struct Release {
     pub tag_name: String,
     pub assets: Vec<Asset>,
-    /// The release description. The dist repo's "What's new" comes from its manifests instead, so
-    /// this is only read for the launcher's own releases (selfupdate.rs). Absent or JSON `null`
-    /// both land as None.
+    /// The release description. It is the LAUNCHER's "What's new" — both the pending-update
+    /// banner (selfupdate.rs) and the launcher history page (`engine::launcher_notes_history`)
+    /// render it. The dist repo's comes from its manifests instead. Absent or JSON `null` both
+    /// land as None.
     #[serde(default)]
     pub body: Option<String>,
+    /// Unpublished. Only ever visible to a token with push access; absent from an anonymous
+    /// listing entirely.
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
+    pub prerelease: bool,
 }
 
 impl Release {
     pub fn asset(&self, name: &str) -> Option<&Asset> {
         self.assets.iter().find(|a| a.name == name)
+    }
+
+    /// Is this a release the updater would actually offer? The `/releases` LISTING carries drafts
+    /// and prereleases; `/releases/latest` — which every check follows — carries neither. A
+    /// "What's new" page built from the unfiltered listing therefore advertises versions that can
+    /// never be installed, and dates its cache against a tag no check will ever report.
+    pub fn is_published(&self) -> bool {
+        !self.draft && !self.prerelease
     }
 
     /// Name -> asset, built once. `asset()` is a linear scan, which is fine for the handful of
@@ -92,6 +107,7 @@ pub mod fake {
     pub struct Fake {
         pub tag: String,
         pub assets: HashMap<String, Vec<u8>>,
+        pub prerelease: bool,
     }
 
     impl Fake {
@@ -100,13 +116,22 @@ pub mod fake {
             let mut map: HashMap<String, Vec<u8>> =
                 assets.into_iter().map(|(n, b)| (n.to_string(), b.to_vec())).collect();
             map.insert("manifest.json".to_string(), manifest_json.as_bytes().to_vec());
-            Self { tag: tag.to_string(), assets: map }
+            Self { tag: tag.to_string(), assets: map, prerelease: false }
+        }
+
+        /// Mark it a prerelease: it stays in the `/releases` listing and drops out of the
+        /// histories, which is exactly the case the exclusion exists for.
+        pub fn prerelease(mut self) -> Self {
+            self.prerelease = true;
+            self
         }
 
         fn release(&self) -> Release {
             Release {
                 tag_name: self.tag.clone(),
                 body: None,
+                draft: false,
+                prerelease: self.prerelease,
                 assets: self
                     .assets
                     .keys()

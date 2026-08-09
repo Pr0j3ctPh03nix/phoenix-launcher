@@ -21,6 +21,7 @@ mod engine;
 mod fslock;
 mod github;
 mod install;
+mod keep;
 mod launch;
 mod manifest;
 mod selfupdate;
@@ -64,8 +65,12 @@ fn run_gui() {
             cmd::game::game_install,
             cmd::game::game_repair,
             cmd::game::game_verify,
+            cmd::game::your_files,
+            cmd::game::game_delete_extras,
+            cmd::game::phoenix_keep,
             cmd::game::game_cancel,
             cmd::notes::release_notes,
+            cmd::notes::launcher_notes,
             cmd::selfupdate::launcher_check,
             cmd::selfupdate::launcher_update,
             cmd::selfupdate::launcher_info,

@@ -22,6 +22,17 @@ use crate::verify;
 pub struct OpProgress {
     /// Which operation, e.g. "install".
     pub op: &'static str,
+    /// Which HALF of that operation: `plan` (reading what is already there) or `fetch`
+    /// (downloading what is missing). A base run does both under one `op`, and the UI has one
+    /// progress line for them, so it has to be able to tell them apart.
+    ///
+    /// It must be stated, never inferred. The UI used to infer it from "does this tick carry
+    /// bytes", which is wrong in the one direction that matters: the PLAN narrates bytes too, for
+    /// files big enough that hashing them would otherwise freeze the counter. One 300 MB VPK
+    /// re-hashed on a retry was enough to make the line claim a download that had not started,
+    /// and to seed the byte accumulator with hash progress — after which the real download's
+    /// first tick drove the running total negative and pinned the bar at 0% for the whole run.
+    pub phase: &'static str,
     /// Current item number, 1-based (item `current` of `total` is in progress).
     pub current: u64,
     /// Items total.
@@ -46,18 +57,70 @@ pub type Progress<'a> = Option<&'a (dyn Fn(OpProgress) + Send + Sync)>;
 pub enum Action {
     /// Installed file already matches the manifest hash.
     UpToDate,
-    /// Installed but the hash differs.
+    /// Installed but the hash differs — and the bytes there are OURS (what we last wrote at this
+    /// dest, or a file that predates us and is preserved on displacement). Safe to overwrite.
     Update,
     /// Not present locally.
     Install,
     /// We placed it previously but it left the effective set (deselected option) — delete it.
     Remove,
+    /// We wrote this dest, and what is there now is neither the manifest's bytes nor the bytes we
+    /// wrote. Somebody else changed our file — or it rotted; from here the two are the same
+    /// observation and nothing in this process can tell them apart.
+    ///
+    /// Apply still FIXES it. That is deliberate and was the hard call: refusing would mean a
+    /// corrupted shim file could never be repaired by the button whose entire job is repairing
+    /// shim files, and "Up to date" would sit above a broken install. What changes is that the
+    /// user is told first — `CheckView::user_changed` drives a confirm that names the count and
+    /// offers the files view — and that a pin makes it `Kept` instead, permanently.
+    ///
+    /// The asymmetry with `Remove` is on purpose: a removal of modified content is not reported at
+    /// all (see `plan`). Overwriting a managed file with the content it is supposed to have is a
+    /// repair; deleting a file we have stopped managing because somebody edited it is just
+    /// deletion, and there is no version of that worth doing automatically.
+    Modified,
+    /// `Modified`, and the user pinned exactly these bytes as intentional (see keep.rs). Reported
+    /// so it is never invisible, acted on only when named.
+    Kept,
+}
+
+impl Action {
+    /// Work the RELEASE brings: a file it adds, replaces, or retires. Distinct from the whole
+    /// unattended set, because `Modified` is not the release's doing — it is the user's, and
+    /// counting it as "an update is available" put an Update button over a folder where nothing
+    /// new was on offer.
+    pub fn is_release_change(self) -> bool {
+        matches!(self, Action::Update | Action::Install | Action::Remove)
+    }
+
+    /// Does an ordinary apply act on this dest? Everything except `Kept` — a pin is the one
+    /// instruction that survives without being restated.
+    pub fn is_unattended(self) -> bool {
+        matches!(self, Action::Update | Action::Install | Action::Remove | Action::Modified)
+    }
+
+    /// Is this somebody's own work sitting at one of our dests — the thing the files view exists
+    /// to show, and the confirm exists to warn about?
+    pub fn is_users(self) -> bool {
+        matches!(self, Action::Modified | Action::Kept)
+    }
 }
 
 #[derive(Debug)]
 pub struct FileStatus {
     pub dest: String,
     pub action: Action,
+    /// `Modified` reached by a pin EXPIRING because the release changed this file — as opposed to
+    /// a difference nobody has ruled on. The two want opposite defaults: one is "take the new
+    /// version", the other is "you already said keep mine, and only the other side moved".
+    pub superseded: bool,
+    /// The release ships something NEWER than the version this file's current state was
+    /// established against — its pin's `theirs` if it has one, else the bytes we recorded
+    /// installing. Orthogonal to `action`: "these are my bytes" and "there is a new version of
+    /// this file" are two separate facts, and a row can carry both (it then reads "modified /
+    /// update"). Using the pin as the baseline where one exists is what stops a re-pinned file
+    /// from advertising the same update forever.
+    pub update_available: bool,
 }
 
 #[derive(Debug)]
@@ -76,9 +139,19 @@ pub struct CheckResult {
 
 impl CheckResult {
     /// Number of files that would change (written or removed).
+    /// What the RELEASE would change here — the number behind "N file(s) to change", the Update
+    /// button, and whether Play is held back. `Modified` is deliberately not counted: those files
+    /// are the user's own, the install is complete without touching them, and blocking Play over
+    /// somebody's mod (or counting it as an available update) claims something untrue.
     pub fn changes(&self) -> usize {
-        self.files.iter().filter(|f| f.action != Action::UpToDate).count()
+        self.files.iter().filter(|f| f.action.is_release_change()).count()
     }
+
+    // No `users()` counter here on purpose. The two callers that once shared it want DIFFERENT
+    // sets, and collapsing them into one number is what made the apply confirm overstate itself:
+    // the view counts `Modified` (what apply would overwrite), while `install::Ctx::user_changed`
+    // wants `Modified | Kept` (what must be preserved if displaced). Both read `Action::is_users`
+    // or match the variant directly, where the distinction is visible at the call site.
 }
 
 /// A file the install must replace or delete is locked by a live process — the game keeps its
@@ -196,20 +269,27 @@ pub struct NotesCache {
     pub entries: Vec<NotesEntry>,
 }
 
-fn notes_cache_path() -> Option<PathBuf> {
-    Settings::config_path().map(|p| p.with_file_name("notes_cache.json"))
+/// The file each history persists to. TWO files, not one keyed by repo: the shim's history and the
+/// launcher's are read from different pages, at different times, and a single slot would make
+/// opening either one evict the other — turning a page switch into a network round trip.
+/// The shim's name is historical and stays: an existing cache must not be orphaned by the split.
+pub const NOTES_FILE_SHIM: &str = "notes_cache.json";
+pub const NOTES_FILE_LAUNCHER: &str = "launcher_notes.json";
+
+fn notes_cache_path(file: &str) -> Option<PathBuf> {
+    Settings::config_path().map(|p| p.with_file_name(file))
 }
 
 impl NotesCache {
     /// Best-effort disk load; None on any miss or parse failure.
-    pub fn load() -> Option<Self> {
-        let text = std::fs::read_to_string(notes_cache_path()?).ok()?;
+    pub fn load(file: &str) -> Option<Self> {
+        let text = std::fs::read_to_string(notes_cache_path(file)?).ok()?;
         serde_json::from_str(&text).ok()
     }
 
     /// Best-effort disk save; a failure only costs a refetch next launch.
-    pub fn save(&self) {
-        let Some(p) = notes_cache_path() else { return };
+    pub fn save(&self, file: &str) {
+        let Some(p) = notes_cache_path(file) else { return };
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -238,7 +318,13 @@ pub fn fetch_notes_history(
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    let releases = dl.fetch_releases(&settings.source_repo).context("listing releases")?;
+    let all = dl.fetch_releases(&settings.source_repo).context("listing releases")?;
+    // Drafts and prereleases are dropped. The LISTING carries them; `/releases/latest`, which
+    // every check follows, does not — so keeping them would advertise a version the updater can
+    // never install, and would date the cache against a tag no check will ever report, making the
+    // freshness key miss on every open. Filtering here also makes `latest_tag` below agree with
+    // `/releases/latest` by construction.
+    let releases: Vec<&Release> = all.iter().filter(|r| r.is_published()).collect();
     let by_tag: BTreeMap<&str, &NotesEntry> =
         known.iter().map(|e| (e.tag.as_str(), e)).collect();
     // one slot per release keeps GitHub's newest-first order regardless of download timing
@@ -300,6 +386,39 @@ pub fn fetch_notes_history(
         latest_tag: releases.first().map(|r| r.tag_name.clone()).unwrap_or_default(),
         entries,
     })
+}
+
+/// The LAUNCHER's version history, from an already-fetched release list.
+///
+/// A pure transform, and deliberately not a sibling of `fetch_notes_history`: the launcher
+/// publishes its notes as the GitHub release DESCRIPTION (release.yml puts the annotated tag's
+/// body there), so the listing already carries every entry inline. That makes this history one
+/// API call with nothing to download per release and nothing to rebuild incrementally — the
+/// opposite cost shape from the shim's, whose notes live inside each release's manifest.json.
+///
+/// A release with a blank body is skipped, the same rule `selfupdate::available` applies to the
+/// pending update: an empty description is "no notes", not an empty section in the UI. The version
+/// is the tag without its leading "v", also as `available` reports it — these two views name the
+/// same build and must not disagree about what to call it.
+/// Drafts and prereleases are excluded here for the same reason as in `fetch_notes_history`: this
+/// page must not offer a version `launcher_check` will never see.
+pub fn launcher_notes_history(repo: &str, releases: &[Release]) -> NotesCache {
+    let published = || releases.iter().filter(|r| r.is_published());
+    let entries = published()
+        .filter_map(|r| {
+            let notes = r.body.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+            Some(NotesEntry {
+                tag: r.tag_name.clone(),
+                version: r.tag_name.trim_start_matches('v').to_string(),
+                notes: notes.to_string(),
+            })
+        })
+        .collect();
+    NotesCache {
+        repo: repo.to_string(),
+        latest_tag: published().next().map(|r| r.tag_name.clone()).unwrap_or_default(),
+        entries,
+    }
 }
 
 /// The effective selection for one option: the user's value if it is valid for this manifest,
@@ -376,19 +495,83 @@ pub fn plan(
     prev: Option<&InstalledState>,
     remove: &[crate::manifest::RemoveEntry],
 ) -> Vec<FileStatus> {
+    // What WE last wrote at each dest, and which bytes the user has approved there. Together they
+    // answer the question a bare manifest comparison cannot: a file that matches neither the
+    // manifest nor our own record was changed by somebody else, and is not ours to overwrite.
+    let ours: HashSet<(&str, &str)> = prev
+        .map(|p| p.files.iter().map(|f| (f.dest.as_str(), f.sha256.as_str())).collect())
+        .unwrap_or_default();
+    let keep = crate::keep::KeepList::load(game_dir);
+    let prev_sha: std::collections::HashMap<&str, &str> = prev
+        .map(|p| p.files.iter().map(|f| (f.dest.as_str(), f.sha256.as_str())).collect())
+        .unwrap_or_default();
+    // What this file's current state was decided against: the release version its pin was weighed
+    // over, or — with no pin — the bytes we recorded installing.
+    let baseline = |dest: &str| -> Option<&str> {
+        keep.files
+            .get(dest)
+            .and_then(|p| p.theirs())
+            .or_else(|| prev_sha.get(dest).copied())
+    };
+    // Only dests we have actually written can be "modified by the user" — see `classify`.
+    let placed: HashSet<&str> =
+        prev.map(|p| p.files.iter().map(|f| f.dest.as_str()).collect()).unwrap_or_default();
+
+    // How a local hash that is NOT the manifest's reads. Split out because the removal pass below
+    // has to ask the same question about the same file, and the two answers must never diverge.
+    let classify = |dest: &str, h: &str, theirs: &str| {
+        if !placed.contains(dest) || ours.contains(&(dest, h)) {
+            // Not a file we placed (a genuine pre-existing one — `back_up` preserves it into the
+            // vanilla store on displacement, which is what makes installing over it reversible),
+            // or exactly the bytes we last wrote. Either way, ours to replace.
+            Action::Update
+        } else if keep.is_kept(dest, h, Some(theirs)) {
+            Action::Kept
+        } else {
+            Action::Modified
+        }
+    };
+
     let mut out: Vec<FileStatus> = resolved
         .iter()
         .map(|f| {
             let local = game_dir.join(&f.dest);
-            let action = if !local.exists() {
-                Action::Install
-            } else {
-                match verify::sha256_file_cached(&local) {
+            let mut local_hash = String::new();
+            let action = match std::fs::metadata(&local) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Action::Install,
+                // Present but unstattable, or the wrong LENGTH: either way this is not the file
+                // the manifest describes, and the length says so without reading it — a content
+                // hash implies a content length. This runs on every check, over a payload that
+                // includes multi-hundred-MB VPKs.
+                //
+                // The shortcut is suspended for a dest we placed: "not the manifest's bytes" and
+                // "not anybody's bytes we know" are different verdicts, and only the hash can
+                // tell them apart. That set is a handful of files, not the base game's 4,635.
+                Err(_) => Action::Update,
+                Ok(md) if md.len() != f.size && !placed.contains(f.dest.as_str()) => Action::Update,
+                Ok(_) => match verify::sha256_file_cached(&local) {
                     Ok(h) if h == f.sha256 => Action::UpToDate,
-                    _ => Action::Update,
-                }
+                    Ok(h) => {
+                        let a = classify(&f.dest, &h, &f.sha256);
+                        local_hash = h;
+                        a
+                    }
+                    // A read failure lands on Update, unlike the base-game plan which reports it
+                    // apart (`BaseAction::Unreadable`). The asymmetry is deliberate: this set is
+                    // a handful of files whose next action is `apply`, and apply's
+                    // `probe_writable` diagnoses a lock or an ACL by name before downloading
+                    // anything. A base verify has no such follow-up — it IS the diagnosis, over
+                    // thousands of files, so there the cause has to travel with the verdict.
+                    Err(_) => Action::Update,
+                },
             };
-            FileStatus { dest: f.dest.clone(), action }
+            FileStatus {
+                superseded: action == Action::Modified
+                    && keep.superseded(&f.dest, &local_hash, Some(&f.sha256)),
+                update_available: baseline(&f.dest).is_some_and(|b| b != f.sha256),
+                dest: f.dest.clone(),
+                action,
+            }
         })
         .collect();
 
@@ -400,6 +583,20 @@ pub fn plan(
     let restored: HashSet<&str> = prev
         .map(|p| p.restored.iter().map(String::as_str).collect())
         .unwrap_or_default();
+    // A deletion is as destructive as an overwrite, and unlike an overwrite it has no upside: the
+    // dest is one we have STOPPED managing, so there is no correct content to put back and
+    // nothing is repaired by removing it. If the bytes are no longer the ones we wrote, the file
+    // is somebody's work — we drop the row entirely, which both leaves the file alone and stops
+    // claiming it, so the extras scan reports it as what it now is: a file in the folder that
+    // belongs to whoever put it there.
+    //
+    // A dest we never placed keeps its `Remove` (commit preserves it into the vanilla store, so
+    // that path is already reversible); only our own files can be modified out from under us.
+    let removal_action = |dest: &str| match verify::sha256_file_cached(&game_dir.join(dest)) {
+        Ok(h) if placed.contains(dest) && !ours.contains(&(dest, h.as_str())) => None,
+        // unreadable: it was ours by record, and a read failure is not evidence of a change
+        _ => Some(Action::Remove),
+    };
     let mut removed: HashSet<&str> = HashSet::new();
     if let Some(prev) = prev {
         for f in &prev.files {
@@ -407,7 +604,9 @@ pub fn plan(
                 && removed.insert(f.dest.as_str())
                 && game_dir.join(&f.dest).exists()
             {
-                out.push(FileStatus { dest: f.dest.clone(), action: Action::Remove });
+                if let Some(action) = removal_action(&f.dest) {
+                    out.push(FileStatus { dest: f.dest.clone(), action, superseded: false, update_available: false });
+                }
             }
         }
     }
@@ -417,7 +616,9 @@ pub fn plan(
             && removed.insert(r.dest.as_str())
             && game_dir.join(&r.dest).exists()
         {
-            out.push(FileStatus { dest: r.dest.clone(), action: Action::Remove });
+            if let Some(action) = removal_action(&r.dest) {
+                out.push(FileStatus { dest: r.dest.clone(), action, superseded: false, update_available: false });
+            }
         }
     }
     out
@@ -503,6 +704,8 @@ mod tests {
             Release {
                 tag_name: tag.into(),
                 body: None,
+                draft: false,
+                prerelease: false,
                 assets: names
                     .iter()
                     .map(|n| Asset {
@@ -571,6 +774,91 @@ mod tests {
         assert!(fetch_notes_history(&settings, &garbage, &[]).unwrap().entries.is_empty());
     }
 
+    /// A prerelease is in the `/releases` listing and NOT in `/releases/latest`. Showing it would
+    /// offer a version no check can ever see — and leave `latest_tag` naming a tag the freshness
+    /// key never matches, so every open would refetch the whole history.
+    #[test]
+    fn a_prerelease_is_not_history() {
+        let settings = Settings::default();
+        let json = serde_json::json!({ "version": "9.9.9", "notes": "### Nope", "files": [] })
+            .to_string();
+        assert_eq!(fetch_notes_history(&settings, &Fake::new("v9.9.9", &json, vec![]), &[])
+            .unwrap()
+            .entries
+            .len(), 1);
+        let cache =
+            fetch_notes_history(&settings, &Fake::new("v9.9.9", &json, vec![]).prerelease(), &[])
+                .unwrap();
+        assert!(cache.entries.is_empty(), "a prerelease has no place in the history");
+        assert_eq!(cache.latest_tag, "", "nor may it date the cache");
+    }
+
+    fn launcher_rel(tag: &str, body: Option<&str>) -> Release {
+        Release {
+            tag_name: tag.into(),
+            body: body.map(str::to_string),
+            draft: false,
+            prerelease: false,
+            assets: vec![],
+        }
+    }
+
+    #[test]
+    fn launcher_history_reads_release_bodies() {
+        let rels = vec![
+            launcher_rel("v1.3.0", Some("#### Added\n- two pages")),
+            launcher_rel("v1.2.9", Some("   \n  ")), // blank body = no notes, not an empty section
+            launcher_rel("v1.2.8", None),            // no body at all
+            launcher_rel("1.2.7", Some("plain")),    // a tag without the "v" still reports a version
+        ];
+        let c = launcher_notes_history("o/r", &rels);
+
+        assert_eq!(c.repo, "o/r");
+        // newest first, the listing's own order, with the note-less releases dropped
+        let got: Vec<(&str, &str)> =
+            c.entries.iter().map(|e| (e.tag.as_str(), e.version.as_str())).collect();
+        assert_eq!(got, [("v1.3.0", "1.3.0"), ("1.2.7", "1.2.7")]);
+        assert_eq!(c.entries[0].notes, "#### Added\n- two pages");
+        // the freshness key is the newest RELEASE, not the newest entry — the latest one carrying
+        // no notes must not silently date the cache to the one below it
+        assert_eq!(c.latest_tag, "v1.3.0");
+
+        assert_eq!(launcher_notes_history("o/r", &[]).latest_tag, "");
+    }
+
+    #[test]
+    fn launcher_history_skips_drafts_and_prereleases() {
+        let mut draft = launcher_rel("v2.0.0", Some("unpublished"));
+        draft.draft = true;
+        let mut pre = launcher_rel("v1.9.0-rc1", Some("not for everyone"));
+        pre.prerelease = true;
+        let rels = vec![draft, pre, launcher_rel("v1.8.0", Some("shipped"))];
+
+        let c = launcher_notes_history("o/r", &rels);
+        assert_eq!(c.entries.len(), 1);
+        assert_eq!(c.entries[0].tag, "v1.8.0");
+        // and the key dates to the newest PUBLISHED release, which is what /releases/latest —
+        // and therefore launcher_check — reports
+        assert_eq!(c.latest_tag, "v1.8.0");
+    }
+
+    /// The two histories must not share a file: one slot keyed by repo would make opening either
+    /// page evict the other's cache, turning a tab switch into a network round trip.
+    #[test]
+    fn the_two_histories_cache_to_different_files() {
+        assert_ne!(NOTES_FILE_SHIM, NOTES_FILE_LAUNCHER);
+        let (shim, launcher) =
+            (notes_cache_path(NOTES_FILE_SHIM), notes_cache_path(NOTES_FILE_LAUNCHER));
+        assert_ne!(shim, launcher);
+        // both beside settings.json, or neither (no config dir on this machine)
+        assert_eq!(shim.is_some(), launcher.is_some());
+        if let (Some(s), Some(l)) = (shim, launcher) {
+            assert_eq!(s.parent(), l.parent());
+            assert_eq!(s.file_name().unwrap(), NOTES_FILE_SHIM);
+            assert_eq!(l.file_name().unwrap(), NOTES_FILE_LAUNCHER);
+        }
+    }
+
     fn manifest() -> Manifest {
         serde_json::from_value(serde_json::json!({
             "version": "1.0.0", "tag": "v1.0.0",
@@ -624,8 +912,146 @@ mod tests {
         assert_eq!(r.iter().find(|f| f.dest == "game/dota/hud.vpk").unwrap().sha256, "bb");
     }
 
+    /// The scoring order: length first, hash second. Each case gets its OWN dest on purpose —
+    /// rewriting one path at the same length is invisible to the (size, mtime) hash memo (two
+    /// writes microseconds apart share an mtime on Windows), which would make this flaky rather
+    /// than wrong.
+    #[test]
+    fn plan_scores_by_length_then_hash() {
+        use sha2::Digest;
+        let dir = std::env::temp_dir().join("phoenix-engine-test-size");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("game/dota")).unwrap();
+        let good = hex::encode(sha2::Sha256::digest(b"GOOD"));
+        let entry = |dest: &str| {
+            serde_json::json!({ "name": "a.vpk", "dest": dest, "sha256": good, "size": 4 })
+        };
+        let m: Manifest = serde_json::from_value(serde_json::json!({
+            "version": "1.0.0",
+            "files": [entry("game/dota/ok.vpk"), entry("game/dota/bad.vpk"), entry("game/dota/long.vpk")]
+        }))
+        .unwrap();
+
+        std::fs::write(dir.join("game/dota/ok.vpk"), b"GOOD").unwrap();
+        std::fs::write(dir.join("game/dota/bad.vpk"), b"BAD!").unwrap(); // right length, wrong bytes
+        std::fs::write(dir.join("game/dota/long.vpk"), b"MUCH LONGER").unwrap(); // wrong length
+
+        let statuses = plan(&dir, &resolve(&m, &BTreeMap::new()), None, &[]);
+        let action = |dest: &str| statuses.iter().find(|s| s.dest == dest).unwrap().action;
+        assert_eq!(action("game/dota/ok.vpk"), Action::UpToDate);
+        assert_eq!(action("game/dota/bad.vpk"), Action::Update, "only the hash can catch this");
+        assert_eq!(action("game/dota/long.vpk"), Action::Update, "the length alone settles this");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pin is a decision about a COMPARISON. When the release changes the file the user chose
+    /// their version over, the thing they weighed is gone — the pin expires and the file comes
+    /// back as `Modified`, which is what puts it in the update menu. Without this a kept file
+    /// silently never received another update while the launcher reported "up to date".
+    #[test]
+    fn a_pin_expires_when_the_release_changes_that_file() {
+        let dir = std::env::temp_dir().join("phoenix-engine-test-pin-expiry");
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = manifest();
+        let resolved = resolve(&m, &BTreeMap::new());
+        let dest = resolved[0].dest.clone();
+        std::fs::create_dir_all(dir.join(&dest).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(&dest), b"my own version").unwrap();
+        let prev = InstalledState {
+            version: "0.9".into(),
+            files: vec![InstalledFile { dest: dest.clone(), sha256: "dd".into() }],
+            winmm_orig_created: false,
+            restored: Vec::new(),
+        };
+
+        // pinned against THIS release's version of the file
+        let mine = crate::verify::sha256_file_cached(&dir.join(&dest)).unwrap();
+        let mut k = crate::keep::KeepList::default();
+        k.pin(&dest, &mine, Some(resolved[0].sha256.clone()));
+        k.save(&dir).unwrap();
+        let st = plan(&dir, &resolved, Some(&prev), &[]);
+        assert_eq!(st.iter().find(|s| s.dest == dest).unwrap().action, Action::Kept);
+
+        // a new release ships different bytes at the same dest: the comparison the user made no
+        // longer exists, so we ask again rather than suppressing the update forever
+        let mut next = resolved.clone();
+        next[0].sha256 = "ff".repeat(32);
+        let st = plan(&dir, &next, Some(&prev), &[]);
+        let row = st.iter().find(|s| s.dest == dest).unwrap();
+        assert_eq!(row.action, Action::Modified, "the release moved on — re-ask");
+        assert!(row.action.is_unattended(), "and the update menu can act on it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An expired pin is not the same thing as a difference nobody ruled on, and the plan says
+    /// which is which — that is what lets the update menu leave the user's earlier answer standing
+    /// instead of silently reversing it.
+    #[test]
+    fn an_expired_pin_is_reported_as_superseded_not_merely_modified() {
+        let dir = std::env::temp_dir().join("phoenix-engine-test-superseded");
+        let _ = std::fs::remove_dir_all(&dir);
+        let m = manifest();
+        let mut resolved = resolve(&m, &BTreeMap::new());
+        let dest = resolved[0].dest.clone();
+        std::fs::create_dir_all(dir.join(&dest).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(&dest), b"my own version").unwrap();
+        let prev = InstalledState {
+            version: "0.9".into(),
+            files: vec![InstalledFile { dest: dest.clone(), sha256: "dd".into() }],
+            winmm_orig_created: false,
+            restored: Vec::new(),
+        };
+        let mine = crate::verify::sha256_file_cached(&dir.join(&dest)).unwrap();
+        let mut k = crate::keep::KeepList::default();
+        k.pin(&dest, &mine, Some(resolved[0].sha256.clone()));
+        k.save(&dir).unwrap();
+
+        // same release: the decision stands, untouched and unmentioned
+        let row = plan(&dir, &resolved, Some(&prev), &[]);
+        let row = row.iter().find(|s| s.dest == dest).unwrap();
+        assert_eq!(row.action, Action::Kept);
+        assert!(!row.superseded);
+
+        // the release changes that file: ask again, and say WHY it is being asked
+        resolved[0].sha256 = "ff".repeat(32);
+        let row = plan(&dir, &resolved, Some(&prev), &[]);
+        let row = row.iter().find(|s| s.dest == dest).unwrap();
+        assert_eq!(row.action, Action::Modified);
+        assert!(row.superseded, "the user ruled on this once; only the other side moved");
+
+        // and a file nobody ever pinned is plain Modified — the two must not collapse
+        std::fs::remove_file(crate::keep::KeepList::path(&dir)).unwrap();
+        let row = plan(&dir, &resolved, Some(&prev), &[]);
+        let row = row.iter().find(|s| s.dest == dest).unwrap();
+        assert_eq!(row.action, Action::Modified);
+        assert!(!row.superseded);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pin written before `theirs` existed carries no comparison, so it cannot have expired.
+    /// Holding it is the right way to be wrong: re-asking about every file somebody already
+    /// decided is worse than deferring one question.
+    #[test]
+    fn a_legacy_pin_without_a_comparison_still_holds() {
+        let dir = std::env::temp_dir().join("phoenix-engine-test-pin-legacy");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // the old on-disk shape: dest -> bare content hash
+        std::fs::write(
+            crate::keep::KeepList::path(&dir),
+            br#"{ "files": { "game/dota/x.vpk": "aa" } }"#,
+        )
+        .unwrap();
+        let k = crate::keep::KeepList::load(&dir);
+        assert!(k.is_kept("game/dota/x.vpk", "aa", Some("anything")), "no comparison to expire");
+        assert!(!k.is_kept("game/dota/x.vpk", "bb", None), "content still has to match");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An orphan whose bytes are still the ones we wrote is ours to clean up.
     #[test]
     fn plan_flags_orphans() {
+        use sha2::Digest;
         let dir = std::env::temp_dir().join("phoenix-engine-test-orphan");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("game/dota")).unwrap();
@@ -635,7 +1061,12 @@ mod tests {
         let resolved = resolve(&m, &BTreeMap::new()); // fx off
         let prev = InstalledState {
             version: "0.9".into(),
-            files: vec![InstalledFile { dest: "game/dota/fx.vpk".into(), sha256: "dd".into() }],
+            files: vec![InstalledFile {
+                dest: "game/dota/fx.vpk".into(),
+                // the REAL hash of what is on disk — the record has to be true for the file to
+                // count as ours, which is the whole distinction this plan now draws
+                sha256: hex::encode(sha2::Sha256::digest(b"x")),
+            }],
             winmm_orig_created: false,
             restored: Vec::new(),
         };
@@ -644,6 +1075,74 @@ mod tests {
         assert_eq!(orphan.action, Action::Remove);
         // and the others are Install (nothing on disk)
         assert!(statuses.iter().filter(|s| s.dest != "game/dota/fx.vpk").all(|s| s.action == Action::Install));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same orphan after somebody edited it: NOT reported at all. Dropping the row is what
+    /// leaves the file alone (apply only acts on rows) and simultaneously stops claiming the dest,
+    /// so the files view's extras scan reports it as what it has become — somebody else's file.
+    /// Deleting it to tidy up a deselected option would destroy work we did not do, and unlike an
+    /// overwrite of a MANAGED file there is no repair on the other side of it.
+    #[test]
+    fn plan_leaves_an_orphan_somebody_edited() {
+        let dir = std::env::temp_dir().join("phoenix-engine-test-orphan-edited");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("game/dota")).unwrap();
+        std::fs::write(dir.join("game/dota/fx.vpk"), b"my own edit").unwrap();
+
+        let m = manifest();
+        let resolved = resolve(&m, &BTreeMap::new());
+        let prev = InstalledState {
+            version: "0.9".into(),
+            // what we wrote, which is not what is there now
+            files: vec![InstalledFile { dest: "game/dota/fx.vpk".into(), sha256: "dd".into() }],
+            winmm_orig_created: false,
+            restored: Vec::new(),
+        };
+        let statuses = plan(&dir, &resolved, Some(&prev), &[]);
+        assert!(
+            !statuses.iter().any(|s| s.dest == "game/dota/fx.vpk"),
+            "an edited orphan is nobody's to delete, so it is not an action at all"
+        );
+        assert_eq!(std::fs::read(dir.join("game/dota/fx.vpk")).unwrap(), b"my own edit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A MANAGED file somebody edited is still repaired — but reported as theirs, so the shell can
+    /// warn before overwriting. Refusing outright would mean a corrupted shim file could never be
+    /// fixed by the button whose whole job is fixing shim files.
+    #[test]
+    fn plan_marks_a_managed_file_somebody_edited() {
+        let dir = std::env::temp_dir().join("phoenix-engine-test-modified");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("game/bin/win64")).unwrap();
+        let m = manifest();
+        let resolved = resolve(&m, &BTreeMap::new());
+        let dest = &resolved[0].dest;
+        std::fs::create_dir_all(dir.join(dest).parent().unwrap()).unwrap();
+        std::fs::write(dir.join(dest), b"somebody else's bytes").unwrap();
+
+        let prev = InstalledState {
+            version: "0.9".into(),
+            files: vec![InstalledFile { dest: dest.clone(), sha256: "dd".into() }],
+            winmm_orig_created: false,
+            restored: Vec::new(),
+        };
+        let statuses = plan(&dir, &resolved, Some(&prev), &[]);
+        let st = statuses.iter().find(|s| &s.dest == dest).unwrap();
+        assert_eq!(st.action, Action::Modified);
+        assert!(st.action.is_unattended(), "apply still repairs it");
+        assert!(st.action.is_users(), "and the shell is told whose bytes it would overwrite");
+
+        // pin those exact bytes and it becomes Kept: reported, never written
+        let h = crate::verify::sha256_file_cached(&dir.join(dest)).unwrap();
+        let mut k = crate::keep::KeepList::default();
+        k.pin(dest, &h, Some(resolved[0].sha256.clone()));
+        k.save(&dir).unwrap();
+        let statuses = plan(&dir, &resolved, Some(&prev), &[]);
+        let st = statuses.iter().find(|s| &s.dest == dest).unwrap();
+        assert_eq!(st.action, Action::Kept);
+        assert!(!st.action.is_unattended(), "a pin is an instruction that outlasts one dialog");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

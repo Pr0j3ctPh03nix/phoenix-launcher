@@ -296,6 +296,8 @@ mod tests {
         Release {
             tag_name: tag.to_string(),
             body: body.map(str::to_string),
+            draft: false,
+            prerelease: false,
             assets: assets
                 .iter()
                 .map(|n| Asset {

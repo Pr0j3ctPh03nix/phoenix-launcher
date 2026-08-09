@@ -47,19 +47,40 @@ pub fn open_repo_tagged(
         Some(t) => format!("the {repo} release {t}"),
         None => format!("the latest {repo} release"),
     };
+    open_repo_with(settings, what, |dl| dl.fetch_release(repo, tag))
+}
+
+/// `open_repo` for a repo's WHOLE release list — the launcher's version history. Same credential
+/// rule, because it is the same repo reached by a different endpoint: a private launcher repo
+/// refuses the listing exactly as it refuses the latest release.
+pub fn open_repo_releases(
+    repo: &str,
+    settings: &Settings,
+) -> AnyResult<(Box<dyn Downloader>, Vec<Release>)> {
+    open_repo_with(settings, || format!("the {repo} releases"), |dl| dl.fetch_releases(repo))
+}
+
+/// The anonymous-first / token-on-refusal rule itself, over any single repo read. It lives in ONE
+/// place on purpose: the rationale above is subtle (a 404 is indistinguishable from private, only
+/// an HTTP refusal earns the retry, offline must not pay two connect timeouts), and a second
+/// hand-rolled copy would drift from it.
+fn open_repo_with<T>(
+    settings: &Settings,
+    what: impl Fn() -> String,
+    call: impl Fn(&dyn Downloader) -> AnyResult<T>,
+) -> AnyResult<(Box<dyn Downloader>, T)> {
     let anon = Github::new(None);
-    match anon.fetch_release(repo, tag) {
-        Ok(r) => Ok((Box::new(anon), r)),
+    match call(&anon) {
+        Ok(v) => Ok((Box::new(anon), v)),
         Err(anon_err) => {
             let refused = anon_err
                 .chain()
                 .any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(_))));
             let (true, Some(t)) = (refused, settings.token()) else { return Err(anon_err) };
             let auth = Github::new(Some(t));
-            let r = auth
-                .fetch_release(repo, tag)
+            let v = call(&auth)
                 .with_context(|| format!("fetching {} (anonymously and with a token)", what()))?;
-            Ok((Box::new(auth), r))
+            Ok((Box::new(auth), v))
         }
     }
 }
@@ -77,6 +98,13 @@ pub struct AppState {
     /// The "What's new" history (also persisted to disk by the engine). `release_notes` validates
     /// freshness itself against the last checked tag, so nothing here needs invalidating.
     pub notes_cache: Mutex<Option<engine::NotesCache>>,
+    /// The LAUNCHER's own version history — a separate repo with a separate version line, shown
+    /// on its own page. Same freshness contract, keyed by `launcher_tag` instead.
+    pub launcher_notes_cache: Mutex<Option<engine::NotesCache>>,
+    /// The launcher repo's latest tag as of the last successful `launcher_check`. Plays the part
+    /// `manifest_cache.tag_name` plays for the shim: it is what lets a cached launcher history be
+    /// served without a round trip, and what expires it the moment a new launcher is published.
+    pub launcher_tag: Mutex<Option<String>>,
     pub autofind_cancel: Arc<AtomicBool>,
     pub autofind_running: AtomicBool,
     /// Cancels the base-game op in flight (`game_cancel` sets it; install_base's chunk callbacks

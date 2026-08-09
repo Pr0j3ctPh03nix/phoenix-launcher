@@ -35,6 +35,11 @@ use crate::{engine, fslock, verify};
 const STAGING_DIR: &str = ".phoenix-staging";
 const BACKUP_DIR: &str = ".phoenix-backup";
 const VANILLA_DIR: &str = ".phoenix-vanilla";
+/// Where a displaced file the USER wrote goes when the vanilla store's one slot for that dest is
+/// already holding the genuine stock file. Never restored automatically and never cleaned up: it
+/// is the only copy of bytes this launcher did not write, and the alternative was the ephemeral
+/// backup, which is deleted on success. `.phoenix*` is already invisible to the extras scan.
+const USER_DIR: &str = ".phoenix-yours";
 /// Content-addressed asset cache (file name = sha256). Every manifest asset — including unselected
 /// variants and disabled toggles — lands here via `warm_cache` (run detached by the shell after a
 /// successful install), so a later customization change never re-downloads. Pruned to the current
@@ -74,6 +79,13 @@ pub struct UninstallReport {
     pub version: String,
     pub restored: Vec<String>,
     pub deleted: Vec<String>,
+    /// Dests left in place because what is there is no longer what we installed. Reported, never
+    /// silently skipped — "reverted to stock" would be a false statement about a folder that
+    /// still holds these.
+    pub kept: Vec<String>,
+    /// `.phoenix-vanilla/` still holds preserved originals that had nowhere to go (their dests are
+    /// occupied by files in `kept`). The folder survives the uninstall so those originals do.
+    pub vanilla_kept: bool,
     pub winmm_orig_removed: bool,
 }
 
@@ -93,6 +105,8 @@ struct Ctx {
     game_dir: PathBuf,
     backup_root: PathBuf,
     vanilla_root: PathBuf,
+    /// Durable home for a displaced user edit that the vanilla store cannot take — see USER_DIR.
+    user_root: PathBuf,
     /// Dests the previous install managed (so an existing target is ours, not a vanilla original).
     prev_dests: HashSet<String>,
     /// Whether `prev_dests` can be believed. False when the state file is gone but the folder
@@ -104,6 +118,9 @@ struct Ctx {
     /// Dests where an earlier removal restored a preserved vanilla original (state.restored) —
     /// carried into the new state so `plan` keeps treating those files as stock, not ours.
     prev_restored: Vec<String>,
+    /// Dests we recorded writing whose bytes are no longer the bytes we wrote. `back_up` stops
+    /// calling these ours: the ephemeral backup it would otherwise pick is deleted on success.
+    user_changed: HashSet<String>,
 }
 
 /// Everything phase 2 places, removes and records.
@@ -116,12 +133,18 @@ struct CommitJob<'a> {
 
 /// `cancel` aborts the download phase (phase 1) between chunks. Phase 2 is NOT cancellable by
 /// design: a commit is the part that must either complete or roll back.
+/// `only`: restrict the run to these dests — the files view's "restore these Phoenix files"
+/// selection, and the ONLY way a `Modified`/`Kept` dest is written or removed. An ordinary apply
+/// passes `None` and never touches them. Same contract as `install_base`'s parameter, and for the
+/// same reason: the plan is recomputed here regardless, so the selection filters a fresh verdict
+/// rather than standing in for one.
 pub fn install(
     settings: &Settings,
     dl: &dyn Downloader,
     tag: Option<&str>,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
+    only: Option<&HashSet<String>>,
 ) -> Result<InstallReport> {
     let game_dir = settings.resolve_game_dir()?;
     let (release, manifest) = engine::fetch(settings, dl, tag)?;
@@ -145,20 +168,25 @@ pub fn install(
     let resolved = engine::resolve(&manifest, &settings.selections);
     let statuses = engine::plan(&game_dir, &resolved, prev.as_ref(), &manifest.remove);
     let up_to_date = statuses.iter().filter(|s| s.action == engine::Action::UpToDate).count();
+    // An apply acts on the unattended verdicts. A dest the user changed is acted on only when
+    // `only` names it — that naming IS the user checking it back on in the files view, and the
+    // caller drops its pin afterwards.
+    let acts_on = |s: &engine::FileStatus| match only {
+        Some(sel) => sel.contains(&s.dest) && s.action != engine::Action::UpToDate,
+        None => s.action.is_unattended(),
+    };
     let to_write: Vec<&FileEntry> = resolved
         .iter()
         .filter(|fe| {
-            statuses.iter().any(|s| {
-                s.dest == fe.dest
-                    && s.action != engine::Action::UpToDate
-                    && s.action != engine::Action::Remove
-            })
+            statuses
+                .iter()
+                .any(|s| s.dest == fe.dest && s.action != engine::Action::Remove && acts_on(s))
         })
         .collect();
     // everything plan wants gone: manifest remove[] entries + orphaned option files
     let removals: Vec<String> = statuses
         .iter()
-        .filter(|s| s.action == engine::Action::Remove)
+        .filter(|s| s.action == engine::Action::Remove && acts_on(s))
         .map(|s| s.dest.clone())
         .collect();
 
@@ -240,6 +268,18 @@ pub fn install(
         game_dir: game_dir.clone(),
         backup_root: game_dir.join(BACKUP_DIR).join(&manifest.version),
         vanilla_root: game_dir.join(VANILLA_DIR),
+        user_root: game_dir.join(USER_DIR),
+        // Derived from the same plan the write set came from, so `back_up` and `plan` can never
+        // disagree about whose bytes a file holds — computed once here rather than re-hashed
+        // per displaced file inside the commit.
+        // `plan` visits every resolved dest and every still-present orphan, which between them is
+        // every recorded dest that could be displaced — so its verdicts are complete here and
+        // nothing needs re-hashing.
+        user_changed: statuses
+            .iter()
+            .filter(|s| s.action.is_users())
+            .map(|s| s.dest.clone())
+            .collect(),
         prev_dests,
         trust_prev,
         prev_winmm_created,
@@ -429,6 +469,11 @@ const PROGRESS_GRAIN: u64 = 256 * 1024;
 /// Same idea for the per-FILE ticks of a plan/verify pass: one event per file across 4,635 files
 /// is a burst of pure overhead, and the counter only has to move visibly.
 const PLAN_GRAIN: u64 = 16;
+/// A file big enough that hashing it visibly stalls a per-FILE counter, and the tick spacing used
+/// while reading one. The game ships several VPKs in the hundreds of megabytes; on a cold verify
+/// each is tens of seconds during which the only honest thing to show is bytes.
+const BIG_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const BIG_FILE_TICK_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Transient-failure retries per asset before the run fails. The base game is 4,600+ requests
 /// against GitHub's CDN, which throws sporadic 5xxs — without retries the odds of one hiccup
@@ -564,17 +609,65 @@ fn costs_of(acqs: &[Acq]) -> (u64, u64, u64) {
     (wire, disk, disk + transient)
 }
 
-/// `costs_of` over a base plan's Write set — the numbers behind the download/repair confirms,
+/// `costs_of` over a base plan's to-write set — the numbers behind the download/repair confirms,
 /// computed with the exact math `install_base`'s own preflight uses.
 pub fn base_costs(manifest: &Manifest, statuses: &[BaseStatus]) -> Result<(u64, u64, u64)> {
+    base_costs_for(manifest, statuses.iter().filter(|s| s.action.writes()))
+}
+
+/// `base_costs` over an arbitrary subset — what a PARTIAL repair costs. Bundles make this
+/// non-additive (needing one member costs the whole packed asset, needing a second member of the
+/// same bundle costs nothing more), which is why a caller cannot get this by summing per-file
+/// numbers and must hand the whole subset over at once.
+pub fn base_costs_for<'a>(
+    manifest: &Manifest,
+    statuses: impl Iterator<Item = &'a BaseStatus>,
+) -> Result<(u64, u64, u64)> {
     let acqs = build_acqs(
         &manifest.bundles,
-        statuses
-            .iter()
-            .filter(|s| s.action == BaseAction::Write)
-            .map(|s| (s.entry.name.as_deref(), s.entry.sha256.as_str(), s.entry.size)),
+        statuses.map(|s| (s.entry.name.as_deref(), s.entry.sha256.as_str(), s.entry.size)),
     )?;
     Ok(costs_of(&acqs))
+}
+
+/// Which download a file rides in, and what that download costs on the wire.
+///
+/// Exists so the files view can total a live selection WITHOUT a round trip per checkbox: two
+/// entries sharing a key are one fetch, so "N selected · X GB" is a sum over DISTINCT keys — the
+/// same rule `costs_of` applies backend-side, expressed as data the UI can carry. Built once and
+/// reused; the member index alone is O(every bundle member).
+pub struct WireIndex<'a> {
+    member_of: HashMap<&'a str, &'a Bundle>,
+}
+
+impl<'a> WireIndex<'a> {
+    pub fn new(manifest: &'a Manifest) -> Self {
+        Self {
+            member_of: manifest
+                .bundles
+                .iter()
+                .flat_map(|b| b.members.iter().map(move |m| (m.as_str(), b)))
+                .collect(),
+        }
+    }
+
+    /// `(key, wire bytes)`. `None` = costs nothing to obtain (a zero-byte entry is materialized
+    /// locally, never fetched — see `Acq::Empty`). Raw entries key by CONTENT hash rather than
+    /// asset name because that is what `build_acqs` deduplicates on: two dests sharing bytes
+    /// download once.
+    pub fn of(&self, fe: &FileEntry) -> (Option<String>, u64) {
+        if fe.size == 0 {
+            (None, 0)
+        } else if fe.name.is_some() {
+            (Some(fe.sha256.clone()), fe.size)
+        } else if let Some(b) = self.member_of.get(fe.sha256.as_str()) {
+            (Some(format!("bundle:{}", b.name)), b.psize)
+        } else {
+            // B3 makes this unreachable for a validated manifest; reporting it as free is the
+            // harmless reading, and `install_base`'s own preflight bails on it properly.
+            (None, 0)
+        }
+    }
 }
 
 /// Fetch every to-write file into the asset cache with a small worker pool. Errors fail the
@@ -671,6 +764,7 @@ fn obtain_all_tagged(
                     for item in &items {
                         report(engine::OpProgress {
                             op,
+                            phase: "fetch",
                             current,
                             total,
                             item: Some((*item).to_string()),
@@ -710,6 +804,7 @@ fn obtain_all_tagged(
                                 for dest in &dests_of[*sha256] {
                                     report(engine::OpProgress {
                                         op,
+                                        phase: "fetch",
                                         current: d,
                                         total,
                                         item: Some((*dest).to_string()),
@@ -731,6 +826,7 @@ fn obtain_all_tagged(
                                     for dest in &dests_of[*sha] {
                                         report(engine::OpProgress {
                                             op,
+                                            phase: "fetch",
                                             current: d,
                                             total,
                                             item: Some((*dest).to_string()),
@@ -1013,7 +1109,10 @@ fn obtain_to_cache(
         .with_context(|| format!("the release has no asset named {name}"))?;
     let tmp = cache.join(format!("{sha256}.part"));
     let mut attempt = 0u32;
-    let (got_size, got_sha) = loop {
+    // A verification failure that followed a RESUME indicts the prefix we inherited, not the
+    // source — spend one clean restart before calling the release broken. See the bail below.
+    let mut may_restart_clean = true;
+    loop {
         // an interrupted attempt (an earlier run's, or this loop's previous try) left a .part —
         // resume from its length instead of restarting.
         // ...but a .part that already reached the full length can never be resumed: the Range
@@ -1027,7 +1126,33 @@ fn obtain_to_cache(
             resume_from = 0;
         }
         match dl.download_to(asset, &tmp, resume_from, chunk) {
-            Ok(v) => break v,
+            Ok((got_size, got_sha)) => {
+                if got_size == size && got_sha == sha256 {
+                    break;
+                }
+                // Wrong bytes. Resume cannot help either way, so the .part goes.
+                let _ = std::fs::remove_file(&tmp);
+                // Whose fault is it? If this attempt RESUMED, the hash covers a prefix we did not
+                // fetch and did not verify — and that prefix has a mundane way of being wrong that
+                // has nothing to do with the release: NTFS journals metadata, not data, so a
+                // power loss can leave a `.part` whose LENGTH persisted while its tail never made
+                // it out of the cache. Resuming past that hashes zeros, and the mismatch only
+                // surfaces after the whole remainder has been re-fetched — a 16 GB run spent to
+                // reach a wall the next run would walk straight back into. So spend one restart
+                // from zero before blaming the source. (A server that DECLINED the Range answered
+                // from zero already and this restart is redundant; it costs one extra download in
+                // a case that was failing anyway, and there is no way to tell from here.)
+                if resume_from > 0 && may_restart_clean {
+                    may_restart_clean = false;
+                    continue;
+                }
+                // Fetched whole and still wrong: that is a fact about the source, not about us.
+                // Not retried — `transient_net_failure` deliberately excludes verification, and
+                // re-asking a settled question just burns the link.
+                bail!(
+                    "verification failed for {name}: manifest {size}b/{sha256} got {got_size}b/{got_sha}"
+                );
+            }
             Err(e) => {
                 // keep the .part — the next attempt (or run) resumes from it — unless it is now
                 // full-length or longer, which no future Range request could extend
@@ -1060,11 +1185,6 @@ fn obtain_to_cache(
                 }
             }
         }
-    };
-    if got_size != size || got_sha != sha256 {
-        // wrong bytes (corrupt source or a poisoned .part): resume can't help — start over
-        let _ = std::fs::remove_file(&tmp);
-        bail!("verification failed for {name}: manifest {size}b/{sha256} got {got_size}b/{got_sha}");
     }
     std::fs::rename(&tmp, &cpath).with_context(|| format!("caching {name}"))?;
     Ok(cpath)
@@ -1209,7 +1329,14 @@ fn clear_dir_files(dir: &Path) {
 /// Move an existing `target` aside and return where it went. Ours -> ephemeral rollback backup;
 /// a genuine pre-existing file -> the permanent vanilla store (kept only the first time).
 fn back_up(ctx: &Ctx, dest: &str, target: &Path) -> Result<PathBuf> {
-    let ours = ctx.prev_dests.contains(dest);
+    // "Ours" is a claim about BYTES, not about a dest. The record says we wrote specific content
+    // here; if the content changed, the file we wrote is gone and what sits there was put there by
+    // somebody else. Treating that as ours would send it to the ephemeral backup, which is deleted
+    // on success — so a user's edit to a Phoenix file evaporated the next time the file was
+    // displaced, with no copy anywhere. Routed to the vanilla store instead it survives, and
+    // uninstall puts it back, which is the only reading of "revert" that does not throw away work
+    // the launcher did not do.
+    let ours = ctx.prev_dests.contains(dest) && !ctx.user_changed.contains(dest);
     let vanilla = ctx.vanilla_root.join(dest);
     // Promoting a file to the vanilla store is IRREVERSIBLE in effect: uninstall restores whatever
     // is in there as "stock". So it only happens when `prev_dests` is trustworthy. Without the
@@ -1218,10 +1345,18 @@ fn back_up(ctx: &Ctx, dest: &str, target: &Path) -> Result<PathBuf> {
     // the shim back and report the game as stock. `trust_prev` is false exactly when the state is
     // missing AND the folder shows evidence of a prior install; the cost is an ephemeral backup
     // instead of a preserved original, which is the safe direction to be wrong in.
-    let to = if ctx.trust_prev && !ours && !vanilla.exists() {
+    let to = if !ctx.trust_prev || ours {
+        ctx.backup_root.join(dest)
+    } else if !vanilla.exists() {
         vanilla
     } else {
-        ctx.backup_root.join(dest)
+        // The vanilla slot for this dest is already holding the genuine stock file — the one
+        // uninstall has to put back — so what is being displaced here is the user's edit of OUR
+        // file, and it needs a home of its own. It used to fall through to the ephemeral backup,
+        // which is deleted on success: an edit to a Phoenix file at a dest that once had a stock
+        // original evaporated on the next update, with no copy anywhere. One slot, two files that
+        // both matter, so the second one gets its own store.
+        ctx.user_root.join(dest)
     };
     if let Some(p) = to.parent() {
         std::fs::create_dir_all(p)?;
@@ -1309,10 +1444,32 @@ pub fn uninstall(settings: &Settings) -> Result<UninstallReport> {
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
 
+    let mut kept = Vec::new();
     for f in &state.files {
         let target = game_dir.join(&f.dest);
         let vanilla = vanilla_root.join(&f.dest);
+        // Is this still the file we installed? Uninstall deletes on the strength of the record
+        // saying "we put this here", and that record stops being true the moment somebody edits
+        // the file. Deleting it then destroys their work while reporting a clean revert — so a
+        // changed file is left exactly where it is and named in the report instead.
+        //
+        // Note which way the unreadable case falls: a file we cannot hash is NOT assumed changed.
+        // The record is the only evidence available and it says the file is ours; refusing to
+        // remove it would leave the shim's own winmm.dll behind whenever an antivirus held it for
+        // a second, which is a half-uninstalled game that still loads Phoenix.
+        let changed = verify::sha256_file_cached(&target).is_ok_and(|h| h != f.sha256);
+        if changed && !vanilla.exists() {
+            kept.push(f.dest.clone());
+            continue;
+        }
         if vanilla.exists() {
+            // A preserved original outranks the current file only when the current file is still
+            // ours. If the user changed it, moving the original back would bury their version
+            // under the very "restore" that is supposed to be doing them a favour.
+            if changed {
+                kept.push(f.dest.clone());
+                continue;
+            }
             if let Some(p) = target.parent() {
                 std::fs::create_dir_all(p)?;
             }
@@ -1345,10 +1502,42 @@ pub fn uninstall(settings: &Settings) -> Result<UninstallReport> {
     // shim entries only — an interrupted base-game download lives in a subdirectory and is not
     // this operation's to discard
     clear_dir_files(&game_dir.join(CACHE_DIR));
-    let _ = std::fs::remove_dir_all(&vanilla_root);
+    // The store goes only when everything in it went home. What `restore_vanilla_tree` could not
+    // place is an original whose dest is occupied by a file the user put there — the one copy of
+    // a file they may well want back. Deleting the store on the way out would take it with us, so
+    // an un-emptied store survives the uninstall and is reported rather than silently discarded.
+    let vanilla_kept = tree_has_files(&vanilla_root);
+    if !vanilla_kept {
+        let _ = std::fs::remove_dir_all(&vanilla_root);
+    }
     let _ = std::fs::remove_file(InstalledState::path(&game_dir));
 
-    Ok(UninstallReport { version: state.version, restored, deleted, winmm_orig_removed })
+    Ok(UninstallReport {
+        version: state.version,
+        restored,
+        deleted,
+        kept,
+        vanilla_kept,
+        winmm_orig_removed,
+    })
+}
+
+/// Does this tree hold any FILE (at any depth)? Empty directories do not count — they are the
+/// residue of a store whose contents all went home.
+fn tree_has_files(dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(dir) else { return false };
+    for e in rd.flatten() {
+        match e.metadata() {
+            Ok(md) if md.is_dir() => {
+                if tree_has_files(&e.path()) {
+                    return true;
+                }
+            }
+            Ok(_) => return true,
+            Err(_) => return true, // cannot tell: assume something is there rather than delete it
+        }
+    }
+    false
 }
 
 /// Restore every file remaining under the vanilla store to its game-relative path. Skips a dest
@@ -1400,18 +1589,57 @@ fn restore_vanilla_tree(
 // A dest the shim itself manages (recorded in .phoenix-state.json) with no vanilla copy is
 // untouchable and reported as skipped.
 
-/// What the base plan decided for one manifest file.
+/// What the base plan decided for one manifest file — ONE axis, deliberately.
+///
+/// This used to be three variants plus an `unreadable` bool, which forced every reader to
+/// reconstruct the real question ("what am I looking at?") from two fields. The distinctions that
+/// matter to a user are all differences from vanilla; what separates them is *what we know about
+/// the difference*, and that is exactly one thing per file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseAction {
     /// The file (at its live path, or its preserved vanilla copy) matches the manifest hash.
     UpToDate,
-    /// Missing or hash-mismatched — download and place at `target`.
-    Write,
+    /// Not there at all. The one unambiguous verdict: nothing is lost by writing it back.
+    Missing,
+    /// Present, read in full, and NOT the manifest's bytes. Note what this does NOT say: it is a
+    /// difference, not damage. A mod that replaces a stock file lands here identically to a
+    /// corrupted one, and only the user can tell them apart — which is why the files view shows
+    /// the evidence (size delta, when it changed) instead of calling it "damaged".
+    Differs,
+    /// Present but could not be READ — a lock, an ACL, a bad sector. Not a statement about its
+    /// contents; the cure is usually antivirus or permissions, not a download. Still written by a
+    /// repair (rewriting IS the cure when the cause is the disk) and `probe_writable` names a lock
+    /// or an ACL before a byte downloads.
+    Unreadable,
+    /// Differs, and the user pinned exactly these bytes as intentional (see keep.rs). Never
+    /// written unless a caller names it explicitly — a pin is an instruction, not a hint.
+    Kept,
     /// The shim manages this dest and no vanilla copy exists — nothing here is ours to touch.
     Skipped,
 }
 
-/// One base-game file's verdict.
+impl BaseAction {
+    /// Does the pipeline write this of its own accord? The three unapproved differences do; a
+    /// `Kept` file takes an explicit selection, and the other two are nothing to do.
+    pub fn writes(self) -> bool {
+        matches!(self, BaseAction::Missing | BaseAction::Differs | BaseAction::Unreadable)
+    }
+
+    /// The wire name for this verdict — one word, shared by the view layer and the debug CLI so
+    /// they can never drift into describing the same state differently.
+    pub fn word(self) -> &'static str {
+        match self {
+            BaseAction::UpToDate => "intact",
+            BaseAction::Missing => "missing",
+            BaseAction::Differs => "modified",
+            BaseAction::Unreadable => "unreadable",
+            BaseAction::Kept => "kept",
+            BaseAction::Skipped => "skipped",
+        }
+    }
+}
+
+/// One base-game file's verdict, plus the evidence a user needs to judge it.
 ///
 /// Carries the manifest `entry` itself rather than just a dest: every caller needs the size and
 /// hash (to total bytes, to dedupe shared content, to download), and looking those back up meant
@@ -1420,6 +1648,17 @@ pub enum BaseAction {
 pub struct BaseStatus {
     pub action: BaseAction,
     pub entry: FileEntry,
+    /// Size on disk. Together with `entry.size` this is the one piece of hard evidence about a
+    /// difference we can state as fact — "2.1 MB of an expected 340 MB" is a truncated download,
+    /// and no mod looks like that.
+    pub local_size: Option<u64>,
+    /// Last-modified, unix seconds. The other half of the evidence: vanilla files all carry the
+    /// install date, so a file touched months later is a change someone made on purpose. Read for
+    /// free — the hash memo stats every file anyway.
+    pub mtime: Option<u64>,
+    /// `Differs` reached by a pin EXPIRING because the manifest changed this file, rather than a
+    /// difference nobody has ruled on. See `engine::FileStatus::superseded`.
+    pub superseded: bool,
     /// Where the file actually lives for us: the live path, or its preserved copy under
     /// .phoenix-vanilla when the shim removed the dest.
     target: PathBuf,
@@ -1463,12 +1702,43 @@ pub fn base_plan(
     op: &'static str,
     cancel: Option<&AtomicBool>,
 ) -> Result<Vec<BaseStatus>> {
+    base_plan_of(game_dir, manifest, progress, op, cancel, None)
+}
+
+/// `base_plan` over a SUBSET of the manifest — the verdicts for named dests and nothing else.
+///
+/// The cost of a base plan *is* the hashing, so filtering the entry list is what makes a narrow
+/// question cheap: `your_files` needs the state of the handful of dests the user has pinned, and
+/// reading 15 GB to answer that would be the very thing that screen exists to avoid. `only` names
+/// dests in manifest form; one the manifest does not carry is simply absent from the result,
+/// because there is no authority verdict to give about it.
+///
+/// Every other rule is `base_plan`'s, unchanged — pins, the shim's claim on a dest, and the
+/// preserved-vanilla redirect all still apply, because a subset must not answer differently from
+/// the whole for the files it does cover.
+pub fn base_plan_of(
+    game_dir: &Path,
+    manifest: &Manifest,
+    progress: engine::Progress,
+    op: &'static str,
+    cancel: Option<&AtomicBool>,
+    only: Option<&HashSet<String>>,
+) -> Result<Vec<BaseStatus>> {
     // resolve with no selections: today's game manifests carry no options, and if one ever does,
     // installing its defaults is the right reading
     let entries = engine::resolve(manifest, &Default::default());
+    let entries: Vec<_> = match only {
+        Some(want) => entries.into_iter().filter(|f| want.contains(&f.dest)).collect(),
+        None => entries,
+    };
     let shim_managed: HashSet<String> = crate::state::InstalledState::load(game_dir)
         .map(|s| s.files.into_iter().map(|f| f.dest).collect())
         .unwrap_or_default();
+    // Loaded here rather than passed in, exactly like the install record above: the pins describe
+    // THIS folder, so every caller that plans it wants the same answer and none of them should be
+    // able to forget to ask. A plan that ignored pins would report the user's mods as differences
+    // again, and `install_base` re-plans before writing — that re-plan is the one that must not.
+    let keep = crate::keep::KeepList::load(game_dir);
     let vanilla_root = game_dir.join(VANILLA_DIR);
     let total = entries.len() as u64;
 
@@ -1482,7 +1752,7 @@ pub fn base_plan(
     let done = AtomicU64::new(0);
     let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
     std::thread::scope(|s| {
-        for _ in 0..HASH_WORKERS.min(entries.len().max(1)) {
+        for _ in 0..hash_workers().min(entries.len().max(1)) {
             s.spawn(|| loop {
                 // one relaxed load per file, against a file hash — free, and it is the only place
                 // a worker can be stopped without abandoning a half-read file
@@ -1494,7 +1764,24 @@ pub fn base_plan(
                     return;
                 }
                 let fe = &entries[i];
-                let st = plan_one(game_dir, &vanilla_root, &shim_managed, fe);
+                // Narrate the read itself for the few files big enough to stall the counter. The
+                // closure is only built (and only fires) for those — see plan_one.
+                let tick = |read: u64| {
+                    if let Some(p) = progress {
+                        p(engine::OpProgress {
+                            op,
+                            phase: "plan",
+                            current: done.load(Ordering::Relaxed),
+                            total,
+                            item: Some(fe.dest.clone()),
+                            bytes_done: Some(read),
+                            bytes_total: Some(fe.size),
+                            done: false,
+                        });
+                    }
+                };
+                let on_read: Option<&dyn Fn(u64)> = progress.map(|_| &tick as &dyn Fn(u64));
+                let st = plan_one(game_dir, &vanilla_root, &shim_managed, &keep, fe, on_read);
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                 // Throttled like the byte ticks are. One event per file means 4,635 JSON
                 // serializations + webview postMessages + JS handler calls in a burst — and a warm
@@ -1504,12 +1791,13 @@ pub fn base_plan(
                     if d.is_multiple_of(PLAN_GRAIN) || d == total {
                         p(engine::OpProgress {
                             op,
+                            phase: "plan",
                             current: d,
                             total,
                             item: Some(fe.dest.clone()),
                             bytes_done: None,
                             bytes_total: None,
-                            done: st.action != BaseAction::Write,
+                            done: !st.action.writes(),
                         });
                     }
                 }
@@ -1523,35 +1811,112 @@ pub fn base_plan(
     Ok(slots.into_inner().unwrap().into_iter().flatten().collect())
 }
 
-/// One file's verdict, and WHERE it lives for us — see `base_plan`'s coexistence rules.
-fn plan_one(
+/// WHICH FILE a base dest's verdict is about, and whether there is one to give.
+///
+/// Not always `game_dir/dest`: the shim can occupy that path, or have relocated the stock file, in
+/// which case the base file is its preserved original under `.phoenix-vanilla/`. Everything that
+/// forms an opinion about a base dest — the plan, and the pin recorded from the plan's answer —
+/// has to look at the same file, or a pin records an approval of bytes nobody compared.
+pub fn base_target(
     game_dir: &Path,
     vanilla_root: &Path,
     shim_managed: &HashSet<String>,
-    fe: &FileEntry,
-) -> BaseStatus {
-    let live = game_dir.join(&fe.dest);
-    let vanilla = vanilla_root.join(&fe.dest);
-    let (target, checkable) = if shim_managed.contains(&fe.dest) {
+    dest: &str,
+) -> (PathBuf, bool) {
+    let live = game_dir.join(dest);
+    let vanilla = vanilla_root.join(dest);
+    if shim_managed.contains(dest) {
         // the shim owns the live path; its preserved original (if any) is the base file
-        (vanilla.clone(), vanilla.exists())
+        let exists = vanilla.exists();
+        (vanilla, exists)
     } else if !live.exists() && vanilla.exists() {
         // shim remove[] relocated it — verify/repair the preserved copy, not the void
         (vanilla, true)
     } else {
         (live, true)
-    };
+    }
+}
+
+/// `base_target`'s path, resolved for a caller that has only the game folder — the shape
+/// `keep::pin_all` wants. Loads the install record once; the returned closure is cheap per dest.
+pub fn base_paths(game_dir: &Path) -> impl Fn(&str) -> PathBuf + '_ {
+    let shim_managed: HashSet<String> = crate::state::InstalledState::load(game_dir)
+        .map(|s| s.files.into_iter().map(|f| f.dest).collect())
+        .unwrap_or_default();
+    let vanilla_root = game_dir.join(VANILLA_DIR);
+    move |dest| base_target(game_dir, &vanilla_root, &shim_managed, dest).0
+}
+
+/// One file's verdict, and WHERE it lives for us — see `base_plan`'s coexistence rules.
+fn plan_one(
+    game_dir: &Path,
+    vanilla_root: &Path,
+    shim_managed: &HashSet<String>,
+    keep: &crate::keep::KeepList,
+    fe: &FileEntry,
+    on_read: Option<&dyn Fn(u64)>,
+) -> BaseStatus {
+    let (target, checkable) = base_target(game_dir, vanilla_root, shim_managed, &fe.dest);
+    // Whether this dest carries a pin decides how hard we look below, so it is read once up front.
+    let pinned = keep.files.contains_key(&fe.dest);
+    let mut local_size = None;
+    let mut mtime = None;
+    let mut superseded = false;
+
     let action = if !checkable {
         BaseAction::Skipped
-    } else if !target.exists() {
-        BaseAction::Write
     } else {
-        match verify::sha256_file_cached(&target) {
-            Ok(h) if h == fe.sha256 => BaseAction::UpToDate,
-            _ => BaseAction::Write,
+        match std::fs::metadata(&target) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BaseAction::Missing,
+            // there, but we cannot even stat it — as unreadable as a file whose bytes won't come
+            Err(_) => BaseAction::Unreadable,
+            Ok(md) => {
+                local_size = Some(md.len());
+                mtime = md
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs());
+                // The LENGTH settles it without reading a byte: a content hash implies a content
+                // length, so a size mismatch cannot possibly hash clean. This is the common damage
+                // — a file truncated by a killed download or a full disk — and it used to be read
+                // in full (these include multi-hundred-MB VPKs) to conclude what the metadata
+                // already proved. The memo fetches this metadata anyway, so the check is free.
+                //
+                // A PIN suspends the shortcut, and only for the pinned dests. A kept file is
+                // normally a different SIZE as well as different bytes (that is what replacing a
+                // file means), so short-circuiting here would make it impossible for a pin to ever
+                // match — the feature would be dead on arrival for exactly the files it exists
+                // for. The extra reads are bounded by the number of pins, which is a handful.
+                if md.len() != fe.size && !pinned {
+                    BaseAction::Differs
+                } else {
+                    // Only the big ones narrate: below the threshold a file is gone before a tick
+                    // could mean anything, and the events would be pure noise on the wire.
+                    let (every, cb) = if fe.size >= BIG_FILE_BYTES {
+                        (BIG_FILE_TICK_BYTES, on_read)
+                    } else {
+                        (0, None)
+                    };
+                    match verify::sha256_file_cached_with(&target, every, cb) {
+                        Ok(h) if h == fe.sha256 => BaseAction::UpToDate,
+                        Ok(h) if keep.is_kept(&fe.dest, &h, Some(&fe.sha256)) => {
+                            BaseAction::Kept
+                        }
+                        Ok(h) if keep.superseded(&fe.dest, &h, Some(&fe.sha256)) => {
+                            superseded = true;
+                            BaseAction::Differs
+                        }
+                        // includes a pin that no longer matches: the bytes the user approved are
+                        // not the bytes that are there now, so the approval does not carry to them
+                        Ok(_) => BaseAction::Differs,
+                        Err(_) => BaseAction::Unreadable,
+                    }
+                }
+            }
         }
     };
-    BaseStatus { action, entry: fe.clone(), target }
+    BaseStatus { action, entry: fe.clone(), local_size, mtime, superseded, target }
 }
 
 /// Does this folder hold a game at all — `game/dota` on disk, or a shim install record (a shim
@@ -1595,7 +1960,7 @@ pub fn base_cached(game_dir: &Path, manifest: &Manifest, statuses: &[BaseStatus]
     let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
     let writes: Vec<&FileEntry> = statuses
         .iter()
-        .filter(|s| s.action == BaseAction::Write)
+        .filter(|s| s.action.writes())
         .map(|s| &s.entry)
         .collect();
     let Ok(acqs) = build_acqs(
@@ -1655,22 +2020,273 @@ pub fn base_cached(game_dir: &Path, manifest: &Manifest, statuses: &[BaseStatus]
     (bytes, files)
 }
 
-/// Does this folder hold a DIFFERENT game build than the manifest describes?
+/// What `build_identity` concluded about a folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildIdentity {
+    /// Nothing contradicts the manifest: steam.inf matches it, or is absent (a fresh target), or
+    /// the manifest states none.
+    Same,
+    /// steam.inf is there and is a DIFFERENT build.
+    Foreign,
+    /// steam.inf is there and could not be read. Neither of the other two answers — and saying
+    /// either would be a guess.
+    Unknown,
+}
+
+/// Which Dota 2 build does this folder hold, relative to the manifest?
 ///
-/// `game/dota/steam.inf` carries the build identity, so a local copy that EXISTS but does not
+/// `game/dota/steam.inf` carries the build identity, so a local copy that exists but does not
 /// match the manifest's hash means the folder is some other Dota 2 installation — not a damaged
-/// one. The distinction is the difference between a useful repair and a catastrophe: verify
-/// would otherwise report nearly every file as "damaged", and accepting that repair would
-/// overwrite a perfectly good unrelated install with build 1805. An ABSENT steam.inf is a fresh
-/// or empty target, which is not foreign — that is exactly what a fresh install starts from.
-pub fn foreign_build(game_dir: &Path, manifest: &Manifest) -> bool {
+/// one. The distinction is the difference between a useful repair and a catastrophe: verify would
+/// otherwise report nearly every file as "damaged", and accepting that repair would overwrite a
+/// perfectly good unrelated install with build 1805. An ABSENT steam.inf is a fresh or empty
+/// target, which is not foreign — that is exactly what a fresh install starts from.
+///
+/// `Unknown` exists because the question is answered by READING a file, and a read can fail for
+/// reasons that say nothing about which build this is. Folding that into "foreign" — as a bare
+/// bool must — meant an antivirus holding steam.inf for a second was enough to tell the user
+/// their 6.88 folder was some other build and to offer them the one irreversible action in the
+/// app. The caller decides what to do with not-knowing; it must not be spelled as knowing.
+pub fn build_identity(game_dir: &Path, manifest: &Manifest) -> BuildIdentity {
     const STEAM_INF: &str = "game/dota/steam.inf";
-    let Some(fe) = manifest.files.iter().find(|f| f.dest == STEAM_INF) else { return false };
+    let Some(fe) = manifest.files.iter().find(|f| f.dest == STEAM_INF) else {
+        return BuildIdentity::Same;
+    };
     let local = game_dir.join(STEAM_INF);
-    if !local.exists() {
-        return false;
+    match std::fs::metadata(&local) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BuildIdentity::Same,
+        Err(_) => BuildIdentity::Unknown,
+        Ok(_) => match verify::sha256_file_cached(&local) {
+            Ok(h) if h == fe.sha256 => BuildIdentity::Same,
+            Ok(_) => BuildIdentity::Foreign,
+            Err(_) => BuildIdentity::Unknown,
+        },
     }
-    !matches!(verify::sha256_file_cached(&local), Ok(h) if h == fe.sha256)
+}
+
+/// A file in the game folder that no manifest entry and no install record claims.
+///
+/// Never at risk from anything this app does — a repair can only write manifest dests, so these
+/// are reported for one reason: a mod is usually some replaced files plus some ADDED ones, and
+/// showing only the replaced half makes the other half look like it vanished. Deleting them is a
+/// separate, explicit act (`delete_extras`).
+#[derive(Debug, Clone)]
+pub struct ExtraEntry {
+    /// Relative to the game folder, `/`-separated like a manifest dest.
+    pub path: String,
+    /// Bytes: the file's own, or a summarized directory's total.
+    pub size: u64,
+    pub mtime: Option<u64>,
+    /// 0 = a file. Otherwise the recursive file count of a DIRECTORY the manifest knows nothing
+    /// about, reported as one row instead of thousands — a custom-game addon can hold tens of
+    /// thousands of files, and enumerating them would bury the handful that mean anything.
+    pub files: u32,
+}
+
+/// Ceiling on directory entries the extras scan will look at. A game folder can contain an
+/// arbitrary user-made tree; this is metadata-only work (no hashing) so the cap is generous, but
+/// "walk whatever is there" is not a bound, and the UI is told when it was hit rather than
+/// quietly showing a short list as if it were the whole truth.
+const EXTRA_SCAN_CAP: usize = 200_000;
+
+/// Does the manifest's `ignore` list quiet this path? Three rules, no glob engine:
+///   * exact match — one named file;
+///   * a pattern ending in `/` — that directory and everything under it;
+///   * a pattern starting with `*.` — that extension, anywhere.
+///
+/// Anything else matches nothing. A tiny, total language beats a glob dialect nobody can predict:
+/// the cost of a pattern that silently matches too much is a file the user never gets told about.
+fn ignores_extra(ignore: &[String], path: &str) -> bool {
+    ignore.iter().any(|p| {
+        if let Some(ext) = p.strip_prefix("*.") {
+            path.rsplit_once('.').is_some_and(|(_, e)| e.eq_ignore_ascii_case(ext))
+        } else if p.ends_with('/') {
+            path.starts_with(p.as_str())
+        } else {
+            path == p
+        }
+    })
+}
+
+/// Why an extras walk ended. "The user stopped it" and "there are more than we will list" are
+/// different facts, and reporting one as the other was a real misstatement: pressing Stop produced
+/// "There are more extra files than could be listed — this is a partial view of them", which
+/// describes a scan ceiling nobody hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtrasEnd {
+    Complete,
+    /// Hit `EXTRA_SCAN_CAP` — the entries are a prefix of the truth and the UI must say so.
+    Capped,
+    Cancelled,
+}
+
+/// Everything in the game folder that the manifest does not describe.
+///
+/// Bounded by the VANILLA footprint, not by the folder: it walks the directories the manifest
+/// itself populates, and an unknown directory found inside one is summarized as a single row
+/// (recursive count + bytes) rather than descended into as a listing. That keeps the common case
+/// — a mod dropping files among stock ones — precise, while a 40,000-file custom game reads as
+/// one line saying so.
+///
+/// Excluded outright, at every level: anything named `.phoenix*` (our staging, cache, backups,
+/// preserved originals and state files) and `winmm_orig.dll` (ours, and not in the shim's file
+/// list). Offering to delete our own machinery would be a bug dressed as a feature.
+///
+/// `claimed` is every dest the CALLER is already reporting under some other authority — the game
+/// manifest's own dests plus whatever the shim plan accounted for. It is a parameter rather than
+/// something derived here because the install record alone is the wrong answer to "is this file
+/// spoken for": a dest we recorded, no longer manage, and whose bytes are not even the ones we
+/// wrote describes a file that does not exist any more. What is actually there belongs to whoever
+/// put it there, and hiding it behind a stale record is how a user's file becomes invisible to the
+/// one view built to show it. Callers that cannot compute a shim plan (no network, no manifest)
+/// pass the record's dests and get the old, conservative behaviour.
+///
+/// Returns the entries and WHY the walk ended — see `ExtrasEnd`.
+pub fn scan_extras(
+    game_dir: &Path,
+    manifest: &Manifest,
+    claimed: &HashSet<String>,
+    cancel: Option<&AtomicBool>,
+) -> (Vec<ExtraEntry>, ExtrasEnd) {
+    let entries = engine::resolve(manifest, &Default::default());
+    let mut known: HashSet<&str> = entries.iter().map(|f| f.dest.as_str()).collect();
+    known.insert(WINMM_ORIG);
+    known.extend(claimed.iter().map(String::as_str));
+    // Every ancestor of every KNOWN dest — the tree we walk file by file, as opposed to the
+    // unknown subtrees we summarize whole. Membership answers "does anything here belong to
+    // somebody", and it must be derived from `known`, NOT from the game manifest alone.
+    //
+    // This was a real, serious bug: Phoenix installs into directories vanilla does not have
+    // (`game/dota_phoenix/`), so a set built from the game manifest classified the ENTIRE shim as
+    // one foreign subtree — reported to the user as "not part of the game", with a delete control
+    // on it. `summarize_dir` never consults `known` (it cannot: it exists precisely to avoid
+    // enumerating what it walks), so a directory holding claimed files must never reach it. It
+    // cannot now: a claimed file puts every one of its ancestors in here.
+    let mut dirs: HashSet<&str> = HashSet::from([""]);
+    for dest in &known {
+        let mut d = *dest;
+        while let Some((parent, _)) = d.rsplit_once('/') {
+            if !dirs.insert(parent) {
+                break; // this ancestor chain is already recorded
+            }
+            d = parent;
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut budget = EXTRA_SCAN_CAP;
+    let mut truncated = false;
+    let mut stack = vec![String::new()];
+    while let Some(rel) = stack.pop() {
+        if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            return (out, ExtrasEnd::Cancelled);
+        }
+        let abs = if rel.is_empty() { game_dir.to_path_buf() } else { game_dir.join(&rel) };
+        let Ok(rd) = std::fs::read_dir(&abs) else { continue };
+        for e in rd.flatten() {
+            if budget == 0 {
+                truncated = true;
+                break;
+            }
+            budget -= 1;
+            let name = e.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.starts_with(".phoenix") {
+                continue;
+            }
+            let child = if rel.is_empty() { name.to_string() } else { format!("{rel}/{name}") };
+            let Ok(md) = e.metadata() else { continue };
+            let mtime = md
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs());
+            if md.is_dir() {
+                if dirs.contains(child.as_str()) {
+                    stack.push(child);
+                } else if !ignores_extra(&manifest.ignore, &format!("{child}/")) {
+                    let (files, size, cut) = summarize_dir(&e.path(), &mut budget);
+                    truncated |= cut;
+                    // an empty unknown directory is not something the user "has" — reporting it
+                    // as a row with nothing in it is noise, and deleting it changes nothing
+                    if files > 0 {
+                        out.push(ExtraEntry { path: child, size, mtime, files });
+                    }
+                }
+            } else if !known.contains(child.as_str()) && !ignores_extra(&manifest.ignore, &child) {
+                out.push(ExtraEntry { path: child, size: md.len(), mtime, files: 0 });
+            }
+        }
+        // Spent budget ends the WALK, not just this directory. Without this the stack kept being
+        // popped and every remaining directory paid for a read_dir it would immediately abandon.
+        if budget == 0 {
+            break;
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    (out, if truncated { ExtrasEnd::Capped } else { ExtrasEnd::Complete })
+}
+
+/// Recursive file count + byte total of an unknown subtree, spending from the shared scan budget.
+fn summarize_dir(dir: &Path, budget: &mut usize) -> (u32, u64, bool) {
+    let (mut files, mut size, mut truncated) = (0u32, 0u64, false);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        for e in rd.flatten() {
+            if *budget == 0 {
+                truncated = true;
+                break;
+            }
+            *budget -= 1;
+            match e.metadata() {
+                Ok(md) if md.is_dir() => stack.push(e.path()),
+                Ok(md) => {
+                    files += 1;
+                    size += md.len();
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    (files, size, truncated)
+}
+
+/// Delete named extras. Irreversible, so it re-derives the legal set instead of trusting the
+/// caller: only paths `scan_extras` reports right now can be removed, which makes a stale UI list,
+/// a renamed folder, or a crafted path incapable of reaching a manifest file, the shim's files, or
+/// anything under `.phoenix*`. Returns how many entries were removed.
+///
+/// Symlinks and junctions are refused rather than followed — `remove_dir_all` through a junction
+/// would delete the target's contents, and a game folder is exactly where someone parks one.
+pub fn delete_extras(
+    game_dir: &Path,
+    manifest: &Manifest,
+    claimed: &HashSet<String>,
+    paths: &[String],
+) -> Result<u32> {
+    let (extras, _) = scan_extras(game_dir, manifest, claimed, None);
+    let legal: HashMap<&str, &ExtraEntry> =
+        extras.iter().map(|e| (e.path.as_str(), e)).collect();
+    let mut removed = 0;
+    for p in paths {
+        let Some(e) = legal.get(p.as_str()) else { continue };
+        let target = game_dir.join(p);
+        let md = std::fs::symlink_metadata(&target)
+            .with_context(|| format!("reading {}", target.display()))?;
+        if md.file_type().is_symlink() {
+            bail!("{p} is a link, not a file — refusing to follow it");
+        }
+        if e.files > 0 {
+            std::fs::remove_dir_all(&target)
+                .with_context(|| format!("removing {}", target.display()))?;
+        } else {
+            std::fs::remove_file(&target)
+                .with_context(|| format!("removing {}", target.display()))?;
+        }
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 /// Free bytes available to this process on the volume holding `dir` (its deepest existing
@@ -1694,7 +2310,16 @@ pub fn free_space(dir: &Path) -> Option<u64> {
 /// file is independent, so one thread leaves both the CPU and the drive queue mostly idle. Kept
 /// modest on purpose: past a handful of readers a spinning disk starts seeking instead of
 /// streaming, which is slower than the serial case it replaced.
-const HASH_WORKERS: usize = 4;
+///
+/// LEAVES A CORE. This was a flat 4, which on a 4-core machine means every core hashing: sha256
+/// is CPU-bound (only some CPUs have SHA extensions; without them it is a few hundred MB/s per
+/// core), so the webview's own thread ended up competing with the work it was trying to report on,
+/// and the whole app went sluggish exactly while the user was watching a progress line. One core
+/// held back costs a fraction of the throughput and buys a UI that still moves — and the run is
+/// disk-bound as often as not anyway.
+fn hash_workers() -> usize {
+    std::thread::available_parallelism().map_or(2, |n| n.get().saturating_sub(1)).clamp(1, 4)
+}
 
 /// Headroom demanded beyond the payload itself: filesystem overhead, the shim install that
 /// follows a fresh download, and not painting the user into a zero-byte volume.
@@ -1718,10 +2343,24 @@ fn ensure_disk_space(need: u64, free: Option<u64>) -> Result<()> {
     Ok(())
 }
 
-/// Download and place every missing/damaged base-game file. Serves both fresh installs (into an
-/// empty folder) and repair (into a live one) — the plan diff makes them the same operation.
-/// Interruption at ANY point is recoverable by running again: completed files hash-match and
-/// skip, interrupted downloads resume from their .part, the cache survives.
+/// Download and place base-game files that are not what the manifest says they should be. Serves
+/// both fresh installs (into an empty folder) and repair (into a live one) — the plan diff makes
+/// them the same operation. Interruption at ANY point is recoverable by running again: completed
+/// files hash-match and skip, interrupted downloads resume from their .part, the cache survives.
+///
+/// `only` restricts the write set to those dests — a PARTIAL repair, which is what the files view
+/// sends when the user has spared some files. Two things about it are load-bearing:
+///
+///   * the plan is still RECOMPUTED here, for those dests. The selection says what to look at; it
+///     never stands in for the verdict. A dest the user picked minutes ago that is intact by the
+///     time we get here is not rewritten, and one that broke in between is not written just
+///     because it was in a stale list. It is scoped to the selection rather than the whole
+///     manifest because the cost of a base plan IS the hashing: restoring one edited file used to
+///     read all ~15 GB first, which is a full verification nobody asked for — and its file counter
+///     then fought the download's own for the one progress line the screen has.
+///   * it is the ONLY way a `Kept` file gets written. Pins are an instruction, so the default
+///     (`None`) write set skips them; naming one explicitly is the user checking it back on, and
+///     the caller is expected to drop the pin afterwards.
 pub fn install_base(
     game_dir: &Path,
     dl: &dyn Downloader,
@@ -1729,14 +2368,21 @@ pub fn install_base(
     manifest: &Manifest,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
+    only: Option<&HashSet<String>>,
 ) -> Result<BaseReport> {
     // cancellable from the first file: repairing a live folder hashes it before a byte is
     // downloaded, and a Cancel that only took effect once the download started sat inert for
     // minutes on exactly the screen that shows a Stop button
-    let statuses = base_plan(game_dir, manifest, progress, "game", cancel)?;
+    let statuses = base_plan_of(game_dir, manifest, progress, "game", cancel, only)?;
+    // `sel.contains` stays even though the plan is already scoped to it: `wanted` is the write
+    // gate, and it must not depend on the plan having been narrowed to be correct.
+    let wanted = |s: &BaseStatus| match only {
+        Some(sel) => sel.contains(s.dest()) && (s.action.writes() || s.action == BaseAction::Kept),
+        None => s.action.writes(),
+    };
     let to_write: Vec<(&FileEntry, &Path)> = statuses
         .iter()
-        .filter(|s| s.action == BaseAction::Write)
+        .filter(|s| wanted(s))
         .map(|s| (&s.entry, s.target.as_path()))
         .collect();
     let up_to_date = statuses.iter().filter(|s| s.action == BaseAction::UpToDate).count();
@@ -1753,7 +2399,9 @@ pub fn install_base(
     if to_write.is_empty() {
         // same reclaim as the success path below: everything is intact, so whatever an earlier
         // interrupted attempt cached is no longer a resume source for anything
-        clear_dir_files(&game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR));
+        if only.is_none() {
+            clear_dir_files(&game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR));
+        }
         return Ok(report(0, 0));
     }
 
@@ -1842,7 +2490,14 @@ pub fn install_base(
     // and uninstall both deliberately keep out), so a superseded 16 GB attempt would sit inside
     // the game folder forever. Only on SUCCESS: a cancelled or failed run keeps everything — its
     // `.part`s and finished entries are exactly what the next attempt resumes from.
-    clear_dir_files(&cache);
+    //
+    // And only on a WHOLE pass. "Everything needed was consumed" is a statement about a run that
+    // considered every file; a partial repair deliberately looked at three of them, so what is
+    // left over is not stale, it is the other 4,632 — including an interrupted multi-gigabyte
+    // download that a three-file repair has no business reclaiming.
+    if only.is_none() {
+        clear_dir_files(&cache);
+    }
     Ok(report(written, bytes))
 }
 
@@ -1891,7 +2546,7 @@ mod tests {
         let dir = tempdir("fresh");
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
-        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
 
         assert_eq!(r.written.len(), 2);
         assert_eq!(r.winmm_orig, WinmmOrig::Created);
@@ -1928,8 +2583,10 @@ mod tests {
             game_dir: dir.clone(),
             backup_root: dir.join(BACKUP_DIR).join("1.0.0"),
             vanilla_root: dir.join(VANILLA_DIR),
+            user_root: dir.join(USER_DIR),
             prev_dests: HashSet::new(),
             trust_prev: true,
+            user_changed: HashSet::new(),
             prev_winmm_created: false,
             prev_restored: Vec::new(),
         };
@@ -1968,7 +2625,7 @@ mod tests {
         let part = cache.join(format!("{}.part", sha(b"dll")));
         std::fs::write(&part, b"XXX").unwrap();
 
-        let r = install(&settings(&dir), &dl, None, None, None);
+        let r = install(&settings(&dir), &dl, None, None, None, None);
         assert!(r.is_ok(), "install must recover from a full-length .part: {r:?}");
         assert_eq!(std::fs::read(dir.join("game/bin/win64/winmm.dll")).unwrap(), b"dll");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1981,7 +2638,7 @@ mod tests {
     fn a_lost_state_file_does_not_turn_our_own_file_into_a_vanilla_original() {
         let dir = tempdir("lost-state");
         let (m1, assets1) = basic_release();
-        install(&settings(&dir), &Fake::new("v1.0.0", &m1, assets1), None, None, None).unwrap();
+        install(&settings(&dir), &Fake::new("v1.0.0", &m1, assets1), None, None, None, None).unwrap();
         // the state file is lost (AV cleanup, a tidy-up, or the corrupt-state quarantine)
         std::fs::remove_file(InstalledState::path(&dir)).unwrap();
 
@@ -1995,7 +2652,7 @@ mod tests {
         })
         .to_string();
         let dl2 = Fake::new("v2.0.0", &m2, vec![("winmm.dll", b"dll2"), ("a.vpk", b"vpk")]);
-        install(&settings(&dir), &dl2, None, None, None).unwrap();
+        install(&settings(&dir), &dl2, None, None, None, None).unwrap();
 
         assert!(
             !dir.join(VANILLA_DIR).join("game/bin/win64/winmm.dll").exists(),
@@ -2014,12 +2671,12 @@ mod tests {
         let dir = tempdir("heal");
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None).unwrap();
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
         // lose the state file — the folder is now "up to date but not installed"
         std::fs::remove_file(InstalledState::path(&dir)).unwrap();
         assert!(InstalledState::load(&dir).is_none());
 
-        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
         assert!(r.written.is_empty() && r.removed.is_empty());
         assert_eq!(r.up_to_date, 2);
         // healed: state rewritten. winmm_orig already existed, and with the state lost we can no
@@ -2047,11 +2704,11 @@ mod tests {
 
         let mut s = settings(&dir);
         s.selections.insert("fx".into(), serde_json::json!(true));
-        install(&s, &dl, None, None, None).unwrap();
+        install(&s, &dl, None, None, None, None).unwrap();
         assert!(dir.join("game/dota/fx.vpk").exists());
 
         s.selections.insert("fx".into(), serde_json::json!(false));
-        let r = install(&s, &dl, None, None, None).unwrap();
+        let r = install(&s, &dl, None, None, None, None).unwrap();
         assert_eq!(r.removed, vec!["game/dota/fx.vpk".to_string()]);
         assert!(!dir.join("game/dota/fx.vpk").exists());
         let st = InstalledState::load(&dir).unwrap();
@@ -2073,7 +2730,7 @@ mod tests {
         .to_string();
         let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]);
         let s = settings(&dir);
-        install(&s, &dl, None, None, None).unwrap();
+        install(&s, &dl, None, None, None, None).unwrap();
 
         // install itself no longer prefetches the disabled toggle's asset...
         assert!(!dir.join(CACHE_DIR).join(sha(b"fx")).exists());
@@ -2088,7 +2745,7 @@ mod tests {
         let dir = tempdir("uninstall");
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None).unwrap();
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
 
         let r = uninstall(&settings(&dir)).unwrap();
         assert_eq!(r.deleted.len(), 2);
@@ -2110,7 +2767,7 @@ mod tests {
 
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None).unwrap();
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
 
         // shim in place, original preserved
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
@@ -2140,7 +2797,7 @@ mod tests {
 
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None).unwrap(); // no-op heal: adopts both
+        install(&settings(&dir), &dl, None, None, None, None).unwrap(); // no-op heal: adopts both
 
         let r = uninstall(&settings(&dir)).unwrap();
         assert!(r.deleted.iter().any(|d| d == "game/dota/a.vpk"));
@@ -2160,7 +2817,7 @@ mod tests {
         .to_string();
         let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]);
 
-        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
         assert!(!dir.join("game/dota/a.vpk").exists());
         assert!(InstalledState::load(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -2181,7 +2838,7 @@ mod tests {
             owned.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
         let dl = Fake::new("v1.0.0", &m, assets);
 
-        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
         assert_eq!(r.written.len(), 8);
         for n in names {
             assert_eq!(std::fs::read(dir.join(format!("game/dota/{n}.vpk"))).unwrap(), n.as_bytes());
@@ -2247,12 +2904,12 @@ mod tests {
         };
 
         // first run: dies mid-download, touches nothing but the resumable .part
-        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
         assert!(!dir.join("game/dota/big.vpk").exists());
         assert!(dir.join(CACHE_DIR).join(format!("{}.part", sha(&big))).exists());
 
         // second run: resumes the .part (asserted inside CutOnce) and completes
-        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
         assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2317,7 +2974,7 @@ mod tests {
             calls: 0.into(),
         };
         // two flakes, then success — the user must never have seen an error
-        install(&settings(&dir), &dl, None, None, None).unwrap();
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
         assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2335,7 +2992,7 @@ mod tests {
             kind: Some(NetKind::Status(404)),
             calls: 0.into(),
         };
-        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
         assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
 
@@ -2348,8 +3005,75 @@ mod tests {
             kind: None,
             calls: 0.into(),
         };
-        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
         assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The power-loss shape: NTFS journals metadata, not data, so a `.part` can survive a crash
+    /// with its LENGTH persisted and its tail never flushed. Resuming past that hashes garbage —
+    /// and the mismatch only surfaces after the whole remainder has been re-fetched. Blaming the
+    /// release there would spend a second full run to reach the same wall, so a verification
+    /// failure that FOLLOWED a resume buys exactly one clean restart.
+    #[test]
+    fn a_poisoned_part_is_discarded_and_the_download_restarts_clean() {
+        use std::sync::atomic::Ordering;
+        let dir = tempdir("part-poison");
+        let payload: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ file_json("big.vpk", "game/dota/big.vpk", &payload) ]
+        })
+        .to_string();
+        let dl = Flaky {
+            inner: Fake::new("v1.0.0", &m, vec![("big.vpk", &payload)]),
+            fail: 0.into(),
+            kind: None,
+            calls: 0.into(),
+        };
+        // a resumable prefix of the right shape and the wrong bytes — zeros, as an unflushed
+        // tail reads back
+        let cache = dir.join(CACHE_DIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{}.part", sha(&payload))), vec![0u8; 400]).unwrap();
+
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "one resumed attempt, one clean restart");
+        assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), payload);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the same rule: bytes fetched WHOLE that still verify wrong are a fact
+    /// about the source, and re-asking a settled question just burns the link.
+    #[test]
+    fn a_source_that_verifies_wrong_from_zero_is_not_retried() {
+        use std::sync::atomic::Ordering;
+        // the manifest describes GOOD; the release serves BAD at the same length, so it is the
+        // hash — not the size — that refuses it
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ file_json("a.vpk", "game/dota/a.vpk", b"GOOD") ]
+        })
+        .to_string();
+        let bad = || Fake::new("v1.0.0", &m, vec![("a.vpk", b"BAD!")]);
+
+        let dir = tempdir("bad-source");
+        let dl = Flaky { inner: bad(), fail: 0.into(), kind: None, calls: 0.into() };
+        let err = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("verification failed"), "got: {err:#}");
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 1, "nothing was resumed — one attempt settles it");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // and with a poisoned .part in front of it, the clean restart is spent exactly once
+        // before the same verdict lands
+        let dir = tempdir("bad-source-part");
+        let cache = dir.join(CACHE_DIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(format!("{}.part", sha(b"GOOD"))), b"XX").unwrap();
+        let dl = Flaky { inner: bad(), fail: 0.into(), kind: None, calls: 0.into() };
+        let err = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("verification failed"), "got: {err:#}");
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "the restart is spent once, not looped");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2367,7 +3091,7 @@ mod tests {
         .to_string();
         let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]);
 
-        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
         assert_eq!(r.removed, vec!["game/dota/stale.vpk".to_string()]);
         // the removal must STICK (the old bug preserved-then-restored it in one breath,
         // re-flagging it as Remove on every future plan, forever)...
@@ -2408,7 +3132,7 @@ mod tests {
         })
         .to_string();
         let dl1 = Fake::new("v1.0.0", &m1, vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]);
-        install(&settings(&dir), &dl1, None, None, None).unwrap();
+        install(&settings(&dir), &dl1, None, None, None, None).unwrap();
         assert_eq!(std::fs::read(dir.join(VANILLA_DIR).join("game/dota/sound.vpk")).unwrap(), b"STOCK");
 
         // v2 stops shipping it and removes the dest — our file goes, the original comes back
@@ -2419,7 +3143,7 @@ mod tests {
         })
         .to_string();
         let dl2 = Fake::new("v2.0.0", &m2, vec![("a.vpk", b"vpk")]);
-        let r = install(&settings(&dir), &dl2, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl2, None, None, None, None).unwrap();
         assert_eq!(r.removed, vec!["game/dota/sound.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/sound.vpk")).unwrap(), b"STOCK");
         let st = InstalledState::load(&dir).unwrap();
@@ -2430,7 +3154,7 @@ mod tests {
         assert_eq!(chk.changes(), 0, "restored original re-flagged: {:?}", chk.files);
 
         // a no-op re-install (the heal path) carries the record instead of dropping it
-        install(&settings(&dir), &dl2, None, None, None).unwrap();
+        install(&settings(&dir), &dl2, None, None, None, None).unwrap();
         assert_eq!(
             InstalledState::load(&dir).unwrap().restored,
             vec!["game/dota/sound.vpk".to_string()]
@@ -2464,11 +3188,11 @@ mod tests {
         };
 
         let dl1 = Fake::new("v1", &ship("1.0.0", true, false), vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]);
-        install(&settings(&dir), &dl1, None, None, None).unwrap();
+        install(&settings(&dir), &dl1, None, None, None, None).unwrap();
         let dl2 = Fake::new("v2", &ship("2.0.0", false, true), vec![("a.vpk", b"vpk")]);
-        install(&settings(&dir), &dl2, None, None, None).unwrap(); // restored
+        install(&settings(&dir), &dl2, None, None, None, None).unwrap(); // restored
         let dl3 = Fake::new("v3", &ship("3.0.0", true, false), vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]);
-        install(&settings(&dir), &dl3, None, None, None).unwrap(); // ships it again
+        install(&settings(&dir), &dl3, None, None, None, None).unwrap(); // ships it again
 
         let st = InstalledState::load(&dir).unwrap();
         assert!(st.restored.is_empty(), "a shipped dest must not stay recorded: {:?}", st.restored);
@@ -2486,7 +3210,7 @@ mod tests {
         let dir = tempdir("denied");
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None).unwrap();
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
 
         // a read-only attribute denies write with ERROR_ACCESS_DENIED — not a live process
         let target = dir.join("game/bin/win64/winmm.dll");
@@ -2500,7 +3224,7 @@ mod tests {
         })
         .to_string();
         let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2")]);
-        let err = install(&settings(&dir), &dl2, None, None, None).unwrap_err();
+        let err = install(&settings(&dir), &dl2, None, None, None, None).unwrap_err();
         assert!(
             !err.chain().any(|c| c.downcast_ref::<engine::GameRunning>().is_some()),
             "a permissions problem must not be diagnosed as the game running: {err:#}"
@@ -2517,7 +3241,7 @@ mod tests {
         let dir = tempdir("locked");
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None).unwrap();
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
 
         // simulate the game holding winmm.dll open: no sharing allowed on our handle
         use std::os::windows::fs::OpenOptionsExt;
@@ -2537,7 +3261,7 @@ mod tests {
         })
         .to_string();
         let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2"), ("a.vpk", b"vpk")]);
-        let err = install(&settings(&dir), &dl2, None, None, None).unwrap_err();
+        let err = install(&settings(&dir), &dl2, None, None, None, None).unwrap_err();
         assert!(
             err.chain().any(|c| c.downcast_ref::<engine::GameRunning>().is_some()),
             "expected GameRunning in the error chain, got: {err:#}"
@@ -2580,6 +3304,350 @@ mod tests {
         )
     }
 
+    // ---- selective repair, pins, and the extras scan ----
+
+    /// A partial repair writes ONLY what it was given, and leaves everything else exactly as it
+    /// found it — including files it would happily have rewritten had it been asked.
+    #[test]
+    fn base_repair_writes_only_the_selection() {
+        let dir = tempdir("base-partial");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        // two differences: one the user picks, one they spare
+        std::fs::write(dir.join("game/dota/cfg/a.cfg"), b"MOD").unwrap();
+        std::fs::write(dir.join("game/core/cfg/b.cfg"), b"BAD").unwrap();
+
+        let only: HashSet<String> = ["game/core/cfg/b.cfg".to_string()].into_iter().collect();
+        let r = install_base(&dir, &dl, &release, &manifest, None, None, Some(&only)).unwrap();
+        assert_eq!(r.written, 1);
+        assert_eq!(std::fs::read(dir.join("game/core/cfg/b.cfg")).unwrap(), b"CFG", "restored");
+        assert_eq!(
+            std::fs::read(dir.join("game/dota/cfg/a.cfg")).unwrap(),
+            b"MOD",
+            "the spared file is untouched — this is the whole point of the selection"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pin makes a modified file `Kept`: reported (never hidden), and skipped by an unrestricted
+    /// run. Naming it explicitly still restores it — that is the user taking the approval back.
+    #[test]
+    fn a_pinned_file_survives_an_unrestricted_repair() {
+        let dir = tempdir("base-pinned");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        let dest = "game/dota/cfg/a.cfg";
+        std::fs::write(dir.join(dest), b"MY MOD").unwrap();
+        let h = verify::sha256_file_cached(&dir.join(dest)).unwrap();
+        let mut k = crate::keep::KeepList::default();
+        k.pin(dest, &h, Some(fe_sha(&manifest, dest)));
+        k.save(&dir).unwrap();
+
+        let statuses = base_plan(&dir, &manifest, None, "verify", None).unwrap();
+        let st = statuses.iter().find(|s| s.dest() == dest).unwrap();
+        assert_eq!(st.action, BaseAction::Kept);
+        assert!(!st.action.writes(), "a pin is not a difference to be fixed");
+
+        // the sweeping repair leaves it alone
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"MY MOD");
+
+        // ...but naming it does not
+        let only: HashSet<String> = [dest.to_string()].into_iter().collect();
+        install_base(&dir, &dl, &release, &manifest, None, None, Some(&only)).unwrap();
+        assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"CFG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A PARTIAL repair must not read the whole install to write one file.
+    ///
+    /// It used to: `install_base` planned the entire manifest before filtering to the selection,
+    /// so restoring a single edited file ran a full integrity pass over ~15 GB first — and the
+    /// plan's file counter then fought the download's own ticks for the one progress line that
+    /// screen has, because both are emitted under op "game" and `emit` drains asynchronously.
+    /// The plan tick count is the observable proof of what got read.
+    #[test]
+    fn a_partial_repair_plans_only_the_selection() {
+        let dir = tempdir("base-partial-plan");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        let dest = "game/dota/cfg/a.cfg";
+        std::fs::write(dir.join(dest), b"MY MOD").unwrap();
+
+        // The plan's `total` is the entry count it is working through — the one signal that is
+        // exact whatever the tick throttle does (`d == total` always reports), so it says how many
+        // files were about to be hashed rather than how many happened to be narrated.
+        //
+        // Selected by `phase`, NOT by "carries no bytes": the plan narrates bytes as well, for
+        // files big enough that hashing them would freeze the counter. This test read them apart
+        // the wrong way and only passed because its fixtures are three bytes long.
+        let planned_total = std::sync::Mutex::new(None);
+        let emit = |p: engine::OpProgress| {
+            if p.op == "game" && p.phase == "plan" {
+                *planned_total.lock().unwrap() = Some(p.total);
+            }
+        };
+        let only: HashSet<String> = [dest.to_string()].into_iter().collect();
+        let r = install_base(&dir, &dl, &release, &manifest, Some(&emit), None, Some(&only)).unwrap();
+
+        assert_eq!(r.written, 1, "the one file the user picked is restored");
+        assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"CFG");
+        assert_eq!(
+            planned_total.into_inner().unwrap(),
+            Some(1),
+            "a one-file repair planned more than the one file — that is a full verification the \
+             user never asked for, racing the download for the same progress line"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A subset plan must answer for exactly the dests it was asked about, and give the SAME
+    /// verdict the whole-install plan gives — the Your-files screen is built on it, and a cheaper
+    /// answer that disagreed with the expensive one would be worse than no answer.
+    #[test]
+    fn a_subset_plan_reads_only_what_it_was_asked_about() {
+        let dir = tempdir("base-plan-subset");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        let dest = "game/dota/cfg/a.cfg";
+        std::fs::write(dir.join(dest), b"MY MOD").unwrap();
+
+        let whole = base_plan(&dir, &manifest, None, "verify", None).unwrap();
+        assert!(whole.len() > 1, "the fixture has more than the one dest under test");
+
+        let only: HashSet<String> = [dest.to_string()].into_iter().collect();
+        let subset = base_plan_of(&dir, &manifest, None, "yours", None, Some(&only)).unwrap();
+        assert_eq!(subset.len(), 1, "nothing outside the selection is planned — or read");
+        assert_eq!(subset[0].dest(), dest);
+        assert_eq!(
+            subset[0].action,
+            whole.iter().find(|s| s.dest() == dest).unwrap().action,
+            "the cheap answer must be the same answer"
+        );
+
+        // a dest the manifest does not carry has no verdict to give, and asking for one is not an
+        // error — the keep list can name paths no authority claims
+        let stranger: HashSet<String> = ["game/dota/nobody.txt".to_string()].into_iter().collect();
+        assert!(base_plan_of(&dir, &manifest, None, "yours", None, Some(&stranger)).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pin is on the BYTES. Change the file again and the approval does not carry over — the
+    /// thing the user looked at is not the thing that is there now.
+    #[test]
+    fn a_pin_expires_when_the_content_changes_again() {
+        let dir = tempdir("base-pin-expiry");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        let dest = "game/dota/cfg/a.cfg";
+        std::fs::write(dir.join(dest), b"MOD v1").unwrap();
+        let mut k = crate::keep::KeepList::default();
+        k.pin(dest, &verify::sha256_file_cached(&dir.join(dest)).unwrap(), Some(fe_sha(&manifest, dest)));
+        k.save(&dir).unwrap();
+
+        std::fs::write(dir.join(dest), b"MOD v2 - a different length entirely").unwrap();
+        let statuses = base_plan(&dir, &manifest, None, "verify", None).unwrap();
+        let st = statuses.iter().find(|s| s.dest() == dest).unwrap();
+        assert_eq!(
+            st.action,
+            BaseAction::Differs,
+            "a size mismatch must not short-circuit past a pinned dest, or a pin could never \
+             expire and could never have matched in the first place"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The evidence a user judges a difference by: expected vs actual length, and when it changed.
+    #[test]
+    fn a_plan_carries_the_evidence_for_each_difference() {
+        let dir = tempdir("base-evidence");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        std::fs::write(dir.join("game/dota/cfg/a.cfg"), b"much longer than three").unwrap();
+        std::fs::remove_file(dir.join("game/core/cfg/b.cfg")).unwrap();
+
+        let statuses = base_plan(&dir, &manifest, None, "verify", None).unwrap();
+        let st = |d: &str| statuses.iter().find(|s| s.dest() == d).unwrap();
+        let a = st("game/dota/cfg/a.cfg");
+        assert_eq!(a.entry.size, 3);
+        assert_eq!(a.local_size, Some(22));
+        assert!(a.mtime.is_some());
+        let b = st("game/core/cfg/b.cfg");
+        assert_eq!(b.action, BaseAction::Missing);
+        assert_eq!(b.local_size, None, "nothing there to measure");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The extras scan finds what nobody claims, summarizes an unknown subtree as ONE row, and
+    /// never offers our own machinery.
+    #[test]
+    fn extras_report_unclaimed_files_and_summarize_unknown_trees() {
+        let dir = tempdir("base-extras");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        // a mod dropping a loose file among stock ones
+        std::fs::write(dir.join("game/dota/cfg/mymod.cfg"), b"hello").unwrap();
+        // ...and a whole subtree of its own
+        std::fs::create_dir_all(dir.join("game/dota/addons/big/sub")).unwrap();
+        std::fs::write(dir.join("game/dota/addons/big/one.txt"), b"1").unwrap();
+        std::fs::write(dir.join("game/dota/addons/big/sub/two.txt"), b"22").unwrap();
+        // our own scratch must never be offered for deletion
+        std::fs::create_dir_all(dir.join(".phoenix-cache/base")).unwrap();
+        std::fs::write(dir.join(".phoenix-cache/base/junk"), b"x").unwrap();
+
+        let claimed: HashSet<String> = manifest.files.iter().map(|f| f.dest.clone()).collect();
+        let (extras, end) = scan_extras(&dir, &manifest, &claimed, None);
+        let truncated = end == ExtrasEnd::Capped;
+        assert!(!truncated);
+        let paths: Vec<&str> = extras.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&"game/dota/cfg/mymod.cfg"));
+        assert!(
+            paths.contains(&"game/dota/addons"),
+            "an unknown subtree is ONE row, not a listing: {paths:?}"
+        );
+        assert!(!paths.iter().any(|p| p.starts_with(".phoenix")), "ours: {paths:?}");
+        let tree = extras.iter().find(|e| e.path == "game/dota/addons").unwrap();
+        assert_eq!((tree.files, tree.size), (2, 3));
+
+        // and deletion only reaches what the scan reports — a crafted path cannot touch the game
+        let n = delete_extras(
+            &dir,
+            &manifest,
+            &claimed,
+            &["game/dota/cfg/mymod.cfg".into(), "game/dota/pak01_dir.vpk".into()],
+        )
+        .unwrap();
+        assert_eq!(n, 1, "only the extra was legal");
+        assert!(!dir.join("game/dota/cfg/mymod.cfg").exists());
+        assert!(dir.join("game/dota/pak01_dir.vpk").exists(), "a manifest file is unreachable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shim lives in directories the GAME manifest has never heard of. Nothing it owns may be
+    /// reported as foreign, and above all its directory must not be summarized as one deletable
+    /// subtree — that offered the user a single terracotta control that would erase their whole
+    /// Phoenix install, under the label "not part of the game".
+    #[test]
+    fn a_phoenix_only_directory_is_never_foreign() {
+        let dir = tempdir("base-extras-shim");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        // the shim's payload: its own top-level tree, plus a file among the game's own
+        std::fs::create_dir_all(dir.join("game/dota_phoenix/pak01")).unwrap();
+        std::fs::write(dir.join("game/dota_phoenix/pak01/textures.vpk"), b"phx").unwrap();
+        std::fs::write(dir.join("game/dota_phoenix/hud.vpk"), b"hud").unwrap();
+        std::fs::create_dir_all(dir.join("game/bin/win64")).unwrap();
+        std::fs::write(dir.join("game/bin/win64/winmm.dll"), b"proxy").unwrap();
+        // ...and a file genuinely nobody claims, sitting right beside them
+        std::fs::write(dir.join("game/dota_phoenix/leftover.txt"), b"mine").unwrap();
+
+        let claimed: HashSet<String> = manifest
+            .files
+            .iter()
+            .map(|f| f.dest.clone())
+            .chain([
+                "game/dota_phoenix/pak01/textures.vpk".to_string(),
+                "game/dota_phoenix/hud.vpk".to_string(),
+                "game/bin/win64/winmm.dll".to_string(),
+            ])
+            .collect();
+        let (extras, _) = scan_extras(&dir, &manifest, &claimed, None);
+        let paths: Vec<&str> = extras.iter().map(|e| e.path.as_str()).collect();
+
+        assert!(
+            !paths.contains(&"game/dota_phoenix"),
+            "the shim's own directory summarized as one foreign subtree: {paths:?}"
+        );
+        for p in &paths {
+            assert!(!claimed.contains(*p), "{p} is claimed and must not be reported");
+        }
+        // the genuinely unclaimed file beside them is still found — the fix must not blind the
+        // scan to real extras just because they share a directory with the shim
+        assert!(paths.contains(&"game/dota_phoenix/leftover.txt"), "{paths:?}");
+
+        // and deletion cannot reach the shim even if the UI asked for it
+        let n = delete_extras(
+            &dir,
+            &manifest,
+            &claimed,
+            &["game/dota_phoenix".into(), "game/dota_phoenix/hud.vpk".into()],
+        )
+        .unwrap();
+        assert_eq!(n, 0, "neither the shim's tree nor its files are legal targets");
+        assert!(dir.join("game/dota_phoenix/hud.vpk").exists());
+        assert!(dir.join("game/bin/win64/winmm.dll").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ignore` is manifest-driven and total: exact path, `dir/` subtree, `*.ext` suffix.
+    #[test]
+    fn the_ignore_list_quiets_exactly_three_shapes() {
+        let ig = vec![
+            "game/dota/cfg/config.cfg".to_string(),
+            "replays/".to_string(),
+            "*.log".to_string(),
+        ];
+        assert!(ignores_extra(&ig, "game/dota/cfg/config.cfg"));
+        assert!(!ignores_extra(&ig, "game/dota/cfg/config.cfg.bak"));
+        assert!(ignores_extra(&ig, "replays/1.dem"));
+        assert!(!ignores_extra(&ig, "myreplays/1.dem"));
+        assert!(ignores_extra(&ig, "game/dota/console.LOG"), "extensions are case-insensitive");
+        assert!(!ignores_extra(&ig, "game/dota/log"));
+    }
+
+    /// Uninstall reverts what it installed and REFUSES to delete what it no longer recognises.
+    #[test]
+    fn uninstall_keeps_a_file_somebody_changed() {
+        let dir = tempdir("uninstall-modified");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+
+        let state = InstalledState::load(&dir).unwrap();
+        let victim = state.files[0].dest.clone();
+        let untouched = state.files[1].dest.clone();
+        std::fs::write(dir.join(&victim), b"I edited this").unwrap();
+
+        let r = uninstall(&settings(&dir)).unwrap();
+        assert_eq!(r.kept, vec![victim.clone()]);
+        assert_eq!(
+            std::fs::read(dir.join(&victim)).unwrap(),
+            b"I edited this",
+            "revert must not mean deleting work the launcher did not do"
+        );
+        assert!(r.deleted.contains(&untouched), "the untouched file still reverts");
+        assert!(!dir.join(&untouched).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the manifest currently ships at `dest` — the other half of a pin (see keep.rs).
+    fn fe_sha(m: &Manifest, dest: &str) -> String {
+        m.files.iter().find(|f| f.dest == dest).unwrap().sha256.clone()
+    }
+
     fn base_fetch(dl: &Fake) -> (Release, Manifest) {
         let release = dl.fetch_release("r", None).unwrap();
         let manifest = engine::manifest_of(dl, &release).unwrap();
@@ -2593,7 +3661,7 @@ mod tests {
         let dl = Fake::new("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 4);
         assert_eq!((r.up_to_date, r.skipped), (0, 0));
         assert_eq!(r.bytes, 12); // 4 files × 3 bytes — shared content still counts per placed file
@@ -2633,7 +3701,7 @@ mod tests {
         let dl = Fake::new("v1805", &m, vec![("real", b"DATA")]);
         let (release, manifest) = base_fetch(&dl);
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2);
         let empty = dir.join("game/core/scripts/vscripts/game/gameinit.lua");
         assert!(empty.exists(), "the empty file must exist");
@@ -2657,7 +3725,7 @@ mod tests {
         .to_string();
         let dl = Fake::new("v1805", &m, vec![]);
         let (release, manifest) = base_fetch(&dl);
-        let err = install_base(&dir, &dl, &release, &manifest, None, None).unwrap_err();
+        let err = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("not the empty hash"), "got: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2668,17 +3736,112 @@ mod tests {
         let (m, assets) = base_release();
         let dl = Fake::new("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
         // corrupt one file, delete another, leave the rest alone
         std::fs::write(dir.join("game/dota/pak01_dir.vpk"), b"CORRUPT").unwrap();
         std::fs::remove_file(dir.join("game/dota/cfg/a.cfg")).unwrap();
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2, "only the corrupt + missing files");
         assert_eq!(r.up_to_date, 2);
         assert_eq!(std::fs::read(dir.join("game/dota/pak01_dir.vpk")).unwrap(), b"PAK");
         assert_eq!(std::fs::read(dir.join("game/dota/cfg/a.cfg")).unwrap(), b"CFG");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file we could not READ is not a file we know to be damaged. Both are `Write` (rewriting
+    /// is the cure when the cause is the disk, and probe_writable names a lock or an ACL before a
+    /// byte downloads) — but the report has to keep them apart, or a user whose antivirus is
+    /// holding a VPK is sent to re-download 15 GB for a problem no download can fix.
+    #[test]
+    fn a_file_that_cannot_be_read_is_reported_apart_from_a_damaged_one() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempdir("base-unreadable");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        // held open with no sharing at all — what an antivirus or a second process produces
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join("game/dota/pak01_dir.vpk"))
+            .unwrap();
+        // and genuine damage for contrast, at the SAME length so only the hash can catch it
+        std::fs::write(dir.join("game/core/cfg/b.cfg"), b"XXX").unwrap();
+
+        let statuses = base_plan(&dir, &manifest, None, "verify", None).unwrap();
+        let st = |dest: &str| statuses.iter().find(|s| s.dest() == dest).unwrap();
+        // the cause travels WITH the verdict now: both would be rewritten by a repair, and only
+        // the action word says which problem the user actually has
+        assert_eq!(st("game/dota/pak01_dir.vpk").action, BaseAction::Unreadable);
+        assert_eq!(st("game/core/cfg/b.cfg").action, BaseAction::Differs);
+        assert!(st("game/dota/pak01_dir.vpk").action.writes(), "a repair still covers it");
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The LENGTH settles a mismatch before a byte is read — a content hash implies a content
+    /// length, so a truncated multi-GB VPK never has to be hashed to prove what its size already
+    /// proved. Observable through the read itself: a file that is BOTH the wrong size and
+    /// unreadable comes back as plain damage, which can only happen if nothing tried to read it.
+    #[test]
+    fn a_wrong_size_file_is_damaged_without_being_read() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempdir("base-size-gate");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+
+        let victim = dir.join("game/dota/pak01_dir.vpk");
+        std::fs::write(&victim, b"PAK plus a great deal more").unwrap(); // manifest says 3 bytes
+        let lock =
+            std::fs::OpenOptions::new().read(true).share_mode(0).open(&victim).unwrap();
+
+        let statuses = base_plan(&dir, &manifest, None, "verify", None).unwrap();
+        let st = statuses.iter().find(|s| s.dest() == "game/dota/pak01_dir.vpk").unwrap();
+        assert_eq!(st.action, BaseAction::Differs, "the size settled it — nothing opened the file");
+
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// steam.inf answers "which build is this", and the answer is reached by READING a file. A
+    /// read that fails says nothing about the build — and a bare bool had to spell that as
+    /// "foreign", which is the one verdict that routes the user to an irreversible overwrite.
+    #[test]
+    fn an_unreadable_steam_inf_is_neither_ours_nor_foreign() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempdir("build-identity");
+        let m = serde_json::json!({
+            "schema": 2, "version": "1805",
+            "files": [ file_json("steam.inf", "game/dota/steam.inf", b"ClientVersion=1805") ]
+        })
+        .to_string();
+        let manifest = crate::manifest::Manifest::parse(m.as_bytes()).unwrap();
+        let inf = dir.join("game/dota/steam.inf");
+
+        // an empty folder is a fresh target, not a foreign build — that is where installs start
+        assert_eq!(build_identity(&dir, &manifest), BuildIdentity::Same);
+
+        std::fs::create_dir_all(inf.parent().unwrap()).unwrap();
+        std::fs::write(&inf, b"ClientVersion=1805").unwrap();
+        assert_eq!(build_identity(&dir, &manifest), BuildIdentity::Same);
+
+        // a different LENGTH, deliberately: two same-size writes microseconds apart share an
+        // mtime on Windows, and the (size,mtime) hash memo would keep reporting the old content
+        std::fs::write(&inf, b"ClientVersion=99999").unwrap();
+        assert_eq!(build_identity(&dir, &manifest), BuildIdentity::Foreign);
+
+        std::fs::write(&inf, b"ClientVersion=1805").unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&inf).unwrap();
+        assert_eq!(build_identity(&dir, &manifest), BuildIdentity::Unknown);
+
+        drop(lock);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2729,7 +3892,7 @@ mod tests {
         let (mm, assets) = base_release();
         let dl = Fake::new("v1805", &mm, assets);
         let (release, manifest) = base_fetch(&dl);
-        let r = install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 1);
         assert_eq!(r.skipped, 1);
         assert_eq!(std::fs::read(dir.join(".phoenix-vanilla/game/dota/cfg/a.cfg")).unwrap(), b"CFG");
@@ -2850,7 +4013,7 @@ mod tests {
         .to_string();
         let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"raw"), ("b0.phxb", &packed)]);
 
-        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
         assert_eq!(r.written.len(), 7);
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"raw");
         assert_eq!(std::fs::read(dir.join("game/dota/x.txt")).unwrap(), x);
@@ -2916,7 +4079,7 @@ mod tests {
             calls: Mutex::new(Vec::new()),
         };
 
-        let e = install(&settings(&dir), &dl, None, None, None).unwrap_err();
+        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("broken release"), "got: {e:#}");
         assert_eq!(
             dl.calls.lock().unwrap().len(),
@@ -2944,7 +4107,7 @@ mod tests {
         })
         .to_string();
         let dl = Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]);
-        let e = install(&settings(&dir), &dl, None, None, None).unwrap_err();
+        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("past its declared members"), "got: {e:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2972,12 +4135,12 @@ mod tests {
         };
 
         // first run: dies mid-packed-download, leaving the resumable .part under the psha256
-        assert!(install(&settings(&dir), &dl, None, None, None).is_err());
+        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
         assert!(!dir.join("game/dota/big.vpk").exists());
         assert!(dir.join(CACHE_DIR).join(format!("{psha}.part")).exists());
 
         // second run: resumes the packed .part (asserted inside CutOnce) and completes
-        let r = install(&settings(&dir), &dl, None, None, None).unwrap();
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
         assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
         assert!(!dir.join(CACHE_DIR).join(&psha).exists());
@@ -3018,12 +4181,12 @@ mod tests {
         let release = dl.fetch_release("r", None).unwrap();
 
         // a full install, then damage BOTH files of bundle A; bundle B's file stays intact
-        install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         std::fs::write(dir.join("game/dota/a1.txt"), b"corrupt").unwrap();
         std::fs::write(dir.join("game/dota/a2.txt"), b"corrupt").unwrap();
         dl.calls.lock().unwrap().clear();
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2);
         assert_eq!(std::fs::read(dir.join("game/dota/a1.txt")).unwrap(), a1);
         assert_eq!(std::fs::read(dir.join("game/dota/a2.txt")).unwrap(), a2);
@@ -3087,14 +4250,14 @@ mod tests {
         let (m, assets) = base_release();
         let dl = Fake::new("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         let leftover = std::fs::read_dir(&cache).map(|rd| rd.count()).unwrap_or(0);
         assert_eq!(leftover, 0, "stale cache entries must be reclaimed on success");
 
         // and the nothing-to-do path (everything intact) reclaims too
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join(sha(b"junk2")), b"junk2").unwrap();
-        install_base(&dir, &dl, &release, &manifest, None, None).unwrap();
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         let leftover = std::fs::read_dir(&cache).map(|rd| rd.count()).unwrap_or(0);
         assert_eq!(leftover, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3128,7 +4291,7 @@ mod tests {
         let (release, manifest) = base_fetch(&dl);
 
         let cancel = AtomicBool::new(true); // cancelled before the first chunk lands
-        let err = install_base(&dir, &dl, &release, &manifest, None, Some(&cancel)).unwrap_err();
+        let err = install_base(&dir, &dl, &release, &manifest, None, Some(&cancel), None).unwrap_err();
         assert!(
             err.chain().any(|c| c.downcast_ref::<engine::Cancelled>().is_some()),
             "expected the Cancelled marker, got: {err:#}"

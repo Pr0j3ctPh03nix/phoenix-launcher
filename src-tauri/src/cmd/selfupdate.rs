@@ -28,10 +28,17 @@ fn fetch_tag(settings: &Settings, tag: &str) -> Result<(Box<dyn Downloader>, Rel
 /// A failure here means UNKNOWN, not up-to-date. The frontend keeps those apart: an unreachable
 /// GitHub must neither pass a stale launcher off as current, nor block the user from playing.
 #[tauri::command]
-pub async fn launcher_check() -> Result<Option<LauncherUpdateView>, CmdError> {
-    tauri::async_runtime::spawn_blocking(|| {
+pub async fn launcher_check(
+    state: tauri::State<'_, std::sync::Arc<AppState>>,
+) -> Result<Option<LauncherUpdateView>, CmdError> {
+    let st = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
         let s = Settings::load();
         let (_, release) = fetch(&s).map_err(CmdError::from)?;
+        // Record the tag whether or not it is an update: this is the freshness key the "What's
+        // new" launcher page checks its cached history against, and the common case — this build
+        // IS the latest — is exactly the one where that history must open without a round trip.
+        *st.launcher_tag.lock().unwrap() = Some(release.tag_name.clone());
         Ok(selfupdate::available(&release).map(|a| LauncherUpdateView {
             tag: a.tag,
             version: a.version,
