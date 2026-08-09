@@ -29,6 +29,11 @@ for c in "/c/Program Files/Google/Chrome/Application/chrome.exe" \
 done
 [ -n "$CHROME" ] || { echo "no Chrome or Edge found — install one or edit dev/shoot.sh"; exit 1; }
 
+# Profiles are per-INVOCATION, not just per-screen. Reusing $OUT/profile-N across runs lets a
+# previous run's cached state serve the page, and the symptom is a screenshot that silently
+# reproduces the LAST run rather than this one — including a blank main from a run whose time
+# budget was too short. Wiping them is cheap; debugging a stale PNG is not.
+rm -rf "$OUT"/profile-*
 mkdir -p "$APP"
 cp frontend/index.html frontend/main.js frontend/i18n.js frontend/style.css "$APP/"
 cp dev/preview/stub.js dev/preview/drive.js "$APP/"
@@ -37,7 +42,7 @@ sed -i 's|<script src="i18n.js"></script>|<script src="stub.js"></script>\n  <sc
 sed -i 's|<script src="main.js"></script>|<script src="main.js"></script>\n  <script src="drive.js"></script>|' "$APP/index.html"
 
 SIZE="${SIZE:-825,740}"   # matches tauri.conf.json's window; SIZE=616,594 is its minimum
-SCREENS="${*:-main setup settings:general settings:launch settings:files options confirm gd}"
+SCREENS="${*:-main main:open yours setup settings:general settings:launch settings:files options confirm confirm:keep confirm:restore confirm:restore2 gd verify manage update whatsnew whatsnew:launcher files files:kept files:doomed files:onlyextras}"
 # UILANG=ru renders the Russian tables (the long labels). Not LANG — that is bash's own locale.
 QUERY=""; SUFFIX=""
 [ -n "$UILANG" ] && QUERY="?lang=$UILANG" && SUFFIX="-$UILANG"
@@ -48,7 +53,11 @@ for s in $SCREENS; do
   name=$(echo "$s" | tr ':' '-')
   # --screenshot needs an ABSOLUTE path (a relative one silently writes nothing), and each run
   # needs its own --user-data-dir or back-to-back launches clobber each other and produce nothing.
+  # The virtual-time budget has to comfortably outlast drive.js's 900 ms settle PLUS the .rise
+  # reveal, or the capture lands mid-animation and main renders as an EMPTY COLUMN — everything on
+  # it is a .rise element, so "blank page" is what a budget that is merely tight looks like. It
+  # is virtual time, so a generous number costs nothing in wall clock.
   "$CHROME" --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=1 \
-    --user-data-dir="$OUT/profile-$i" --window-size="$SIZE" --virtual-time-budget=6000 \
+    --user-data-dir="$OUT/profile-$i" --window-size="$SIZE" --virtual-time-budget=15000 \
     --screenshot="$OUT/$name$SUFFIX.png" "file:///$APP/index.html$QUERY#$s" 2>&1 | tail -1
 done

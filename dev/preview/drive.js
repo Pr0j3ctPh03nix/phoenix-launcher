@@ -11,10 +11,23 @@ window.addEventListener("load", () => {
     // frame — by then it would stomp the painted status with the idle one. Force the class,
     // neutralize setIdleStatus, and run the check boot would have run.
     document.getElementById("view-main").classList.add("revealed");
+    // ...and then take the animation out of the equation entirely. Forcing `.revealed` only
+    // STARTS the staggered reveal; the capture still races it, and a frame taken mid-stagger has
+    // every element at opacity 0 — main is nothing but `.rise` elements, so the PNG comes out
+    // blank while the DOM is perfectly correct. That flake cost real debugging time twice. These
+    // screenshots are a LAYOUT check, so pin the end state and let the animation be irrelevant.
+    const settle = document.createElement("style");
+    settle.textContent =
+      ".rise { opacity: 1 !important; transform: none !important; animation: none !important; }";
+    document.head.append(settle);
     setIdleStatus = () => {};
     // ?lang=ru — Russian labels are the long ones; worth a look before calling a layout done
     const lang = new URLSearchParams(location.search).get("lang");
     if (lang) await switchLang(lang);
+    // boot() rides that same unserviced rAF, so nothing has asked which launcher this is — and
+    // the What's-new launcher page marks the running build with it. Without this the pill that
+    // says "current" is missing from every screenshot for no reason the DOM can explain.
+    try { state.launcherVersion = (await invoke("launcher_info")).version; } catch (e) {}
     await doCheck();
 
     if (h.startsWith("settings")) {
@@ -25,16 +38,101 @@ window.addEventListener("load", () => {
     } else if (h === "options") {
       renderOptions();
       showView("options");
-    } else if (h === "whatsnew") {
-      await openWhatsNew();
+    } else if (h.startsWith("whatsnew")) {
+      openWhatsNew();
+      setWnTab(h.split(":")[1] || "phoenix"); // whatsnew:phoenix | :launcher
+    } else if (h === "confirm:restore2") {
+      // both statements apply: one file ticked, one left alone — the card that used to run them
+      // together into "…(0 B). 1 file(s)" at the end of a line
+      openFilesView({ ...GV, files: GV.files.filter((f) =>
+        f.path === "game/dota/cfg/autoexec.cfg" || f.path === "game/core/pak01_dir.vpk") });
+      gv.sel.clear();
+      gv.sel.add("game/core/pak01_dir.vpk");
+      gvRebuild();
+      document.getElementById("btn-gv-restore").click();
+    } else if (h === "confirm:restore") {
+      // The reported card: nothing ticked, one file pinned. Its first statement is then about
+      // NOTHING ("0 file(s) will be downloaded again (0 B)") and used to share a line with the one
+      // that matters — which is why this screen exists.
+      openFilesView({ ...GV, files: GV.files.filter((f) => f.path === "game/dota/cfg/autoexec.cfg") });
+      gv.sel.clear();
+      gvRebuild();
+      document.getElementById("btn-gv-restore").click();
+    } else if (h === "confirm:keep") {
+      // the longest confirm copy in the app — the one that shows how a card's text uses its width
+      confirmDialog({ title: t("cf.keepTitle"), text: t("cf.keepText", { n: 1 }),
+        confirm: t("cf.keepConfirm"), cancel: t("cf.keepDiscard"), defaultCancel: true });
     } else if (h === "confirm") {
       document.getElementById("btn-uninstall").click(); // the real handler, danger flag and all
     } else if (h === "verify" || h === "verify:stopping") {
       // mid-verify: the stub's game_verify never resolves, so the run state holds still. The
-      // progress line is faked because the op-progress event has no stub to fire it.
-      doGameVerify();
-      setStatus(t("status.working"), "busy", t("gv.progress", { i: 1342, n: 4635 }));
-      if (h.endsWith("stopping")) fireStop(); // the after-click state: Stop pressed, now disabled
+      // progress lines are faked because the op-progress event has no stub to fire it. Note the
+      // view underneath is settings — that is the point of the modal.
+      await openSettings();
+      setSettingsTab("files");
+      doGameVerify("settings");
+      document.getElementById("vf-line1").textContent = t("gv.progress", { i: 1342, n: 4635 });
+      document.getElementById("vf-line2").textContent =
+        t("gv.progressBytes", { item: "game/dota/pak01_dir.vpk", done: "240 MB", total: "340 MB" });
+      if (h.endsWith("stopping")) document.getElementById("btn-vf-stop").click();
+    } else if (h.startsWith("files")) {
+      // the files view over the stub's mixed payload. `files:open` expands the modded folder so
+      // the leaf rows (state + evidence) are visible; `files:extras` turns the extras chip on.
+      const mode = h.split(":")[1];
+      // `files:onlyextras` is the case that read as broken: nothing on screen is restorable, so
+      // the primary must not sit greyed at "Keep 0" and the bulk controls must still work.
+      openFilesView(mode === "onlyextras"
+        ? { ...GV, files: GV.files.filter((f) => f.owner === "extra") }
+        : GV);
+      if (mode === "open") {
+        for (const n of gv.root.kids.values()) n.open = true;
+        const dota = [...gv.root.kids.values()][0];
+        if (dota) for (const k of dota.kids.values()) k.open = true;
+        gvRebuild();
+      } else if (mode === "extras" || mode === "doomed") {
+        gv.facets.add("extra");
+        renderGvFacets();
+        for (const n of gv.root.kids.values()) n.open = true;
+        const dota = [...gv.root.kids.values()][0];
+        if (dota) for (const k of dota.kids.values()) k.open = true;
+        // `doomed`: extras ticked, so the terracotta strike + the delete button can be seen
+        if (mode === "doomed") for (const f of GV.files) if (f.owner === "extra") gv.sel.add(f.path);
+        gvRebuild();
+      } else if (mode === "kept") {
+        // only the pins: the review route for "what have I told the launcher to leave alone"
+        gv.facets = new Set(["kept"]);
+        renderGvFacets();
+        for (const n of gv.root.kids.values()) n.open = true;
+        gvRebuild();
+      } else if (mode === "onlyextras") {
+        gv.facets.add("extra");
+        renderGvFacets();
+        for (const n of gv.root.kids.values()) n.open = true;
+        gvRebuild();
+      } else if (mode === "filter") {
+        document.getElementById("gv-filter").value = "panorama";
+        gv.filter = "panorama";
+        gvRebuild();
+      }
+    } else if (h === "main:open") {
+      // categories expanded: the member paths and their individual states, under the summary row
+      for (const id of ["__core", "gfx"]) state.filesOpen.add(id);
+      renderFiles(state.filesShown);
+    } else if (h === "yours") {
+      // the cheap "what is mine" view — pins plus what nothing claims, no verification behind it
+      openFilesView(await invoke("your_files"), "settings", "yours");
+      for (const n of gv.root.kids.values()) n.open = true;
+      gvRebuild();
+    } else if (h === "manage") {
+      // the release has NOTHING pending, but files at our dests are the user's own: the primary
+      // must read Manage, not Update, and the status must not say "up to date"
+      applyCheck({ ...CHECK, changes: 0, userChanged: 2, primaryAction: "manage", canPlay: true,
+        files: CHECK.files.filter((f) => f.status === "modified" || f.status === "kept") });
+    } else if (h === "update") {
+      // what pressing Update now opens when the release would replace files somebody edited
+      openUpdateMenu(CHECK);
+      for (const n of gv.root.kids.values()) n.open = true;
+      gvRebuild();
     } else if (h === "nogame") {
       // the configured folder holds no game — only an interrupted download's cache
       applyCheck({ ...CHECK, gamePresent: false, pendingBaseBytes: 5.2 * GB,

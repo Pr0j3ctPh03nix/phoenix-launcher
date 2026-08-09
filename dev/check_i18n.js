@@ -26,13 +26,36 @@ const ru = new Set(Object.keys(I18N.ru));
 const used = new Set();
 for (const m of html.matchAll(/data-i18n(?:-ph|-title)?="([^"]+)"/g)) used.add(m[1]);
 for (const m of js.matchAll(/\bt\(\s*"([^"]+)"/g)) used.add(m[1]);
-// families built at runtime from backend data (launch flags, file states) — not literals
-const dynamic = (k) => k.startsWith("set.flag.") || k.startsWith("fstate.");
+// families built at runtime from backend data (launch flags, file states, the files view's facet
+// chips) — not literals. The EN/RU parity check below still covers every member of each family.
+const dynamic = (k) =>
+  k.startsWith("set.flag.") || k.startsWith("fstate.") || k.startsWith("gv.facet.");
 
 const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
 const wanted = new Set([...js.matchAll(/\$\("([^"]+)"\)/g)].map((m) => m[1]));
 
+// A key defined TWICE is invisible to everything above: a JS object literal keeps the last one, so
+// the tables were already collapsed before we read them, and the counts match perfectly. It bit for
+// real — `fstate.update` was defined twice in each table, and in Russian the two spellings differed
+// ("обновить" vs "обновление"), so the status word silently became the wrong one and no check could
+// say so. This is the only test here that has to read the SOURCE rather than the parsed value.
+function tableDupes(src) {
+  const out = [];
+  const at = (lang) => src.indexOf(`\n  ${lang}: {`);
+  const bounds = { en: [at("en"), at("ru")], ru: [at("ru"), src.length] };
+  for (const [lang, [from, to]] of Object.entries(bounds)) {
+    if (from < 0) continue;
+    const seen = new Set();
+    for (const m of src.slice(from, to < 0 ? src.length : to).matchAll(/^\s*"([^"]+)"\s*:/gm)) {
+      if (seen.has(m[1])) out.push(`${lang}.${m[1]}`);
+      seen.add(m[1]);
+    }
+  }
+  return out;
+}
+
 const problems = [
+  ["keys defined twice (the later one silently wins)", tableDupes(i18nSrc)],
   ["keys used but missing from en", [...used].filter((k) => !en.has(k) && !dynamic(k))],
   ["keys in en but missing from ru", [...en].filter((k) => !ru.has(k))],
   ["keys in ru but missing from en", [...ru].filter((k) => !en.has(k))],
