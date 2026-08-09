@@ -147,12 +147,6 @@ pub async fn apply(
                 written: r.written,
                 removed: r.removed,
                 up_to_date: r.up_to_date as u32,
-                winmm_orig: match r.winmm_orig {
-                    install::WinmmOrig::Created => "created",
-                    install::WinmmOrig::Existed => "existed",
-                    install::WinmmOrig::NotNeeded => "not_needed",
-                }
-                .to_string(),
             })
             .map_err(CmdError::from)
     })

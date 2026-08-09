@@ -7,9 +7,9 @@
 //!      streaming download (a small pool fetches files in parallel; an interrupted .part is
 //!      resumed, never restarted) that is verified (sha256 + size) — and stage it on the same
 //!      volume; nothing under the game is touched yet;
-//!   2. commit: back up each existing target, atomically move the staged file in, create
-//!      winmm_orig.dll if needed, apply removals (manifest remove[] + orphaned option files),
-//!      write state. Any failure in phase 2 rolls back every step already taken.
+//!   2. commit: back up each existing target, atomically move the staged file in, apply removals
+//!      (manifest remove[] + orphaned option files), write state. Any failure in phase 2 rolls
+//!      back every step already taken.
 //!
 //! Backups distinguish two cases so uninstall is a clean revert to stock:
 //!   * a target that is OURS (a previous phoenix version, present in the prior state) is backed up
@@ -48,16 +48,22 @@ const CACHE_DIR: &str = ".phoenix-cache";
 /// The base-game pipeline's cache, nested inside `CACHE_DIR` so it shares the volume but not the
 /// namespace — the shim's prune and uninstall must never reach a 16 GB game download.
 const BASE_CACHE_SUBDIR: &str = "base";
+/// LEGACY. Launchers up to 1.4.0 copied `%SystemRoot%\System32\winmm.dll` here, because the shim's
+/// winmm.dll proxy forwarded through a local copy. The shim now resolves the system DLL itself at
+/// load time, so **nothing creates this any more** — the copy was the single hardcoded exception to
+/// this being a data-driven installer, and it was also the launcher's loudest antivirus signal (an
+/// unsigned process reading System32 and dropping a Microsoft-signed binary under a
+/// non-Microsoft name beside a game exe).
+///
+/// The name stays because folders installed by an older launcher still hold the file: uninstall
+/// must still collect it (`state.winmm_orig_created`), `trust_prev` still reads it as evidence of a
+/// prior install, and the extras scan must still not offer it up as an unclaimed file. Clearing it
+/// from an existing install is the DIST REPO's job, via the manifest's `remove[]` — that path
+/// already backs up, rolls back and refuses to delete bytes the user changed, none of which a
+/// hardcoded delete here would do.
 const WINMM_ORIG: &str = "game/bin/win64/winmm_orig.dll";
 /// sha256 of zero bytes — the only hash an empty file can have (see `obtain_to_cache`).
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum WinmmOrig {
-    Created,
-    Existed,
-    NotNeeded,
-}
 
 #[derive(Debug)]
 pub struct InstallReport {
@@ -67,7 +73,6 @@ pub struct InstallReport {
     pub written: Vec<String>,
     pub removed: Vec<String>,
     pub up_to_date: usize,
-    pub winmm_orig: WinmmOrig,
     /// The manifest this install applied — the freshest one there is (install fetches its own).
     /// The shell uses it to refresh the replan cache, so a release published between check and
     /// apply can't leave the UI re-diffing against a stale manifest.
@@ -86,6 +91,8 @@ pub struct UninstallReport {
     /// `.phoenix-vanilla/` still holds preserved originals that had nowhere to go (their dests are
     /// occupied by files in `kept`). The folder survives the uninstall so those originals do.
     pub vanilla_kept: bool,
+    /// A legacy winmm_orig.dll was collected. Only ever true for folders an older launcher
+    /// installed — see WINMM_ORIG.
     pub winmm_orig_removed: bool,
 }
 
@@ -97,8 +104,6 @@ enum Committed {
     Removed { target: PathBuf, backup: PathBuf },
     /// Moved a preserved vanilla original from `vanilla` back to `target` (removal restore).
     VanillaRestored { target: PathBuf, vanilla: PathBuf },
-    /// Created winmm_orig.dll at `path`.
-    OrigCreated { path: PathBuf },
 }
 
 struct Ctx {
@@ -113,7 +118,9 @@ struct Ctx {
     /// still shows a prior install — then nothing may be promoted to the vanilla store, because
     /// a wrong promotion makes uninstall restore our own shim as "stock".
     trust_prev: bool,
-    /// Whether the updater lineage already created winmm_orig.dll.
+    /// Whether the updater lineage created the legacy winmm_orig.dll. Nothing sets this true any
+    /// more (see WINMM_ORIG); it is CARRIED FORWARD so that updating an old install does not make
+    /// its uninstall forget to collect the file that install left behind.
     prev_winmm_created: bool,
     /// Dests where an earlier removal restored a preserved vanilla original (state.restored) —
     /// carried into the new state so `plan` keeps treating those files as stock, not ours.
@@ -149,8 +156,8 @@ pub fn install(
     let game_dir = settings.resolve_game_dir()?;
     let (release, manifest) = engine::fetch(settings, dl, tag)?;
 
-    // Prior state distinguishes our files from genuine pre-existing ones, and remembers whether we
-    // already created winmm_orig.dll.
+    // Prior state distinguishes our files from genuine pre-existing ones, and carries the legacy
+    // winmm_orig.dll lineage forward (see WINMM_ORIG).
     let prev = InstalledState::load(&game_dir);
     let prev_dests: HashSet<String> = prev
         .as_ref()
@@ -159,10 +166,20 @@ pub fn install(
     let prev_winmm_created = prev.as_ref().map(|s| s.winmm_orig_created).unwrap_or(false);
     let prev_restored: Vec<String> =
         prev.as_ref().map(|s| s.restored.clone()).unwrap_or_default();
-    // No state file + evidence of a prior install (we created winmm_orig.dll, or a vanilla store
-    // exists) = `prev_dests` is empty but WRONG. See `back_up`.
+    // No state file + evidence that an install happened here anyway = `prev_dests` is empty but
+    // WRONG, and believing it makes `back_up` promote OUR OWN shim into the vanilla store, so
+    // uninstall then "restores" Phoenix as if it were stock. See `back_up`.
+    //
+    // The evidence is every artifact only an install leaves: the asset cache, a vanilla store, and
+    // — for folders an older launcher set up — winmm_orig.dll. That last one used to be the whole
+    // test; it stopped being created (see WINMM_ORIG), which silently made a state-less folder look
+    // pristine. `shim_cache_used` is the durable replacement and a strictly better tombstone: the
+    // cache is written by EVERY shim install, where winmm_orig.dll only appeared if the manifest
+    // happened to ship a winmm.dll.
     let trust_prev = prev.is_some()
-        || (!game_dir.join(WINMM_ORIG).exists() && !game_dir.join(VANILLA_DIR).exists());
+        || (!shim_cache_used(&game_dir)
+            && !game_dir.join(WINMM_ORIG).exists()
+            && !game_dir.join(VANILLA_DIR).exists());
 
     // --- what changes ---
     let resolved = engine::resolve(&manifest, &settings.selections);
@@ -196,32 +213,20 @@ pub fn install(
     seed_cache(&cache, &game_dir, &resolved, &statuses);
 
     if to_write.is_empty() && removals.is_empty() {
-        // Nothing to change — but a missing/corrupt state file or a missing winmm_orig.dll must
-        // not lock this folder into "up to date yet not installed" forever: a no-op install
-        // still heals both (every resolved file hash-matches, so the set is provably ours to
-        // record). A heal failure rolls back whatever was created.
-        let mut committed = Vec::new();
-        let heal = ensure_winmm_orig(&game_dir, has_winmm(&resolved), &mut committed).and_then(
-            |winmm_orig| {
-                let created = prev_winmm_created || matches!(winmm_orig, WinmmOrig::Created);
-                // carry the restored-original record (minus any dest the manifest ships again —
-                // that file will be displaced normally next time and the record no longer applies)
-                let restored: Vec<String> = prev_restored
-                    .iter()
-                    .filter(|d| !resolved.iter().any(|f| &f.dest == *d))
-                    .cloned()
-                    .collect();
-                write_state(&game_dir, &manifest, &resolved, created, restored)
-                    .map(|_| winmm_orig)
-            },
-        );
-        let winmm_orig = match heal {
-            Ok(w) => w,
-            Err(e) => {
-                rollback(&committed);
-                return Err(e.context("could not record the install state"));
-            }
-        };
+        // Nothing to change — but a missing/corrupt state file must not lock this folder into
+        // "up to date yet not installed" forever: a no-op install still heals it (every resolved
+        // file hash-matches, so the set is provably ours to record). Nothing is created here any
+        // more, so there is nothing to roll back either.
+        //
+        // carry the restored-original record (minus any dest the manifest ships again — that file
+        // will be displaced normally next time and the record no longer applies)
+        let restored: Vec<String> = prev_restored
+            .iter()
+            .filter(|d| !resolved.iter().any(|f| &f.dest == *d))
+            .cloned()
+            .collect();
+        write_state(&game_dir, &manifest, &resolved, prev_winmm_created, restored)
+            .map_err(|e| e.context("could not record the install state"))?;
         // cache warming is the caller's affair (warm_cache, backgroundable) — a heal must
         // return as fast as it healed
         return Ok(InstallReport {
@@ -230,7 +235,6 @@ pub fn install(
             written: Vec::new(),
             removed: Vec::new(),
             up_to_date,
-            winmm_orig,
             manifest,
         });
     }
@@ -289,7 +293,7 @@ pub fn install(
     let mut committed: Vec<Committed> = Vec::new();
 
     match commit(&ctx, &job, &mut committed) {
-        Ok((written, removed, winmm_orig)) => {
+        Ok((written, removed)) => {
             let _ = std::fs::remove_dir_all(&staging);
             // The commit succeeded, so nothing will ever roll back to these — they exist only as
             // rollback material for the run that just finished. Left behind they accumulated one
@@ -305,7 +309,6 @@ pub fn install(
                 written,
                 removed,
                 up_to_date,
-                winmm_orig,
                 manifest,
             })
         }
@@ -321,7 +324,7 @@ fn commit(
     ctx: &Ctx,
     job: &CommitJob,
     committed: &mut Vec<Committed>,
-) -> Result<(Vec<String>, Vec<String>, WinmmOrig)> {
+) -> Result<(Vec<String>, Vec<String>)> {
     let mut written = Vec::new();
 
     for (fe, sp) in job.staged {
@@ -344,8 +347,6 @@ fn commit(
         std::fs::rename(sp, &target).with_context(|| format!("installing {}", fe.dest))?;
         written.push(fe.dest.clone());
     }
-
-    let winmm_orig = ensure_winmm_orig(&ctx.game_dir, has_winmm(job.resolved), committed)?;
 
     // removals: back the file up (ours -> ephemeral, foreign -> vanilla store), and if a vanilla
     // original was preserved for the dest, put it back so the game returns to stock there
@@ -395,14 +396,13 @@ fn commit(
         }
     }
 
-    let winmm_orig_created = ctx.prev_winmm_created || matches!(winmm_orig, WinmmOrig::Created);
-    write_state(&ctx.game_dir, job.manifest, job.resolved, winmm_orig_created, restored_dests)?;
+    write_state(&ctx.game_dir, job.manifest, job.resolved, ctx.prev_winmm_created, restored_dests)?;
 
-    Ok((written, removed, winmm_orig))
+    Ok((written, removed))
 }
 
 /// Record the install: version + the resolved (effective) set (selected variants and enabled
-/// toggles included) + the winmm_orig lineage + the restored-original record (see state.rs).
+/// toggles included) + the legacy winmm_orig lineage + the restored-original record (see state.rs).
 fn write_state(
     game_dir: &Path,
     manifest: &Manifest,
@@ -420,15 +420,6 @@ fn write_state(
         restored,
     };
     state.save(game_dir).context("writing install state")
-}
-
-/// Does the effective file set manage a winmm.dll (at any dest)?
-fn has_winmm(resolved: &[FileEntry]) -> bool {
-    resolved.iter().any(|fe| {
-        Path::new(&fe.dest)
-            .file_name()
-            .is_some_and(|n| n.eq_ignore_ascii_case("winmm.dll"))
-    })
 }
 
 /// Fail fast when a file we must touch can't be written — before downloading a byte. The
@@ -1326,6 +1317,21 @@ fn clear_dir_files(dir: &Path) {
     let _ = std::fs::remove_dir(dir); // only succeeds once nothing is left
 }
 
+/// Has a SHIM install ever run in this folder? Answered by the asset cache holding at least one
+/// entry: cache files are content-addressed and sit flat at the top level, while the base game's
+/// cache is a SUBDIRECTORY (`base/`) — so this cannot be fooled by someone who only ever
+/// downloaded the game. Uninstall clears those files (`clear_dir_files`), which is what makes a
+/// reverted folder correctly read as pristine again.
+///
+/// Used only as a tombstone for `trust_prev`, so the failure directions are asymmetric on purpose:
+/// a false NO promotes our own shim to the vanilla store (uninstall then restores Phoenix as
+/// "stock"), a false YES merely declines to preserve a genuine original. Read errors therefore
+/// answer YES.
+fn shim_cache_used(game_dir: &Path) -> bool {
+    let Ok(rd) = std::fs::read_dir(game_dir.join(CACHE_DIR)) else { return false };
+    rd.flatten().any(|e| e.file_type().map(|t| t.is_file()).unwrap_or(true))
+}
+
 /// Move an existing `target` aside and return where it went. Ours -> ephemeral rollback backup;
 /// a genuine pre-existing file -> the permanent vanilla store (kept only the first time).
 fn back_up(ctx: &Ctx, dest: &str, target: &Path) -> Result<PathBuf> {
@@ -1336,7 +1342,16 @@ fn back_up(ctx: &Ctx, dest: &str, target: &Path) -> Result<PathBuf> {
     // displaced, with no copy anywhere. Routed to the vanilla store instead it survives, and
     // uninstall puts it back, which is the only reading of "revert" that does not throw away work
     // the launcher did not do.
-    let ours = ctx.prev_dests.contains(dest) && !ctx.user_changed.contains(dest);
+    //
+    // The legacy winmm_orig.dll is ours by LINEAGE rather than by record: we created it, but it
+    // was never a manifest entry, so it is absent from `prev_dests` and no hash of it was ever
+    // written down. Without this clause it reads as a genuine pre-existing original and is
+    // promoted to the vanilla store — and uninstall restores that store AFTER collecting
+    // winmm_orig.dll, so the file would be put straight back and a manifest `remove[]` could
+    // never actually retire it. Uninstall already deletes this file on the strength of the same
+    // flag and no content check; this only makes the two paths agree about whose it is.
+    let ours = (ctx.prev_dests.contains(dest) && !ctx.user_changed.contains(dest))
+        || (ctx.prev_winmm_created && dest == WINMM_ORIG);
     let vanilla = ctx.vanilla_root.join(dest);
     // Promoting a file to the vanilla store is IRREVERSIBLE in effect: uninstall restores whatever
     // is in there as "stock". So it only happens when `prev_dests` is trustworthy. Without the
@@ -1365,45 +1380,6 @@ fn back_up(ctx: &Ctx, dest: &str, target: &Path) -> Result<PathBuf> {
     Ok(to)
 }
 
-/// If a winmm.dll is managed and winmm_orig.dll is absent, create it by COPYING the system
-/// winmm.dll. Never overwrite an existing winmm_orig.dll — overwriting it with our proxy would
-/// make the proxy's forwarders point at themselves. Decided from the resolved set (not just the
-/// files written this run) so a no-op or partial install still heals a deleted winmm_orig.
-fn ensure_winmm_orig(
-    game_dir: &Path,
-    winmm_managed: bool,
-    committed: &mut Vec<Committed>,
-) -> Result<WinmmOrig> {
-    if !winmm_managed {
-        return Ok(WinmmOrig::NotNeeded);
-    }
-
-    let orig = game_dir.join(WINMM_ORIG);
-    if orig.exists() {
-        return Ok(WinmmOrig::Existed);
-    }
-    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    let src = Path::new(&sysroot).join("System32").join("winmm.dll");
-    if let Some(p) = orig.parent() {
-        std::fs::create_dir_all(p)?;
-    }
-    // Copy to a temp name and rename into place. A copy straight to `orig` that dies partway
-    // (disk full, transient I/O) leaves a TRUNCATED winmm_orig.dll — and because every later run
-    // early-returns on `orig.exists()`, including the no-op heal that exists to repair exactly
-    // this file, the proxy would forward into a broken DLL forever while the launcher reported a
-    // clean install. The path is recorded before the rename so a failure after it rolls back.
-    let tmp = orig.with_extension("dll.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    std::fs::copy(&src, &tmp)
-        .with_context(|| format!("copying {} -> winmm_orig.dll", src.display()))?;
-    committed.push(Committed::OrigCreated { path: orig.clone() });
-    if let Err(e) = std::fs::rename(&tmp, &orig) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(anyhow::Error::from(e).context("moving winmm_orig.dll into place"));
-    }
-    Ok(WinmmOrig::Created)
-}
-
 fn rollback(committed: &[Committed]) {
     for op in committed.iter().rev() {
         match op {
@@ -1419,16 +1395,18 @@ fn rollback(committed: &[Committed]) {
             Committed::VanillaRestored { target, vanilla } => {
                 let _ = std::fs::rename(target, vanilla);
             }
-            Committed::OrigCreated { path } => {
-                let _ = std::fs::remove_file(path);
-            }
         }
     }
 }
 
 /// Revert the game to stock: for each managed file restore its preserved vanilla original if one was
-/// kept, else delete it; delete winmm_orig.dll only if we created it; then remove our own scratch
-/// dirs and the state file. Game dirs (scripts/, cfg/, bin/win64/) are left alone.
+/// kept, else delete it; delete the legacy winmm_orig.dll only if our lineage created it; then
+/// remove our own scratch dirs and the state file. Game dirs (scripts/, cfg/, bin/win64/) are left
+/// alone.
+///
+/// Nothing creates winmm_orig.dll any more (see WINMM_ORIG), but folders installed by a launcher
+/// that did still hold one, and their state still says so — collecting it is the difference
+/// between a clean revert and leaving a stray copy of a system DLL in somebody's game folder.
 pub fn uninstall(settings: &Settings) -> Result<UninstallReport> {
     let game_dir = settings.resolve_game_dir()?;
     let state = InstalledState::load(&game_dir)
@@ -2129,8 +2107,14 @@ pub enum ExtrasEnd {
 /// one line saying so.
 ///
 /// Excluded outright, at every level: anything named `.phoenix*` (our staging, cache, backups,
-/// preserved originals and state files) and `winmm_orig.dll` (ours, and not in the shim's file
-/// list). Offering to delete our own machinery would be a bug dressed as a feature.
+/// preserved originals and state files). Offering to delete our own machinery would be a bug
+/// dressed as a feature.
+///
+/// `winmm_orig.dll` used to be excluded alongside them, on exactly that reasoning — it WAS ours.
+/// It is not any more (see WINMM_ORIG): nothing creates it, nothing reads it, and the shim no
+/// longer forwards through it. On a folder an older launcher set up it is simply a file nothing
+/// claims, which is the definition of an extra. Hiding it made the one leftover this launcher is
+/// responsible for the only file in the folder its owner could neither see nor remove.
 ///
 /// `claimed` is every dest the CALLER is already reporting under some other authority — the game
 /// manifest's own dests plus whatever the shim plan accounted for. It is a parameter rather than
@@ -2150,7 +2134,6 @@ pub fn scan_extras(
 ) -> (Vec<ExtraEntry>, ExtrasEnd) {
     let entries = engine::resolve(manifest, &Default::default());
     let mut known: HashSet<&str> = entries.iter().map(|f| f.dest.as_str()).collect();
-    known.insert(WINMM_ORIG);
     known.extend(claimed.iter().map(String::as_str));
     // Every ancestor of every KNOWN dest — the tree we walk file by file, as opposed to the
     // unknown subtrees we summarize whole. Membership answers "does anything here belong to
@@ -2542,21 +2525,101 @@ mod tests {
     }
 
     #[test]
-    fn fresh_install_writes_files_state_and_winmm_orig() {
+    fn fresh_install_writes_only_the_manifests_files() {
         let dir = tempdir("fresh");
         let (m, assets) = basic_release();
         let dl = Fake::new("v1.0.0", &m, assets);
         let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
 
         assert_eq!(r.written.len(), 2);
-        assert_eq!(r.winmm_orig, WinmmOrig::Created);
         assert_eq!(std::fs::read(dir.join("game/bin/win64/winmm.dll")).unwrap(), b"dll");
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
-        assert!(dir.join(WINMM_ORIG).exists());
+        // The manifest ships a winmm.dll, which used to be the trigger for copying System32's
+        // winmm.dll in beside it. Nothing does that now — an install writes the manifest's files
+        // and NOTHING ELSE, which is the whole claim of a data-driven installer.
+        assert!(!dir.join(WINMM_ORIG).exists(), "no system DLL is copied into the game folder");
         let st = InstalledState::load(&dir).unwrap();
         assert_eq!(st.version, "1.0.0");
         assert_eq!(st.files.len(), 2);
-        assert!(st.winmm_orig_created);
+        assert!(!st.winmm_orig_created, "the legacy lineage flag is never newly set");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder an OLDER launcher set up: winmm_orig.dll on disk, `winmm_orig_created` in state.
+    /// Updating it must carry that flag forward — dropping it would leave a stray copy of a system
+    /// DLL in the game folder that no later uninstall would ever collect.
+    #[test]
+    fn a_legacy_winmm_orig_survives_an_update_and_is_collected_by_uninstall() {
+        let dir = tempdir("legacy-winmm");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+
+        // stage what an older launcher would have left behind
+        std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
+        let mut st = InstalledState::load(&dir).unwrap();
+        st.winmm_orig_created = true;
+        st.save(&dir).unwrap();
+
+        // an update lands (v2 changes a.vpk), then a no-op install on top of it
+        let m2 = m.replace("\"version\": \"1.0.0\"", "\"version\": \"1.0.1\"");
+        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll"), ("a.vpk", b"vpk")]);
+        install(&settings(&dir), &dl2, None, None, None, None).unwrap();
+        assert!(
+            InstalledState::load(&dir).unwrap().winmm_orig_created,
+            "the lineage flag must survive an update"
+        );
+        assert!(dir.join(WINMM_ORIG).exists(), "an update does not delete it either");
+
+        let r = uninstall(&settings(&dir)).unwrap();
+        assert!(r.winmm_orig_removed, "uninstall still collects a legacy winmm_orig.dll");
+        assert!(!dir.join(WINMM_ORIG).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest `remove[]` must be able to RETIRE the legacy winmm_orig.dll — that is how the
+    /// dist repo clears it from existing installs when the shim stops needing it.
+    ///
+    /// It could not before: the file is not in `prev_dests` (it was never a manifest entry), so
+    /// `back_up` read it as a genuine pre-existing original and preserved it into the vanilla
+    /// store — from which uninstall's restore pass, which runs AFTER the winmm collection, put it
+    /// straight back. The removal reported success and the file was still there afterwards.
+    #[test]
+    fn a_manifest_remove_retires_the_legacy_winmm_orig_for_good() {
+        let dir = tempdir("winmm-remove");
+        let (m, assets) = basic_release();
+        let dl = Fake::new("v1.0.0", &m, assets);
+        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+
+        // what an older launcher left behind
+        std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
+        let mut st = InstalledState::load(&dir).unwrap();
+        st.winmm_orig_created = true;
+        st.save(&dir).unwrap();
+
+        // the release that stops needing it says so in the manifest
+        let m2 = serde_json::json!({
+            "version": "1.0.1",
+            "files": [
+                file_json("winmm.dll", "game/bin/win64/winmm.dll", b"dll"),
+                file_json("a.vpk", "game/dota/a.vpk", b"vpk"),
+            ],
+            "remove": [ { "dest": WINMM_ORIG } ]
+        })
+        .to_string();
+        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll"), ("a.vpk", b"vpk")]);
+        let r = install(&settings(&dir), &dl2, None, None, None, None).unwrap();
+
+        assert!(r.removed.contains(&WINMM_ORIG.to_string()), "the removal ran: {:?}", r.removed);
+        assert!(!dir.join(WINMM_ORIG).exists(), "and the file is gone");
+        assert!(
+            !dir.join(VANILLA_DIR).join(WINMM_ORIG).exists(),
+            "our own file must not be preserved as a vanilla original"
+        );
+
+        // the decisive half: it must not come back when the vanilla store is restored
+        uninstall(&settings(&dir)).unwrap();
+        assert!(!dir.join(WINMM_ORIG).exists(), "and it stays gone across an uninstall");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2749,7 +2812,9 @@ mod tests {
 
         let r = uninstall(&settings(&dir)).unwrap();
         assert_eq!(r.deleted.len(), 2);
-        assert!(r.winmm_orig_removed);
+        // nothing created one, so there is nothing to collect — the legacy path is covered by
+        // a_legacy_winmm_orig_survives_an_update_and_is_collected_by_uninstall
+        assert!(!r.winmm_orig_removed);
         assert!(!dir.join("game/bin/win64/winmm.dll").exists());
         assert!(!dir.join("game/dota/a.vpk").exists());
         assert!(!dir.join(WINMM_ORIG).exists());
@@ -3540,6 +3605,35 @@ mod tests {
         assert_eq!(n, 1, "only the extra was legal");
         assert!(!dir.join("game/dota/cfg/mymod.cfg").exists());
         assert!(dir.join("game/dota/pak01_dir.vpk").exists(), "a manifest file is unreachable");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The legacy winmm_orig.dll is nobody's file now, so the view built to show unclaimed files
+    /// has to show it and the delete control has to reach it. It used to be hardcoded into
+    /// `known`, which made the one leftover this launcher is responsible for the only file in the
+    /// folder its owner could neither see nor remove.
+    #[test]
+    fn a_legacy_winmm_orig_is_an_extra_the_user_can_delete() {
+        let dir = tempdir("winmm-extra");
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
+
+        let claimed: HashSet<String> = manifest.files.iter().map(|f| f.dest.clone()).collect();
+        let (extras, _) = scan_extras(&dir, &manifest, &claimed, None);
+        let paths: Vec<&str> = extras.iter().map(|e| e.path.as_str()).collect();
+        assert!(paths.contains(&WINMM_ORIG), "nothing claims it any more: {paths:?}");
+        // its directory is still walked file by file, not summarized as one deletable subtree —
+        // dota2.exe lives there and is claimed
+        assert!(!paths.contains(&"game/bin/win64"), "not a summarized subtree: {paths:?}");
+        assert!(!paths.contains(&"game/bin/win64/dota2.exe"));
+
+        let n = delete_extras(&dir, &manifest, &claimed, &[WINMM_ORIG.into()]).unwrap();
+        assert_eq!(n, 1);
+        assert!(!dir.join(WINMM_ORIG).exists());
+        assert!(dir.join("game/bin/win64/dota2.exe").exists(), "the game is untouched");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

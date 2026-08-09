@@ -11,8 +11,14 @@ const STATE_FILE: &str = ".phoenix-state.json";
 pub struct InstalledState {
     pub version: String,
     pub files: Vec<InstalledFile>,
-    /// True only if the updater itself created winmm_orig.dll (copied from System32). A user's own
-    /// pre-existing winmm_orig.dll leaves this false, so uninstall never deletes it.
+    /// LEGACY. True only if the updater itself created winmm_orig.dll (copied from System32) — a
+    /// user's own pre-existing one leaves this false, so uninstall never deletes it.
+    ///
+    /// Launchers past 1.4.0 never set this true: the shim resolves the system DLL itself and
+    /// nothing copies it any more (see `install::WINMM_ORIG`). It is still READ, and carried
+    /// forward verbatim by every install, because folders an older launcher set up still hold the
+    /// file and their uninstall still has to collect it. Zeroing it on update would strand a copy
+    /// of a system DLL in the game folder permanently.
     #[serde(default)]
     pub winmm_orig_created: bool,
     /// Dests where a removal RESTORED a preserved vanilla original — the file sitting there now is

@@ -143,7 +143,6 @@ pub struct InstallView {
     pub written: Vec<String>,
     pub removed: Vec<String>,
     pub up_to_date: u32,
-    pub winmm_orig: String,
 }
 
 #[derive(Serialize)]
