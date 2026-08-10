@@ -1921,6 +1921,119 @@ pub fn pending_base_bytes(game_dir: &Path) -> u64 {
         .sum()
 }
 
+/// Is there a game here, or the beginnings of one? `game_present` widened by an interrupted
+/// download's cache — together, the two states a fresh download would CONTINUE rather than fill an
+/// empty folder. The download dialog asks this about both the folder the user picked and the
+/// destination it composed, because the answer changes what that dialog is offering.
+pub fn game_started(dir: &Path) -> bool {
+    game_present(dir) || pending_base_bytes(dir) > 0
+}
+
+/// Top-level entries in `dir` that are not the launcher's own bookkeeping. 0 when it does not
+/// exist, which is the ordinary case for a fresh destination.
+///
+/// This is the extras scan's premise, counted before a byte is downloaded: everything in the game
+/// folder that no manifest describes is reported as a file nothing claims — so a destination that
+/// already holds somebody's documents will report them, with a delete control on them. The count
+/// is what lets the dialog say that in a number instead of in the abstract. `.phoenix*` is skipped
+/// on the same reasoning `scan_extras` skips it: those are ours, and they are not what the
+/// sentence is about.
+///
+/// Top level only. This runs on every keystroke in the name field; walking a folder someone might
+/// have pointed at `D:\` is not something to do between two keys, and "is there other stuff in
+/// here" is answered by the first level.
+pub fn foreign_entry_count(dir: &Path) -> u32 {
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    rd.flatten()
+        .filter(|e| !e.file_name().to_string_lossy().starts_with(".phoenix"))
+        .count()
+        .min(u32::MAX as usize) as u32
+}
+
+/// The folder a fresh download creates inside the one the user picks, unless they say otherwise.
+///
+/// A DEFAULT, not a rule: the dialog lets it be renamed or switched off entirely, and nothing else
+/// in the launcher ever looks for this name — whatever is chosen is adopted as `game_dir` and every
+/// later read goes through that setting. So this is the one place to change it.
+pub const GAME_SUBDIR: &str = "dota2_688f";
+
+/// Longest destination folder name the dialog accepts. Launcher policy, not a filesystem limit
+/// (NTFS allows 255): every name here is a segment added to paths that already run deep — the
+/// game ships files nine levels down — and nothing legible needs more than this.
+const GAME_SUBDIR_MAX: usize = 64;
+
+/// Why a typed destination folder name cannot be used. A reason, not a sentence: the shell owns
+/// no language (see main.rs), so this crosses to the webview as a code and is worded there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubdirIssue {
+    /// Nothing typed. Distinct from "no subfolder wanted", which is `None` at the call site.
+    Empty,
+    /// A path separator: this names ONE folder, and the rest of the path is the picker's job.
+    Separator,
+    /// A character Windows refuses in a file name — including `:`, which would also make the
+    /// composed string mean a different drive entirely.
+    Chars,
+    /// Leading/trailing space or a trailing dot. Win32 strips those before it resolves the path,
+    /// so the folder created would not be the folder named — the dialog would be showing a path
+    /// that does not exist.
+    Edge,
+    /// A reserved device name (`NUL`, `COM1`, `con.txt`): writing there vanishes bytes.
+    Reserved,
+    /// Longer than `GAME_SUBDIR_MAX`.
+    TooLong,
+}
+
+/// Vet a destination folder NAME — one path component, typed by the user.
+///
+/// Deliberately stricter than the filesystem, and in one direction only: everything refused here
+/// either cannot become a folder at all, or would become a folder with a different name than the
+/// one on screen. Being refused costs a keystroke; the alternative costs a multi-gigabyte download
+/// into a place the user was not shown.
+pub fn subdir_issue(name: &str) -> Option<SubdirIssue> {
+    if name.is_empty() {
+        return Some(SubdirIssue::Empty);
+    }
+    if name.chars().count() > GAME_SUBDIR_MAX {
+        return Some(SubdirIssue::TooLong);
+    }
+    if name.contains(['/', '\\']) {
+        return Some(SubdirIssue::Separator);
+    }
+    if name.contains([':', '*', '?', '"', '<', '>', '|']) || name.chars().any(|c| c.is_control()) {
+        return Some(SubdirIssue::Chars);
+    }
+    // Win32 resolves `dota2 ` and `dota2.` to `dota2`, so a name that only differs by an edge
+    // space or dot is a name the user cannot actually have. `..` and `.` fall in here too.
+    if name != name.trim() || name.ends_with('.') {
+        return Some(SubdirIssue::Edge);
+    }
+    if crate::manifest::is_reserved_device(name) {
+        return Some(SubdirIssue::Reserved);
+    }
+    None
+}
+
+/// Where a fresh download would write, split into the head the user cannot edit and the whole.
+///
+/// Returns `(prefix, target)`: `prefix` is `base` plus the separator a subfolder would be joined
+/// with (just `base` when there is none), and `target` is the destination itself. They are
+/// produced together, by one rule, because the download dialog SHOWS the prefix and SENDS the
+/// target — join either of them frontend-side and the path on screen stops being the path on disk
+/// the first time somebody picks a drive root, which already ends in a separator and must not be
+/// given a second one.
+///
+/// `sub` is assumed vetted (`subdir_issue`); nothing here can make a bad name safe, and the caller
+/// that ignores the verdict gets exactly the folder it asked for.
+pub fn target_of(base: &str, sub: Option<&str>) -> (String, String) {
+    let Some(sub) = sub else { return (base.to_string(), base.to_string()) };
+    let mut prefix = base.to_string();
+    if !prefix.ends_with(['/', '\\']) {
+        prefix.push(std::path::MAIN_SEPARATOR);
+    }
+    let target = format!("{prefix}{sub}");
+    (prefix, target)
+}
+
 /// What the plan's to-download set ALREADY has in the base cache: (WIRE bytes, fully-fetched
 /// files). Accounted per ASSET, not per file (R6): a partly-fetched bundle is progress toward
 /// all of its members and toward none of them individually — without asset tracking, a bundle
@@ -2427,6 +2540,14 @@ pub fn install_base(
         .map(|(_, t)| t.strip_prefix(game_dir).unwrap_or(t).to_string_lossy().into_owned())
         .collect();
     probe_writable(game_dir, rels.iter())?;
+
+    // The destination may not exist yet: a fresh download composes one INSIDE the folder the user
+    // picked (see `target_of`), so this is the first thing that ever touches it. Creating it in its
+    // own step is purely about the error — `create_dir_all(cache)` below would create it too, and
+    // then report a folder nobody can write to as "creating the asset cache", which names our
+    // machinery instead of the path the user chose. A no-op for repair, where it exists.
+    std::fs::create_dir_all(game_dir)
+        .with_context(|| format!("creating {}", game_dir.display()))?;
 
     // The base game gets its OWN cache subdirectory. It shared the shim's until a detached
     // warm_cache — which prunes against the shim manifest — was found deleting multi-GB base
@@ -3824,6 +3945,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A fresh download composes its destination INSIDE the folder the user picked, so the folder
+    /// it installs into does not exist yet — every earlier caller handed it one the picker had just
+    /// returned. Nothing may assume it is there.
+    #[test]
+    fn base_install_creates_a_destination_that_does_not_exist_yet() {
+        let base = tempdir("base-nested");
+        let (prefix, target) = target_of(&base.to_string_lossy(), Some(GAME_SUBDIR));
+        assert_eq!(format!("{prefix}{GAME_SUBDIR}"), target);
+        let dir = PathBuf::from(&target);
+        assert!(!dir.exists(), "the point of the test");
+
+        let (m, assets) = base_release();
+        let dl = Fake::new("v1805", &m, assets);
+        let (release, manifest) = base_fetch(&dl);
+        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        assert_eq!(r.written, 4);
+        assert_eq!(std::fs::read(dir.join("game/dota/pak01_dir.vpk")).unwrap(), b"PAK");
+        assert!(game_present(&dir), "and it is a game folder afterwards");
+        // the folder the user picked is untouched apart from the one it now contains
+        assert_eq!(foreign_entry_count(&base), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn base_repair_touches_only_damaged_files() {
         let dir = tempdir("base-repair");
@@ -4026,6 +4170,79 @@ mod tests {
         .unwrap();
         assert!(game_present(&dir2));
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// The two facts the download dialog reads off a folder before it offers to fill it: is a game
+    /// (or an interrupted download of one) already here, and how much of somebody else's is.
+    #[test]
+    fn a_destination_reports_what_is_already_in_it() {
+        let dir = tempdir("dest-probe");
+        assert!(!game_started(&dir));
+        assert_eq!(foreign_entry_count(&dir), 0);
+
+        // an interrupted download counts as started — the dialog offers to continue, not to fill
+        let cache = dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(sha(b"a")), b"12345").unwrap();
+        assert!(game_started(&dir));
+        // ...and our own bookkeeping is not "somebody else's files", exactly as the extras scan
+        // does not report it
+        assert_eq!(foreign_entry_count(&dir), 0);
+
+        std::fs::write(dir.join("taxes.xlsx"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("photos")).unwrap();
+        assert_eq!(foreign_entry_count(&dir), 2, "top-level entries, files and folders alike");
+        // a folder that does not exist is the ordinary fresh case, not an error
+        assert_eq!(foreign_entry_count(&dir.join("nope")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Everything refused here either cannot become a folder, or becomes one with a different name
+    /// than the dialog showed — Win32 strips edge spaces and trailing dots before it resolves a
+    /// path, and resolves device names to devices.
+    #[test]
+    fn a_destination_name_that_would_not_be_that_folder_is_refused() {
+        assert_eq!(subdir_issue(GAME_SUBDIR), None);
+        assert_eq!(subdir_issue("Dota 2 6.88f"), None, "spaces and dots inside are fine");
+        assert_eq!(subdir_issue("Дота"), None, "and so is anything not ASCII");
+
+        assert_eq!(subdir_issue(""), Some(SubdirIssue::Empty));
+        assert_eq!(subdir_issue("a/b"), Some(SubdirIssue::Separator));
+        assert_eq!(subdir_issue("a\\b"), Some(SubdirIssue::Separator));
+        assert_eq!(subdir_issue("D:"), Some(SubdirIssue::Chars), "a drive means another place");
+        assert_eq!(subdir_issue("what?"), Some(SubdirIssue::Chars));
+        assert_eq!(subdir_issue("a\tb"), Some(SubdirIssue::Chars));
+        assert_eq!(subdir_issue("dota "), Some(SubdirIssue::Edge));
+        assert_eq!(subdir_issue(" dota"), Some(SubdirIssue::Edge));
+        assert_eq!(subdir_issue("dota."), Some(SubdirIssue::Edge));
+        assert_eq!(subdir_issue(".."), Some(SubdirIssue::Edge));
+        assert_eq!(subdir_issue("."), Some(SubdirIssue::Edge));
+        assert_eq!(subdir_issue(".hidden"), None, "a LEADING dot is a legal name");
+        assert_eq!(subdir_issue("nul"), Some(SubdirIssue::Reserved));
+        assert_eq!(subdir_issue("COM1.txt"), Some(SubdirIssue::Reserved));
+        assert_eq!(subdir_issue(&"x".repeat(GAME_SUBDIR_MAX + 1)), Some(SubdirIssue::TooLong));
+        // the length cap counts CHARACTERS, not bytes: a Cyrillic name is two bytes a letter and
+        // must not be refused at half the length an ASCII one is allowed
+        assert_eq!(subdir_issue(&"я".repeat(GAME_SUBDIR_MAX)), None);
+    }
+
+    /// The head shown and the path sent come from one rule, and the case that proves it is a drive
+    /// root: it already ends in a separator and must not be given a second one.
+    #[test]
+    fn a_composed_destination_shows_the_path_it_sends() {
+        let (prefix, target) = target_of("D:\\Games", Some("dota2_688f"));
+        assert_eq!(prefix, "D:\\Games\\");
+        assert_eq!(target, "D:\\Games\\dota2_688f");
+        assert_eq!(format!("{prefix}dota2_688f"), target, "prefix + name IS the target");
+
+        let (prefix, target) = target_of("D:\\", Some("dota2_688f"));
+        assert_eq!(prefix, "D:\\");
+        assert_eq!(target, "D:\\dota2_688f");
+
+        // no subfolder: the picked folder is the destination, unchanged and unsuffixed
+        let (prefix, target) = target_of("D:\\Games", None);
+        assert_eq!(prefix, "D:\\Games");
+        assert_eq!(target, "D:\\Games");
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //! by a manifest in the standard format — install.rs's base pipeline does the actual work.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -14,7 +14,44 @@ use crate::config::Settings;
 use crate::engine;
 use crate::github::Github;
 use crate::install::{self, BaseAction};
-use crate::views::{CmdError, FileStateView, GameInstallView, GamePlanView, GameVerifyView};
+use crate::views::{
+    CmdError, FileStateView, GameInstallView, GamePlanView, GameTargetView, GameVerifyView,
+};
+
+/// Resolve the destination a fresh download would write to — the dialog that asks *where*, before
+/// the plan that asks *what*.
+///
+/// Deliberately cheap and side-effect free: no op slot, no network, no folder created. It is called
+/// on every keystroke in the name field, and it has to be able to be. Nothing here starts anything
+/// — the folder is created by the download itself, so a dialog the user backs out of leaves the
+/// disk exactly as it found it.
+///
+/// `sub` is the subfolder to create inside `base`; `None` means install straight into `base`, which
+/// is what switching the option off sends. The composed path is returned rather than assembled by
+/// the caller so the path shown and the path used are one string — see `install::target_of`.
+///
+/// ASYNC purely to keep it off the main thread: a sync command runs there, and this one lists a
+/// directory the user chose — which can be a Downloads folder or a drive root with thousands of
+/// entries in it. Milliseconds, but milliseconds on the event loop, once per keystroke.
+#[tauri::command]
+pub async fn game_target(base: String, sub: Option<String>) -> GameTargetView {
+    let issue = sub.as_deref().and_then(install::subdir_issue);
+    // The prefix is composed for the name AS TYPED even when it is refused: the field still shows
+    // `…\Games\` in front of whatever is being typed, and dropping the separator the moment a
+    // keystroke is invalid makes the path jump around under the cursor.
+    let (prefix, target) = install::target_of(&base, sub.as_deref());
+    let target_path = PathBuf::from(&target);
+    GameTargetView {
+        prefix,
+        // a refused name names no folder, so there is nothing to hand on
+        path: issue.is_none().then_some(target),
+        name_error: issue.map(crate::views::subdir_issue_key),
+        default_name: install::GAME_SUBDIR.to_string(),
+        occupied: install::game_started(&target_path),
+        base_occupied: install::game_started(Path::new(&base)),
+        foreign_entries: install::foreign_entry_count(&target_path),
+    }
+}
 
 /// What a download into `target` would do — the numbers behind the confirm dialog. Read-only and
 /// fast for the fresh-install case (an empty folder plans without hashing anything).
@@ -674,4 +711,47 @@ fn shim_plan(
 #[tauri::command]
 pub fn game_cancel(state: tauri::State<'_, Arc<AppState>>) {
     state.game_cancel.store(true, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn target(base: &str, sub: Option<&str>) -> GameTargetView {
+        let sub = sub.map(str::to_string);
+        tauri::async_runtime::block_on(game_target(base.to_string(), sub))
+    }
+
+    /// The two halves of the destination the dialog needs, and the one rule that ties them: what it
+    /// SHOWS is `prefix` plus the name in the field, and what it SENDS is `path`. A refused name
+    /// keeps the prefix (the field still has a path in front of the cursor) and loses the path
+    /// (there is no such folder to hand on).
+    #[test]
+    fn a_refused_name_keeps_its_prefix_and_loses_its_path() {
+        let dir = std::env::temp_dir().join("phoenix-cmd-target");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.to_string_lossy().to_string();
+
+        let ok = target(&base, Some("dota2_688f"));
+        assert_eq!(ok.name_error, None);
+        assert_eq!(ok.path.as_deref(), Some(format!("{}dota2_688f", ok.prefix).as_str()));
+        assert_eq!(ok.default_name, crate::install::GAME_SUBDIR);
+        assert!(!ok.occupied && !ok.base_occupied);
+        assert_eq!(ok.foreign_entries, 0, "the destination does not exist yet");
+
+        let bad = target(&base, Some("a:b"));
+        assert_eq!(bad.name_error, Some("chars"));
+        assert_eq!(bad.path, None);
+        assert_eq!(bad.prefix, ok.prefix, "the field keeps the path in front of the cursor");
+
+        // switched off: the picked folder IS the destination, and everything in it is about to be
+        // somebody else's file in a game folder
+        std::fs::write(dir.join("taxes.xlsx"), b"x").unwrap();
+        let flat = target(&base, None);
+        assert_eq!(flat.prefix, base, "no separator to join with, so none is added");
+        assert_eq!(flat.path.as_deref(), Some(base.as_str()));
+        assert_eq!(flat.foreign_entries, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

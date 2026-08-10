@@ -201,6 +201,62 @@ body {
   transition: width 0.25s ease;
 }
 
+/* ---- game download: choosing the destination ---- */
+/* One path on one line, with only its last segment editable. Framed like an input because it IS
+   one — the head just cannot be typed in. */
+#gd-dest { gap: 0.875rem; }
+.gd-path {
+  display: flex; align-items: center;
+  height: var(--ctl-h); padding: 0 0.875rem;
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r);
+  font-family: "Mono", monospace; font-size: 0.75rem;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.gd-path:focus-within { border-color: rgba(201, 168, 106, 0.5); box-shadow: 0 0 0 3px rgba(201, 168, 106, 0.08); }
+/* The fixed head is what yields when the card is too narrow: whatever the width, the segment being
+   EDITED stays whole. So it ellipsizes from its START (direction: rtl, like .af-current) and keeps
+   its tail, which is the folder name the user just picked and would recognize.
+   The separator is a SIBLING, never part of this span: under `direction: rtl` a trailing neutral
+   character — and "\" is one — is placed at the other end, so "D:\Games\" would render "\D:\Games". */
+.gd-path-base {
+  flex: 0 1 auto; min-width: 0; color: var(--text-mute);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  direction: rtl; text-align: left;
+}
+.gd-path-sep { flex: none; color: var(--text-mute); }
+/* Typed on the attribute, like .gv-search's — the generic input rule further down has the same
+   specificity as a bare `.gd-path input` and sits later, so it would silently win and draw a
+   second border inside this one. */
+.gd-path input[type="text"] {
+  flex: 1 1 7rem; min-width: 3rem; height: 100%; padding: 0;
+  border: none; background: transparent; box-shadow: none;
+  font-family: "Mono", monospace; font-size: 0.75rem; color: var(--gold-soft);
+}
+.gd-path input[type="text"]:focus { outline: none; border: none; box-shadow: none; }
+/* a name that cannot be a folder: the field carries the same terracotta as the message under it,
+   so the characters at fault and the reason are visibly one statement */
+.gd-path.bad { border-color: rgba(212, 119, 103, 0.45); }
+.gd-path.bad input[type="text"] { color: var(--terra); }
+.gd-path.bad:focus-within { border-color: var(--terra); box-shadow: 0 0 0 3px rgba(212, 119, 103, 0.08); }
+/* Consequences, one statement per line (the strings carry the breaks). It shrinks and scrolls
+   before the card can overflow: a note that says three things in Russian must not push the buttons
+   off the bottom. */
+.gd-note {
+  font-size: 0.71875rem; line-height: 1.45; color: var(--text-mute);
+  white-space: pre-line; min-height: 0; overflow-y: auto;
+}
+.gd-note:empty { display: none; }
+/* The plate that means READ THIS, as against .msg's terracotta "this went wrong". Same grammar —
+   accent rule on the left, tinted ground — in the colour that means attention. */
+.notice {
+  color: var(--text-dim);
+  padding: 0.625rem 0.75rem; border-left: 2px solid var(--gold);
+  background: rgba(201, 168, 106, 0.06); border-radius: 0 var(--r-sm) var(--r-sm) 0;
+}
+/* ...and the same plate in the error colour, for input that cannot be used at all. A name that
+   Windows would refuse is not an advisory. */
+.notice.err { color: var(--terra); border-left-color: var(--terra); background: rgba(212, 119, 103, 0.07); }
+
 /* ---- launcher self-update notes ---- */
 /* gold accent = action/attention, same grammar as the .msg plate's terracotta-for-error;
    capped height so long release notes never squeeze the files list off the column */
@@ -651,7 +707,7 @@ body {
 }
 #settings-msg { margin-top: 0.875rem; }
 /* inline code chips: mono on a quiet plate, like the notes' snippets */
-.label code, .hint code {
+.label code, .hint code, .gd-note code {
   font-family: "Mono", monospace; font-size: 0.9em; color: var(--gold-soft);
   background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r-sm);
   padding: 0.05rem 0.375rem;

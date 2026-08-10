@@ -128,6 +128,29 @@ const HANDLERS = {
     kept: GV.files.filter((f) => f.state === "kept").length,
     damagedBytes: 0,
   }),
+  // The destination resolver behind the download dialog's first stage. The COMPOSITION is the real
+  // rule (a base that already ends in a separator must not be given a second one) and so is the
+  // name check, because both are what that screen is for; the "what is already there" fields are
+  // canned — drive.js crafts those cases directly.
+  game_target: ({ base, sub }) => {
+    const prefix = sub == null || /[\\/]$/.test(base) ? base : base + "\\";
+    const err =
+      sub == null ? null
+      : sub === "" ? "empty"
+      : /[\\/]/.test(sub) ? "sep"
+      : /[:*?"<>|]/.test(sub) ? "chars"
+      : sub !== sub.trim() || sub.endsWith(".") ? "edge"
+      : null;
+    return {
+      prefix,
+      path: err ? null : prefix + (sub ?? ""),
+      nameError: err,
+      defaultName: "dota2_688f",
+      occupied: false,
+      baseOccupied: false,
+      foreignEntries: 0,
+    };
+  },
   game_cancel: () => null,
   game_repair: () => ({ gameVersion: "6.88f", written: 0, upToDate: 0, bytes: 0 }),
   game_delete_extras: (a) => a.paths.length,

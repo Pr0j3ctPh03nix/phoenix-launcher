@@ -453,24 +453,31 @@ fn check_dest(dest: &str) -> Result<()> {
         if part.is_empty() || part == ".." {
             return reject("empty path component");
         }
-        // "NUL", "CON.txt", "com1" … — Windows resolves reserved device names (with or without
-        // an extension, any case) to the device itself, not a file; writing there hangs or
-        // vanishes bytes rather than installing anything
-        // byte-wise on purpose: str slicing (`stem[..3]`) panics on a multibyte character
-        // boundary, and file names here can legitimately be Cyrillic
-        let stem = part.split('.').next().unwrap_or(part).as_bytes();
-        let reserved = stem.eq_ignore_ascii_case(b"CON")
-            || stem.eq_ignore_ascii_case(b"PRN")
-            || stem.eq_ignore_ascii_case(b"AUX")
-            || stem.eq_ignore_ascii_case(b"NUL")
-            || (stem.len() == 4
-                && (stem[..3].eq_ignore_ascii_case(b"COM") || stem[..3].eq_ignore_ascii_case(b"LPT"))
-                && stem[3].is_ascii_digit());
-        if reserved {
+        if is_reserved_device(part) {
             return reject("Windows reserved device name");
         }
     }
     Ok(())
+}
+
+/// "NUL", "CON.txt", "com1" … — Windows resolves reserved device names (with or without an
+/// extension, any case) to the device itself, not a file; writing there hangs or vanishes bytes
+/// rather than creating anything.
+///
+/// Byte-wise on purpose: str slicing (`stem[..3]`) panics on a multibyte character boundary, and
+/// the names reaching this can legitimately be Cyrillic — a manifest dest, or a folder name the
+/// user typed (`install::subdir_issue`, which is why this is not private). Callers that can be
+/// handed a raw component must trim trailing spaces and dots first: Win32 strips them BEFORE it
+/// resolves the path, so `NUL ` is the device too.
+pub fn is_reserved_device(part: &str) -> bool {
+    let stem = part.split('.').next().unwrap_or(part).as_bytes();
+    stem.eq_ignore_ascii_case(b"CON")
+        || stem.eq_ignore_ascii_case(b"PRN")
+        || stem.eq_ignore_ascii_case(b"AUX")
+        || stem.eq_ignore_ascii_case(b"NUL")
+        || (stem.len() == 4
+            && (stem[..3].eq_ignore_ascii_case(b"COM") || stem[..3].eq_ignore_ascii_case(b"LPT"))
+            && stem[3].is_ascii_digit())
 }
 
 #[derive(Debug, Clone, Deserialize)]

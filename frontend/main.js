@@ -1329,7 +1329,7 @@ function fmtDuration(sec) {
 }
 
 function gdStage(stage) {
-  for (const s of ["gd-plan", "gd-confirm", "gd-run", "gd-err"])
+  for (const s of ["gd-dest", "gd-plan", "gd-confirm", "gd-run", "gd-err"])
     $(s).classList.toggle("hidden", s !== "gd-" + stage);
 }
 
@@ -1343,11 +1343,11 @@ function gdClose() {
   if (gd.unlisten) { gd.unlisten(); gd.unlisten = null; }
 }
 
-// Fresh download: pick a DESTINATION, plan against it, confirm the numbers, run.
-// The picker always runs — the download never silently reuses the configured game folder — and the
-// files land directly in whatever is picked (no subfolder is invented), which is why the title and
-// the confirm line both name the exact path. `game_install` then adopts that folder as the game
-// dir backend-side, so a fresh download ends pointed at itself.
+// Fresh download: pick a place, decide the DESTINATION, plan against it, confirm the numbers, run.
+// The picker always runs — the download never silently reuses the configured game folder — and what
+// it returns is a place, not yet the destination: the stage below composes one inside it (or not),
+// and every screen after this names the composed path exactly. `game_install` then adopts that
+// folder as the game dir backend-side, so a fresh download ends pointed at itself.
 async function startGameDownload(origin) {
   if (state.busy) return;
   let dir = null;
@@ -1355,7 +1355,136 @@ async function startGameDownload(origin) {
     dir = await invoke("browse_folder", { title: t("dlg.pickTarget") });
   } catch (e) { /* dialog failed — stay put */ }
   if (!dir) return;
-  gdOpen(origin, dir);
+  gdDestOpen(origin, dir);
+}
+
+// ---- where the game goes ----
+// A folder picker answers "which place", not "which folder": dropping ~15 GB of game plus the
+// launcher's own bookkeeping into whatever was picked is a decision, and it used to be made
+// silently. This stage makes it visible and reversible — a subfolder by default, renameable, and
+// switchable off for people who picked an empty folder on purpose and want it used as-is.
+//
+// Nothing here touches the disk. The destination is created by the download itself, so backing out
+// leaves the folder exactly as it was found.
+const gdDest = {
+  origin: null,  // where a finished download should land the user (gdOpen's own `origin`)
+  base: null,    // what the picker returned — never edited on this screen
+  name: "",      // the subfolder: the one editable piece
+  nest: true,
+  path: null,    // the composed destination, AS THE BACKEND COMPOSED IT — never joined here
+  seq: 0,        // one keystroke can outrun another's round trip; only the newest answer renders
+};
+
+// Open on the picked folder. The default name and the "is something already here" facts both come
+// from the backend, which is also what makes the opening state right in the one case that matters:
+// a folder that ALREADY holds a game opens with the subfolder switched off, because nesting inside
+// one installs a second copy a level down instead of continuing the install that is there.
+async function gdDestOpen(origin, base) {
+  gdDest.origin = origin;
+  gdDest.base = base;
+  gdDest.path = null;
+  gdDest.seq++; // discard any refresh still in flight from a previous open
+  gd.mode = "install";
+  $("gd-title").textContent = t("gd.title");
+  let v;
+  try {
+    // sub:null first — this call is asking what the default IS, and what the picked folder holds
+    const probe = await invoke("game_target", { base, sub: null });
+    gdDest.name = probe.defaultName;
+    gdDest.nest = !probe.baseOccupied;
+    $("gd-path-name").value = gdDest.name;
+    v = gdDest.nest ? await invoke("game_target", { base, sub: gdDest.name }) : probe;
+  } catch (e) {
+    // A pure local read that cannot fail in a shipped build (no network, no op slot) — but if the
+    // command is unreachable, say so instead of quietly downloading into the picked folder, which
+    // is a different destination than this screen would have offered.
+    $("gd-err-msg").textContent = errText(e);
+    $("btn-gd-retry").classList.add("hidden");
+    $("gd-modal").classList.remove("hidden");
+    gdStage("err");
+    return;
+  }
+  gdDestRender(v);
+  $("gd-modal").classList.remove("hidden");
+  gdStage("dest");
+  // Take focus before syncModalLayer's observer does: its "first button in the card" is the switch
+  // plate, and Enter on a dialog should mean its primary, not "toggle the option".
+  $("btn-gd-dest-go").focus();
+}
+
+// Re-resolve from what is on screen. Runs on every keystroke: the backend composes the path and
+// vets the name, so this screen never has to know what Windows allows or where a separator goes.
+async function gdDestRefresh() {
+  const seq = ++gdDest.seq;
+  let v;
+  try {
+    v = await invoke("game_target", { base: gdDest.base, sub: gdDest.nest ? gdDest.name : null });
+  } catch (e) {
+    return; // a stale line beats a half-rendered one; the next keystroke re-asks
+  }
+  // a newer keystroke has already been answered, or the screen is gone (closed, or moved on to the
+  // plan — a late answer must not write into either)
+  const onDest = !$("gd-modal").classList.contains("hidden") &&
+                 !$("gd-dest").classList.contains("hidden");
+  if (seq !== gdDest.seq || !onDest) return;
+  gdDestRender(v);
+}
+
+function gdDestRender(v) {
+  gdDest.path = v.path;
+  // The separator is SPLIT OUT of the backend's prefix, never invented here — it has to render in
+  // its own left-to-right span (see .gd-path-base). Relocating the character the backend produced
+  // is not the same as joining a path frontend-side, which is the thing that must not happen.
+  const sep = /[\\/]$/.test(v.prefix) ? v.prefix.slice(-1) : "";
+  $("gd-path-base").textContent = sep ? v.prefix.slice(0, -1) : v.prefix;
+  $("gd-path-sep").textContent = sep;
+  // the whole path on hover, for when the head is ellipsized. Nothing to show when the name is
+  // refused: there is no such path, and pasting one together here to fill the gap is exactly the
+  // frontend join this screen is built to avoid.
+  $("gd-path").title = v.path || "";
+  // the refused text wears the refusal: the message below says why, the field says which characters
+  $("gd-path").classList.toggle("bad", !!v.nameError);
+  $("gd-path-name").classList.toggle("hidden", !gdDest.nest);
+  $("gd-nest").classList.toggle("on", gdDest.nest);
+  $("gd-nest").setAttribute("aria-checked", String(gdDest.nest));
+  $("gd-nest").querySelector(".switch").classList.toggle("on", gdDest.nest);
+
+  // The note is composed, not picked: several of these facts can be true at once, and each is one
+  // line. Order is by weight — what this run would do to an install that already exists first, what
+  // the folder will look like afterwards last. No two lines may state the same consequence: the
+  // count and the plain form of the foreign-files warning are the same sentence, so it is one line
+  // either way.
+  const lines = [];
+  let bad = false;
+  if (v.nameError) {
+    lines.push(t("gd.name." + v.nameError, { name: gdDest.name }));
+    bad = true;
+  } else if (v.occupied) {
+    // there is already a game (or half of one) at the destination — the shape of the folder is
+    // settled, and what matters is that this continues it
+    if (gdDest.nest && v.baseOccupied) lines.push(t("gd.destNestInGame"));
+    lines.push(t("gd.destBusy"));
+  } else {
+    if (gdDest.nest && v.baseOccupied) lines.push(t("gd.destNestInGame"));
+    if (!gdDest.nest) lines.push(t("gd.destFlat"));
+    // stated whenever the folder is shared — because it already holds things, or because it is
+    // about to (switching the subfolder off is exactly that)
+    if (!gdDest.nest || v.foreignEntries > 0) {
+      lines.push(v.foreignEntries > 0
+        ? t("gd.destForeignN", { n: v.foreignEntries })
+        : t("gd.destForeign"));
+    }
+  }
+  const note = $("gd-dest-note");
+  // nothing to warn about: the quiet hint, unplated
+  note.classList.toggle("notice", lines.length > 0);
+  note.classList.toggle("err", bad);
+  const text = lines.length ? lines.join("\n") : t("gd.destNestHint");
+  const frag = inlineCode(text);
+  if (frag) note.replaceChildren(frag);
+  else note.textContent = text;
+  // a destination that cannot exist must not be sendable
+  $("btn-gd-dest-go").disabled = !v.path;
 }
 
 // Resume/continue into the CONFIGURED folder — the one entry point that reuses it instead of
@@ -1368,6 +1497,9 @@ function startGameResume() {
   if (dir) gdOpen(null, dir);
 }
 
+// Plan + confirm, against a destination that is already decided: `dir` is the composed path the
+// destination stage produced (or the configured folder, when resuming). Nothing is joined to it
+// here — every line on the confirm names this exact string, and so does `game_install`.
 async function gdOpen(origin, dir) {
   gd.mode = "install";
   gd.origin = origin;
@@ -1477,6 +1609,15 @@ function onGdProgress(ev) {
       // running total, updated by DELTA. Re-summing the map per tick was O(files) inside an
       // O(ticks) stream — ~60k ticks against a map growing to 4,635 entries is a few hundred
       // million iterations of pure waste on the UI thread during the download.
+      //
+      // The delta keeps `sum` EXACTLY equal to the map's values summed, and every value is a byte
+      // count — which is what makes the line safe against a retry that restarts BELOW its own
+      // high-water mark (the backend's `abs_diff` case: a poisoned .part discarded, a server
+      // declining the Range). Such a tick walks the total down by that item's own contribution
+      // and no further, so it can report less than it did a second ago but never less than zero.
+      // Do NOT "fix" that with Math.max(0, …): the clamp breaks the equality, and the next tick
+      // for a DIFFERENT item then subtracts an old value the total no longer holds — inventing
+      // the negative it was added to prevent.
       gd.sum += p.bytesDone - (gd.perFile.get(p.item) || 0);
       gd.perFile.set(p.item, p.bytesDone);
       if (p.done) gd.doneFiles = Math.min(gd.files, gd.doneFiles + 1);
@@ -3216,6 +3357,26 @@ $("btn-fresh").addEventListener("click", async () => {
 // see. A cancelled guard means the user chose to keep editing: don't start the scan either.
 // Stays put: the progress modal opens on top of Settings and the files view returns to it.
 $("btn-verify").addEventListener("click", () => doGameVerify(currentView()));
+// the destination stage: the switch, the one editable path segment, and the two ways out
+$("gd-nest").addEventListener("click", () => {
+  gdDest.nest = !gdDest.nest;
+  gdDestRefresh();
+});
+$("gd-path-name").addEventListener("input", (e) => {
+  gdDest.name = e.target.value;
+  gdDestRefresh();
+});
+$("gd-path-name").addEventListener("keydown", (e) => {
+  // Enter from the field means the primary. The global handler leaves keys other than Escape alone
+  // while a modal is open, so nothing else would act on it.
+  if (e.key !== "Enter" || $("btn-gd-dest-go").disabled) return;
+  e.preventDefault();
+  $("btn-gd-dest-go").click();
+});
+$("btn-gd-dest-go").addEventListener("click", () => {
+  if (gdDest.path) gdOpen(gdDest.origin, gdDest.path);
+});
+$("btn-gd-dest-cancel").addEventListener("click", () => gdClose());
 $("btn-gd-go").addEventListener("click", () => gdRun());
 $("btn-gd-close").addEventListener("click", () => gdClose());
 $("btn-gd-err-close").addEventListener("click", () => gdClose());

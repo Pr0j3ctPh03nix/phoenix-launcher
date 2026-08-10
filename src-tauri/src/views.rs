@@ -221,6 +221,54 @@ pub struct GamePlanView {
     pub free_bytes: Option<u64>,
 }
 
+/// Where a fresh download would go, answered for the dialog that asks — before any of it is real.
+///
+/// The path is composed HERE, not in the frontend: the dialog shows `prefix` and sends `path`, and
+/// those two have to be the same act of joining or the folder on screen stops being the folder on
+/// disk (see `install::target_of`). The rest is what the destination already contains, which is the
+/// difference between filling an empty folder, continuing an install that exists, and moving in on
+/// top of somebody's files.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameTargetView {
+    /// The fixed head of the destination — the folder the user picked, plus the separator the
+    /// subfolder is joined with. This is the part the dialog renders un-editable.
+    pub prefix: String,
+    /// The destination itself, exactly as `game_plan`/`game_install` want it. `None` when the name
+    /// is unusable: there is no such folder to name, and nothing should be able to send one.
+    pub path: Option<String>,
+    /// Why the name is unusable, as a reason code the webview words in its own language (the shell
+    /// owns no strings — see main.rs). `None` = usable.
+    pub name_error: Option<&'static str>,
+    /// The name to offer when the dialog opens. Shipped rather than hardcoded frontend-side so the
+    /// prefill and what the backend composes cannot drift apart.
+    pub default_name: String,
+    /// The DESTINATION already holds a game, or an interrupted download of one — this run would
+    /// continue it rather than fill an empty folder.
+    pub occupied: bool,
+    /// The folder the user PICKED does. Distinct from `occupied`, and the reason the dialog opens
+    /// with the subfolder switched off: nesting inside a game folder installs a second copy of the
+    /// game one level down instead of touching the one that is already there.
+    pub base_occupied: bool,
+    /// Top-level entries in the destination that are not the launcher's own — what the extras scan
+    /// will report as files nothing claims, counted before the download instead of after it.
+    pub foreign_entries: u32,
+}
+
+/// The code a `SubdirIssue` crosses the wire as. The frontend appends it to `gd.name.` and looks
+/// the sentence up in its own table.
+pub fn subdir_issue_key(i: crate::install::SubdirIssue) -> &'static str {
+    use crate::install::SubdirIssue as S;
+    match i {
+        S::Empty => "empty",
+        S::Separator => "sep",
+        S::Chars => "chars",
+        S::Edge => "edge",
+        S::Reserved => "reserved",
+        S::TooLong => "long",
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameInstallView {

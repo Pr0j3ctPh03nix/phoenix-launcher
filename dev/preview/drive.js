@@ -18,7 +18,13 @@ window.addEventListener("load", () => {
     // screenshots are a LAYOUT check, so pin the end state and let the animation be irrelevant.
     const settle = document.createElement("style");
     settle.textContent =
-      ".rise { opacity: 1 !important; transform: none !important; animation: none !important; }";
+      ".rise { opacity: 1 !important; transform: none !important; animation: none !important; }" +
+      // ...and no TRANSITIONS either, for the same reason one step down. A capture can commit the
+      // first frame of one, which paints the state the DOM has already left: a switch drawn lit
+      // and knob-right over `aria-checked="false"`, on a screen whose whole point was that it is
+      // off. The DOM was right both times — believe --dump-dom, not the PNG, and then remove the
+      // transition from the equation like the reveal above.
+      "*, *::before, *::after { transition: none !important; }";
     document.head.append(settle);
     setIdleStatus = () => {};
     // ?lang=ru — Russian labels are the long ones; worth a look before calling a layout done
@@ -151,6 +157,31 @@ window.addEventListener("load", () => {
       gd.etaText = ""; gd.etaAt = 0;
       onGdProgress({ payload: { op: "game", item: "b002-txt-736453e4cf3c.phxb", current: 12,
         total: 146, bytesDone: 12 * 1024 * 1024, bytesTotal: 200 * 1024 * 1024, done: false } });
+    } else if (h.startsWith("dest")) {
+      // The destination stage. `dest` is the ordinary case (a subfolder inside an empty folder);
+      // the rest are the states whose whole job is to say something, and they are rendered from a
+      // crafted payload because the stub's canned one is deliberately the boring one.
+      const mode = h.split(":")[1];
+      const view = { prefix: "D:\\Games\\", path: "D:\\Games\\dota2_688f", nameError: null,
+        defaultName: "dota2_688f", occupied: false, baseOccupied: false, foreignEntries: 0 };
+      await gdDestOpen(null, "D:\\Games");
+      if (mode === "flat") {
+        // switched off: the game's own folder and our bookkeeping land beside the user's files
+        gdDest.nest = false;
+        gdDestRender({ ...view, prefix: "D:\\Games", path: "D:\\Games", foreignEntries: 12 });
+      } else if (mode === "warn") {
+        // pointed at a folder that already holds a game: nesting would be a second copy
+        gdDestRender({ ...view, baseOccupied: true });
+      } else if (mode === "bad") {
+        $("gd-path-name").value = "dota:2";
+        gdDest.name = "dota:2";
+        gdDestRender({ ...view, path: null, nameError: "chars" });
+      } else if (mode === "long") {
+        // the width case: the picked path is longer than the card, so the head has to give way
+        // while the segment being edited stays whole (and the "\" must not jump to the far left)
+        const base = "D:\\SteamLibrary\\steamapps\\common\\dota 2 beta\\downloads";
+        gdDestRender({ ...view, prefix: base + "\\", path: base + "\\dota2_688f" });
+      }
     } else if (h === "gd") {
       document.getElementById("gd-title").textContent = t("gd.title");
       document.getElementById("gd-summary").textContent =

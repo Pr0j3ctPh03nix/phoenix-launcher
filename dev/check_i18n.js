@@ -29,7 +29,8 @@ for (const m of js.matchAll(/\bt\(\s*"([^"]+)"/g)) used.add(m[1]);
 // families built at runtime from backend data (launch flags, file states, the files view's facet
 // chips) — not literals. The EN/RU parity check below still covers every member of each family.
 const dynamic = (k) =>
-  k.startsWith("set.flag.") || k.startsWith("fstate.") || k.startsWith("gv.facet.");
+  k.startsWith("set.flag.") || k.startsWith("fstate.") || k.startsWith("gv.facet.") ||
+  k.startsWith("gd.name."); // keyed by the backend's SubdirIssue code
 
 const ids = new Set([...html.matchAll(/id="([^"]+)"/g)].map((m) => m[1]));
 const wanted = new Set([...js.matchAll(/\$\("([^"]+)"\)/g)].map((m) => m[1]));

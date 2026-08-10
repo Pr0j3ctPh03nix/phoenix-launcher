@@ -62,9 +62,30 @@ const I18N = {
     "gd.planning": "Fetching the file list…",
     // the folder picker's titles: the same dialog serves two opposite jobs
     "dlg.pickGame": "Select the game folder (the one that contains game\\)",
-    "dlg.pickTarget": "Choose where to download the game — files go directly into this folder",
-    "gd.confirm": "{gb} GB download · {disk} GB on disk · {n} files\nDownloaded straight into this folder:\n{dir}",
-    "gd.confirmResume": "Already downloaded: {have} of {gb} GB · {df} of {n} files · {disk} GB on disk\nResuming straight into this folder:\n{dir}",
+    // no longer promises where the files land — the destination stage is what decides that, and it
+    // shows the composed path
+    "dlg.pickTarget": "Choose where to download the game",
+    "gd.confirm": "{gb} GB download · {disk} GB on disk · {n} files\nThe game goes here:\n{dir}",
+    "gd.confirmResume": "Already downloaded: {have} of {gb} GB · {df} of {n} files · {disk} GB on disk\nResuming here:\n{dir}",
+
+    // ---- destination stage ----
+    // The switch, then what each answer means. Only ONE of these is ever the quiet line: every
+    // other case is something the folder already contains, or a consequence of switching off.
+    "gd.destNest": "Give the game its own folder",
+    "gd.destNestHint": "The game and everything the launcher writes for it stay inside this one folder.",
+    "gd.destFlat": "`game\\` and the launcher's own `.phoenix-*` files go straight into the folder you picked, rather than into a folder of their own.",
+    // the same consequence with and without a count — never both, or the two say the same thing twice
+    "gd.destForeign": "Anything else in this folder is not part of the game: the launcher lists such files as ones it doesn't recognize, and offers to delete them.",
+    "gd.destForeignN": "{n} item(s) are already in this folder, and none of them are part of the game: the launcher lists them as files it doesn't recognize, and offers to delete them.",
+    "gd.destBusy": "This folder already holds a game or an interrupted download — this continues it, and replaces only what doesn't match.",
+    "gd.destNestInGame": "The folder you picked already holds a game. Downloading into a folder inside it installs a second copy and leaves that one alone.",
+    // why a typed name can't be a folder. Keyed by the backend's reason code (views::subdir_issue_key)
+    "gd.name.empty": "Type a folder name.",
+    "gd.name.sep": "A folder name can't contain \\ or / — this names one folder; go back to pick a different place.",
+    "gd.name.chars": "A folder name can't contain : * ? \" < > |",
+    "gd.name.edge": "A folder name can't start or end with a space, or end with a dot — Windows drops those, so the folder would not be the one named here.",
+    "gd.name.reserved": "Windows keeps “{name}” for a device — nothing can be stored under that name.",
+    "gd.name.long": "That folder name is too long.",
     "status.noGame": "No game here",
     "detail.noGame": "This folder has no game in it — download the last official 6.88f client to get started.",
     "detail.resumeDl": "An interrupted game download is here (~{gb} GB fetched) — resume it to finish.",
@@ -370,9 +391,23 @@ const I18N = {
     "gd.repairTitle": "Восстановление игры",
     "gd.planning": "Получаю список файлов…",
     "dlg.pickGame": "Выберите папку игры (ту, что содержит game\\)",
-    "dlg.pickTarget": "Выберите, куда скачать игру — файлы попадут прямо в эту папку",
-    "gd.confirm": "Загрузка: {gb} ГБ · на диске: {disk} ГБ · файлов: {n}\nБудет скачано прямо в эту папку:\n{dir}",
-    "gd.confirmResume": "Уже скачано: {have} из {gb} ГБ · файлов: {df} из {n} · на диске: {disk} ГБ\nПродолжится прямо в эту папку:\n{dir}",
+    "dlg.pickTarget": "Выберите, куда скачать игру",
+    "gd.confirm": "Загрузка: {gb} ГБ · на диске: {disk} ГБ · файлов: {n}\nИгра будет здесь:\n{dir}",
+    "gd.confirmResume": "Уже скачано: {have} из {gb} ГБ · файлов: {df} из {n} · на диске: {disk} ГБ\nПродолжится здесь:\n{dir}",
+
+    "gd.destNest": "Отдельная папка для игры",
+    "gd.destNestHint": "Игра и всё, что лаунчер для неё пишет, останутся внутри одной этой папки.",
+    "gd.destFlat": "Папка `game\\` и служебные файлы лаунчера `.phoenix-*` попадут прямо в выбранную вами папку, а не в отдельную.",
+    "gd.destForeign": "Всё остальное в этой папке к игре не относится: такие файлы лаунчер показывает как неопознанные и предлагает удалить.",
+    "gd.destForeignN": "В этой папке уже есть объекты ({n}), и к игре они не относятся: лаунчер покажет их как неопознанные файлы и предложит удалить.",
+    "gd.destBusy": "Здесь уже есть игра или прерванная загрузка — она будет продолжена, заменится только то, что не совпадает.",
+    "gd.destNestInGame": "В выбранной папке уже есть игра. Загрузка в папку внутри неё установит вторую копию и не тронет уже установленную.",
+    "gd.name.empty": "Введите имя папки.",
+    "gd.name.sep": "Имя папки не может содержать \\ или / — здесь задаётся одна папка; чтобы выбрать другое место, вернитесь назад.",
+    "gd.name.chars": "Имя папки не может содержать : * ? \" < > |",
+    "gd.name.edge": "Имя папки не может начинаться или заканчиваться пробелом и заканчиваться точкой — Windows их отбрасывает, и папка получится не та, что указана здесь.",
+    "gd.name.reserved": "«{name}» Windows держит за именем устройства — сохранить туда ничего нельзя.",
+    "gd.name.long": "Слишком длинное имя папки.",
     "status.noGame": "Игры здесь нет",
     "detail.noGame": "В этой папке нет игры — скачайте последний официальный клиент 6.88f, чтобы начать.",
     "detail.resumeDl": "Здесь прерванная загрузка игры (скачано ~{gb} ГБ) — продолжите, чтобы завершить.",

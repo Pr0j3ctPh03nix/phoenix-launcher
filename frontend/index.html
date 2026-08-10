@@ -464,7 +464,36 @@
         <span class="tag" data-i18n="tag.build"></span>
       </div>
 
-      <div id="gd-plan">
+      <!-- WHERE the game goes, asked before anything is planned or fetched. The destination is one
+           path on one line and only its LAST segment is editable: the folder came from the picker,
+           the name after it is the only part this dialog decides. Switch the folder off and the
+           picked path is all there is — the note says what that costs. First stage in the card on
+           purpose: syncModalLayer focuses the first button it finds, and that must be Continue. -->
+      <div id="gd-dest" class="hidden">
+        <!-- markup carries the DEFAULT answer (on), coherently across all three marks — every open
+             re-renders it from gdDest.nest before the modal is shown -->
+        <button class="flag-row on" id="gd-nest" type="button" role="switch" aria-checked="true">
+          <span class="flag-text">
+            <span class="flag-name" data-i18n="gd.destNest"></span>
+          </span>
+          <span class="switch on" aria-hidden="true"></span>
+        </button>
+
+        <div class="gd-path" id="gd-path">
+          <span class="gd-path-base" id="gd-path-base"></span>
+          <span class="gd-path-sep" id="gd-path-sep"></span>
+          <input id="gd-path-name" type="text" spellcheck="false" autocomplete="off" />
+        </div>
+
+        <div class="gd-note" id="gd-dest-note"></div>
+
+        <div class="modal-actions">
+          <button class="btn" id="btn-gd-dest-go" data-i18n="btn.continue"></button>
+          <button class="btn ghost" id="btn-gd-dest-cancel" data-i18n="btn.cancel"></button>
+        </div>
+      </div>
+
+      <div id="gd-plan" class="hidden">
         <div class="af-progress">
           <span class="spinner"></span>
           <div class="af-lines">

@@ -61,6 +61,7 @@ fn run_gui() {
             cmd::update::replan,
             cmd::update::apply,
             cmd::update::uninstall,
+            cmd::game::game_target,
             cmd::game::game_plan,
             cmd::game::game_install,
             cmd::game::game_repair,
