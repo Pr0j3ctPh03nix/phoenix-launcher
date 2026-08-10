@@ -151,8 +151,9 @@ impl Manifest {
     }
 
     /// Check every install destination in the document before anything can act on one, then the
-    /// bundle invariants — all at parse time (R9): a lazy check would report a broken release
-    /// partway through a multi-gigabyte install, and could not be conformance-tested at all.
+    /// option shapes and the bundle invariants — all at parse time (R9): a lazy check would report
+    /// a broken release partway through a multi-gigabyte install, and could not be
+    /// conformance-tested at all.
     fn validate(&self) -> Result<()> {
         for f in &self.files {
             check_dest(&f.dest)?;
@@ -170,7 +171,67 @@ impl Manifest {
         }
         self.validate_hashes()?;
         self.validate_dests()?;
+        self.validate_options()?;
         self.validate_bundles()
+    }
+
+    /// Every option must resolve to something. An option `resolve` would SKIP is a broken release.
+    ///
+    /// `resolve` materializes a choice from the effective selection — the user's, or the
+    /// manifest's `default` when theirs names no variant (`effective_selection` already discards
+    /// an unknown id, so that half is guarded). Nothing guards the default: if IT names no
+    /// variant, or the option carries no `dest` to install one at, the branch falls through and
+    /// the option contributes no file at all. A toggle whose `default` is not a bool reads as
+    /// disabled by the same silence, taking its files with it.
+    ///
+    /// The symptom never mentions the option. The dest simply never enters the resolved set, so
+    /// the check reports "up to date" about a release that ships one more file than is on disk —
+    /// and a client that already holds the previous variant sees that dest as an orphan and
+    /// DELETES it on the next apply. That is a content regression with no row to show for it,
+    /// which is worse than the dest collision `validate_dests` refuses: that one at least leaves
+    /// a change on screen forever.
+    ///
+    /// Deliberately narrow: only shapes that make the option a guaranteed no-op are refused.
+    /// Fields a kind does not read (a `dest` on a toggle) are inert, and refusing the whole
+    /// manifest — the launcher's only failure mode here, felt by every client at once — has to be
+    /// reserved for defects that actually cost the user files.
+    ///
+    /// No B-number — see `validate_hashes`. Like that check and `validate_dests`, this is stricter
+    /// than the dist repo's reference validator.
+    fn validate_options(&self) -> Result<()> {
+        for o in &self.options {
+            match o.kind {
+                OptionKind::Choice => {
+                    let Some(dest) = &o.dest else {
+                        return bail_invalid(format!(
+                            "choice {} has no dest — its variants have nowhere to install",
+                            o.id
+                        ));
+                    };
+                    let Some(id) = o.default.as_str() else {
+                        return bail_invalid(format!(
+                            "choice {} default {} is not a variant id",
+                            o.id, o.default
+                        ));
+                    };
+                    if !o.variants.iter().any(|v| v.id == id) {
+                        return bail_invalid(format!(
+                            "choice {} default {id:?} names no variant, so {dest} is never written",
+                            o.id
+                        ));
+                    }
+                }
+                OptionKind::Toggle => {
+                    if !o.default.is_boolean() {
+                        return bail_invalid(format!(
+                            "toggle {} default {} is not true or false",
+                            o.id, o.default
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Every content hash must be 64 LOWERCASE hex — the form `hex::encode` produces and the only
@@ -901,6 +962,55 @@ mod tests {
                               "dest":"game/dota/x.vpk",
                               "variants":[{{"id":"v1","label":"A","name":"a","sha256":"{a}","size":1}},
                                           {{"id":"v2","label":"B","name":"b","sha256":"{b}","size":2}}]}}]}}"#
+        );
+        assert!(Manifest::parse(legal.as_bytes()).is_ok());
+    }
+
+    /// An option `resolve` would silently skip is refused up front. Left to run, it contributes no
+    /// file: the check then calls a release "up to date" while one of its dests is unwritten, and
+    /// a client holding the previous variant deletes that dest as an orphan on the next apply.
+    #[test]
+    fn an_option_the_reader_would_skip_is_refused() {
+        let (a, b) = (hash("aa"), hash("bb"));
+        let variants = format!(
+            r#"[{{"id":"v1","label":"A","name":"a","sha256":"{a}","size":1}},
+                {{"id":"v2","label":"B","name":"b","sha256":"{b}","size":2}}]"#
+        );
+        let broken = [
+            // a default naming no variant — `find` misses and the dest is never written
+            format!(
+                r#"{{"id":"c","kind":"choice","label":"L","default":"v3",
+                     "dest":"game/dota/x.vpk","variants":{variants}}}"#
+            ),
+            // ...including when it is not even a variant id in shape
+            format!(
+                r#"{{"id":"c","kind":"choice","label":"L","default":true,
+                     "dest":"game/dota/x.vpk","variants":{variants}}}"#
+            ),
+            // no dest: nothing in the document says where the chosen variant would land
+            format!(
+                r#"{{"id":"c","kind":"choice","label":"L","default":"v1","variants":{variants}}}"#
+            ),
+            // a toggle whose default is not a bool reads as OFF, and its files vanish with it
+            format!(
+                r#"{{"id":"t","kind":"toggle","label":"L","default":"yes",
+                     "files":[{{"name":"a","dest":"game/dota/fx.vpk","sha256":"{a}","size":1}}]}}"#
+            ),
+        ];
+        for opt in broken {
+            let src = format!(r#"{{"schema":2,"version":"1.0.0","files":[],"options":[{opt}]}}"#);
+            let e = Manifest::parse(src.as_bytes()).unwrap_err();
+            assert!(format!("{e:#}").contains("broken release"), "got: {e:#}");
+            assert!(!refused_for_schema(&e), "a broken release, not a version gap");
+        }
+
+        // both kinds in their legal shape still parse
+        let legal = format!(
+            r#"{{"schema":2,"version":"1.0.0","files":[],"options":[
+                 {{"id":"c","kind":"choice","label":"L","default":"v2",
+                   "dest":"game/dota/x.vpk","variants":{variants}}},
+                 {{"id":"t","kind":"toggle","label":"L","default":false,
+                   "files":[{{"name":"a","dest":"game/dota/fx.vpk","sha256":"{a}","size":1}}]}}]}}"#
         );
         assert!(Manifest::parse(legal.as_bytes()).is_ok());
     }
