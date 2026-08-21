@@ -291,9 +291,9 @@
            is the same height and only the visible window is in the DOM (see renderGv), so an
            expanded five-thousand-file folder scrolls like an empty one.
 
-           Two selection systems on purpose, and they look different because they DO different
-           things: a checkbox restores (reversible, gold), the ✕ deletes (irreversible,
-           terracotta). Nothing bulk ever arms the second one. -->
+           ONE selection model: every row has a checkbox, and what ticking it means comes from
+           who owns the row and which PAGE it is on — put this file back, or delete it. The legend
+           above the column says which, because a checkbox cannot. -->
       <section id="view-gv" class="view hidden">
 
         <header class="head">
@@ -307,9 +307,11 @@
              line a screen full of differences reads as "everything is broken". -->
         <div class="gv-summary" id="gv-summary"></div>
 
-        <!-- one chip per KIND of difference: counts, and a click filters that kind in or out.
-             Built by renderGvFacets — the set of kinds present is data, not markup. -->
-        <div class="facets" id="gv-facets"></div>
+        <!-- one PAGE per KIND of difference, so the screen only ever asks one question. Built by
+             renderGvTabs — the set of kinds present is data, not markup — and each count is of the
+             rows its page would show right now, path filter included, so the open tab's number can
+             never disagree with what is under it. -->
+        <div class="tabs gv-tabs" id="gv-tabs" role="tablist"></div>
 
         <div class="gv-tools">
           <label class="gv-search">
@@ -324,10 +326,10 @@
 
         <!-- What a tick MEANS, stated immediately above the ticks. One checkbox column serves
              three different acts here (put back / take the new version / delete), decided by the
-             row's owner and the screen's mode, and none of that is inferable from a checkbox. -->
+             PAGE and the screen's mode, and none of that is inferable from a checkbox. -->
         <div class="gv-legend" id="gv-legend"></div>
 
-        <div class="gv-area" id="gv-area">
+        <div class="gv-area" id="gv-area" role="tabpanel">
           <div class="gv-empty hidden" id="gv-empty"></div>
           <div class="gv-list" id="gv-list" role="group"></div>
         </div>

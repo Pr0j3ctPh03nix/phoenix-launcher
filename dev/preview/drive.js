@@ -83,7 +83,7 @@ window.addEventListener("load", () => {
       if (h.endsWith("stopping")) document.getElementById("btn-vf-stop").click();
     } else if (h.startsWith("files")) {
       // the files view over the stub's mixed payload. `files:open` expands the modded folder so
-      // the leaf rows (state + evidence) are visible; `files:extras` turns the extras chip on.
+      // the leaf rows (state + evidence) are visible; `files:extras` opens the extras page.
       const mode = h.split(":")[1];
       // `files:onlyextras` is the case that read as broken: nothing on screen is restorable, so
       // the primary must not sit greyed at "Keep 0" and the bulk controls must still work.
@@ -96,8 +96,7 @@ window.addEventListener("load", () => {
         if (dota) for (const k of dota.kids.values()) k.open = true;
         gvRebuild();
       } else if (mode === "extras" || mode === "doomed") {
-        gv.facets.add("extra");
-        renderGvFacets();
+        gvGoPage("extra");
         for (const n of gv.root.kids.values()) n.open = true;
         const dota = [...gv.root.kids.values()][0];
         if (dota) for (const k of dota.kids.values()) k.open = true;
@@ -106,13 +105,11 @@ window.addEventListener("load", () => {
         gvRebuild();
       } else if (mode === "kept") {
         // only the pins: the review route for "what have I told the launcher to leave alone"
-        gv.facets = new Set(["kept"]);
-        renderGvFacets();
+        gvGoPage("kept");
         for (const n of gv.root.kids.values()) n.open = true;
         gvRebuild();
       } else if (mode === "onlyextras") {
-        gv.facets.add("extra");
-        renderGvFacets();
+        // every row is an extra, so the extras page is the only one and it opens on it by itself
         for (const n of gv.root.kids.values()) n.open = true;
         gvRebuild();
       } else if (mode === "filter") {

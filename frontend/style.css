@@ -374,29 +374,34 @@ body {
 }
 .gv-summary b { color: var(--verd); font-weight: 600; }
 
-/* facet chips: a count you can switch off. Muted when excluded, so the row doubles as a legend
-   for the colours used down the list. */
-.facets { display: flex; flex-wrap: wrap; gap: 0.4375rem; padding-bottom: 0.75rem; }
-.facet {
-  display: inline-flex; align-items: center; gap: 0.4375rem;
-  height: 1.75rem; padding: 0 0.625rem; border-radius: 999px;
-  border: 1px solid var(--line); background: transparent; cursor: pointer;
-  font-family: "Inter", sans-serif; font-size: 0.71875rem; letter-spacing: 0.0125rem;
-  color: var(--text-mute); transition: border-color 0.15s, color 0.15s, opacity 0.15s;
-}
-.facet:hover { border-color: var(--text-mute); }
-.facet .facet-n { font-family: "Mono", monospace; font-size: 0.6875rem; }
-/* a dot carries the kind's colour; the label stays quiet so the row does not turn into a rainbow */
-.facet .facet-dot { width: 0.4375rem; height: 0.4375rem; border-radius: 50%; background: currentColor; }
-.facet.on { color: var(--text); border-color: var(--line); background: rgba(255, 255, 255, 0.035); }
-.facet.off { opacity: 0.45; }
-.facet[data-kind="missing"]    .facet-dot { color: var(--gold); }
-.facet[data-kind="modified"]   .facet-dot { color: var(--gold-soft); }
-.facet[data-kind="unreadable"] .facet-dot { color: var(--terra); }
-.facet[data-kind="kept"]       .facet-dot { color: var(--kept); }
-.facet[data-kind="extra"]      .facet-dot { color: #8e7fb8; }
+/* One page per kind of difference — the app's tab grammar (see .tabs) over what used to be
+   filter chips. Written .tabs.gv-tabs because this block sits EARLIER in the file than .tabs
+   itself, and on equal specificity would lose every property the two share. The summary above
+   has already paid --gap-head, so the top gap here is its own; the pane below pays one back as
+   .gv-tools' padding-top, the way .panels does under the settings tabs.
 
-.gv-tools { display: flex; align-items: center; gap: 0.875rem; padding-bottom: 0.625rem; }
+   Two departures from .tab, both forced by these labels being DATA rather than three fixed
+   words: each tab carries a COUNT and a DOT in its kind's colour, so the row still doubles as
+   the legend for the colours used down the list; and the row WRAPS, because five Russian labels
+   do not fit the window's minimum width. The label itself never wraps — a whole tab moves down
+   instead — and the price is that an active tab left on the first row underlines itself rather
+   than lighting up the container's rule. */
+.tabs.gv-tabs {
+  margin-top: 0.75rem; gap: 0.875rem; row-gap: 0; flex-wrap: wrap;
+}
+.gv-tabs .tab {
+  display: inline-flex; align-items: center; gap: 0.4375rem; white-space: nowrap;
+}
+.gv-tabs .tab-n { font-family: "Mono", monospace; font-size: 0.6875rem; color: var(--text-mute); }
+.gv-tabs .tab.active .tab-n { color: var(--text-dim); }
+.gv-tabs .tab-dot { width: 0.4375rem; height: 0.4375rem; border-radius: 50%; background: currentColor; }
+.gv-tabs .tab[data-kind="missing"]    .tab-dot { color: var(--gold); }
+.gv-tabs .tab[data-kind="modified"]   .tab-dot { color: var(--gold-soft); }
+.gv-tabs .tab[data-kind="unreadable"] .tab-dot { color: var(--terra); }
+.gv-tabs .tab[data-kind="kept"]       .tab-dot { color: var(--kept); }
+.gv-tabs .tab[data-kind="extra"]      .tab-dot { color: #8e7fb8; }
+
+.gv-tools { display: flex; align-items: center; gap: 0.875rem; padding-top: 0.875rem; padding-bottom: 0.625rem; }
 /* The LABEL is the field; the icon and the input are flex siblings inside it. An absolutely
    positioned icon over a padded input is the obvious way to build this and it only works while
    the padding and the icon's offset agree — they stop agreeing the moment either is retuned, and

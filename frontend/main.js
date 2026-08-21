@@ -905,7 +905,7 @@ function rerenderDynamic() {
   renderHeadVer(); // labeled, so it re-renders with the language
   // the files view holds live state (a selection, an open tree) — re-word it in place rather
   // than rebuilding it, which would throw the user's ticks away
-  if (gv.data) { renderGvChrome(); renderGvFacets(); gvRebuild(); }
+  if (gv.data) { renderGvChrome(); renderGvTabs(); gvRebuild(); }
   if (state.lastCheck) applyCheck(state.lastCheck);
   else { setIdleStatus(); renderPrimary(); }
   updateTokenPlaceholder();
@@ -1939,8 +1939,9 @@ async function doGameVerify(origin) {
 // differences; over a foreign build, with four and a half thousand. A flat list is useless at the
 // second number and only barely tolerable at the first, so the spine is the FOLDER TREE: mods land
 // in identifiable subtrees, which means 312 differences under panorama/ collapse to one row that
-// can be spared with one click. Three mechanisms stack on top of it, cheapest first — facet chips
-// (a whole kind of difference in or out), a path filter, and per-folder tri-state selection.
+// can be spared with one click. Three mechanisms stack on top of it, cheapest first — PAGES (one
+// per kind of difference, so the screen only ever asks one question), a path filter, and
+// per-folder tri-state selection.
 //
 // ONE selection model: every row has a checkbox, and what checking it means is decided by who
 // owns the row — put this file back (game/Phoenix), or delete it (nothing owns it). A checked
@@ -1949,8 +1950,8 @@ async function doGameVerify(origin) {
 // for deletion, which had a much worse failure than being ugly: a user whose results were ALL
 // extras saw bulk controls that skipped every row on screen and a primary button stuck at
 // "Keep 0 as they are". The safety that control was protecting now comes from where it belongs —
-// extras are hidden until their chip is turned on, deletion is its own terracotta button, and its
-// confirm names the count and says it cannot be undone.
+// extras live on a page of their own, deletion is its own terracotta button, and its confirm
+// names the count and says it cannot be undone.
 //
 // Unchecking a `modified` row is not passive: it is the user saying "this one is mine", and it is
 // persisted as a content pin so the next verify stops asking. The footer states that count beside
@@ -1962,7 +1963,10 @@ const gv = {
   sel: new Set(),  // every checked path — see gvTally for what checking one MEANS
   mode: "verify",  // "verify" = what a scan found | "update" = which of MY files a release may overwrite
   origin: "main",  // the view Back returns to; Verify is launched from settings as often as not
-  facets: new Set(),
+  page: null,      // the KIND of difference on screen — one at a time (see ---- pages ----);
+                   // null only while there is nothing at all to show
+  seen: new Set(), // pages gvAutoOpen has already run on, so a folder the user closed by hand
+                   // stays closed when they come back to that page
   filter: "",
   warn: "",       // standing warnings (foreign build, unreachable shim, truncated scan)
   flat: [],        // the rows currently visible, in order — what the virtual window indexes into
@@ -1973,13 +1977,13 @@ const gv = {
               // so nothing durable can hold the focus but the index (see gvFocus)
 };
 
-// Which chip governs a row. `extraDir` rides with `extra`: a summarized subtree is one of them,
+// Which page a row lives on. `extraDir` rides with `extra`: a summarized subtree is one of them,
 // just counted rather than listed.
 const gvKind = (f) => (f.state === "extraDir" ? "extra" : f.state);
 // A row whose checkbox means something. Extras have nothing to be restored TO.
 const gvRestorable = (f) => f.owner !== "extra";
 
-// The chip order is the order of alarm, not of frequency: what is missing or unreadable is a
+// The page order is the order of alarm, not of frequency: what is missing or unreadable is a
 // problem, what is modified or kept is a choice, and extras are context.
 const GV_KINDS = ["missing", "unreadable", "modified", "kept", "extra"];
 const GV_STATE_KEY = {
@@ -2011,7 +2015,7 @@ function fmtAge(mtime) {
 }
 
 // ---- the tree ----
-// Built once per verify. Structure never depends on the filter or the facets: a tree that
+// Built once per verify. Structure never depends on the filter or the page: a tree that
 // reshapes itself as you type would move the row under the cursor between the click and the
 // mouseup.
 function gvBuild(files) {
@@ -2067,7 +2071,7 @@ function gvCompress(n) {
 
 // ---- visibility + aggregates, one pass ----
 // Every directory row states how many rows it holds and how many are picked, and those numbers
-// must agree with what the chips and the filter are currently showing — otherwise a folder reads
+// must agree with what the page and the filter are currently showing — otherwise a folder reads
 // "312" while displaying four. So the counts are computed over VISIBLE descendants, here, on the
 // same walk that decides visibility.
 function gvCompute(n) {
@@ -2087,7 +2091,7 @@ function gvCompute(n) {
 }
 
 function gvPass(f) {
-  if (!gv.facets.has(gvKind(f))) return false;
+  if (gvKind(f) !== gv.page) return false;
   if (gv.filter && !f.lc.includes(gv.filter)) return false;
   return true;
 }
@@ -2105,26 +2109,21 @@ function gvFlatten(n, depth, out) {
   for (const f of n.visFiles) out.push({ file: f, depth });
 }
 
-// What ticking a box actually does, in the words of THIS screen. Rebuilt with the tree because
-// it depends on the mode and on whether the extras chip is on — a tick means "put this back" on
-// one row and "delete this permanently" on the next, and a checkbox cannot say that by itself.
+// What ticking a box actually does, in the words of THIS screen. A tick means "put this back" on
+// one page and "delete this permanently" on the next, and a checkbox cannot say that by itself —
+// so the sentence is the page's, plus the mode, and there is only ever one of it. While every
+// kind shared one screen this had to state both acts at once, and the reader was left to work out
+// which half was about the row they were pointing at.
 function renderGvLegend() {
-  const parts = [];
-  if (gv.data.files.some(gvRestorable)) {
-    parts.push(t(gv.mode === "update" ? "gv.legendUpdate" : "gv.legendRestore"));
-  }
-  if (gv.facets.has("extra") && gv.data.files.some((f) => !gvRestorable(f))) {
-    parts.push(t("gv.legendExtras"));
-  }
+  const p = gv.page === "extra"
+    ? t("gv.legendExtras")
+    : gv.page ? t(gv.mode === "update" ? "gv.legendUpdate" : "gv.legendRestore") : "";
   const el = $("gv-legend");
   el.textContent = "";
   // the verbs are the load-bearing words, so they are the ones that get the colour
-  for (const [i, p] of parts.entries()) {
-    if (i) el.append(" · ");
-    for (const [j, chunk] of p.split("**").entries()) {
-      if (j % 2) el.append(Object.assign(document.createElement("b"), { textContent: chunk }));
-      else el.append(chunk);
-    }
+  for (const [j, chunk] of p.split("**").entries()) {
+    if (j % 2) el.append(Object.assign(document.createElement("b"), { textContent: chunk }));
+    else el.append(chunk);
   }
 }
 
@@ -2134,6 +2133,7 @@ function gvRebuild() {
   gvFlatten(gv.root, 0, gv.flat);
   // collapsing a folder (or typing in the filter) can shorten the list under the keyboard's row
   gv.cursor = Math.max(0, Math.min(gv.cursor, gv.flat.length - 1));
+  syncGvTabs(); // the counts up there describe these rows, and the filter just moved them
   renderGv();
   renderGvLegend();
   renderGvFooter();
@@ -2301,8 +2301,8 @@ function gvEachLeaf(n, fn) {
 function gvToggleNode(n) {
   // A folder's box acts on what it is CURRENTLY showing — the same set its own count describes.
   // Acting on hidden rows would mean a click doing more than the row it sits on claims, and it is
-  // also the safety line for extras: they are not shown until their chip is on, so no bulk
-  // gesture can select one the user has not asked to see.
+  // also the safety line for extras: they are on a page of their own, so no bulk gesture can
+  // select one the user has not opened.
   const on = n.agg.sel < n.agg.vis;
   gvEachLeaf(n, (f) => {
     if (on) gv.sel.add(f.path);
@@ -2398,37 +2398,97 @@ function renderGvFooter() {
     if (tally.del.length) parts.push(t("gv.totalDelete", { n: tally.del.length }));
   }
   // With nothing picked and nothing to keep, say what the screen is waiting for rather than
-  // leaving a bare row of Back. The wording follows what is actually on screen: where nothing is
-  // restorable, ticking a row means DELETING it, and telling that user to "tick what to restore"
-  // describes an action their results do not contain.
-  const anyRestorable = gv.data.files.some(gvRestorable);
+  // leaving a bare row of Back. The wording follows the PAGE, because that is what is on screen:
+  // on the extras page ticking a row means DELETING it, and telling that user to "tick what to
+  // restore" describes an action the rows in front of them do not have. With no rows at all it
+  // says nothing — the list's own empty line has already said why.
   $("gv-total").textContent = parts.length
     ? parts.join(" · ")
-    : anyRestorable ? t("gv.hintPick") : t("gv.hintPickExtras");
+    : !gv.flat.length ? ""
+    : gv.page === "extra" ? t("gv.hintPickExtras") : t("gv.hintPick");
 }
 
-function renderGvFacets() {
-  const box = $("gv-facets");
-  box.textContent = "";
+// ---- pages ----
+// One page per kind of difference. These were chips — five filters the user could combine — and
+// the combination was never a question anybody had: a row is missing, or modified, or nobody's,
+// and what ticking it MEANS changes with which of those it is. One kind at a time is what lets
+// the legend, the footer's hint and the bulk controls each speak in the singular, and it turns
+// the extras safety line into structure rather than a default somebody has to remember: a bulk
+// gesture cannot reach a file whose page is not open.
+//
+// Counts are of the rows a page would show RIGHT NOW, path filter included, so the open tab's
+// number can never disagree with what is under it — and typing in the filter then says which
+// page the hits are on.
+function gvPageCounts() {
   const counts = {};
-  for (const f of gv.data.files) counts[gvKind(f)] = (counts[gvKind(f)] || 0) + 1;
-  for (const k of GV_KINDS) {
-    if (!counts[k]) continue;
+  for (const f of gv.data.files) {
+    if (gv.filter && !f.lc.includes(gv.filter)) continue;
+    counts[gvKind(f)] = (counts[gvKind(f)] || 0) + 1;
+  }
+  return counts;
+}
+
+// Which kinds get a page at all: what the payload holds, UNFILTERED. A tab set that appeared and
+// vanished as the user typed would move the page they were reaching for out from under the click.
+function gvPagesPresent() {
+  const kinds = new Set(gv.data.files.map(gvKind));
+  return GV_KINDS.filter((k) => kinds.has(k));
+}
+
+// Never the extras page unless it is the only one: extras are usually the game's own droppings
+// plus the user's mods, and opening on a wall of files nobody is proposing to touch buries the
+// rows that need a decision. Worst-first otherwise — GV_KINDS is already in that order.
+function gvDefaultPage() {
+  const pages = gvPagesPresent();
+  return pages.find((k) => k !== "extra") || pages[0] || null;
+}
+
+// The tab ELEMENTS, rebuilt only when the set of kinds can have changed: a fresh payload, a
+// language switch, a deletion. Counts and the active mark move with the filter instead, and are
+// updated in place by syncGvTabs — rebuilding this row on every keystroke would drop the focus
+// of anyone driving it from the keyboard.
+function renderGvTabs() {
+  const box = $("gv-tabs");
+  box.textContent = "";
+  for (const k of gvPagesPresent()) {
     const b = document.createElement("button");
-    b.className = "facet " + (gv.facets.has(k) ? "on" : "off");
+    b.className = "tab";
     b.dataset.kind = k;
-    b.innerHTML = '<span class="facet-dot"></span>';
-    b.append(t("gv.facet." + k), Object.assign(document.createElement("span"), {
-      className: "facet-n", textContent: String(counts[k]),
-    }));
-    b.addEventListener("click", () => {
-      if (gv.facets.has(k)) gv.facets.delete(k);
-      else gv.facets.add(k);
-      renderGvFacets();
-      gvRebuild();
-    });
+    b.setAttribute("role", "tab");
+    b.innerHTML = '<span class="tab-dot"></span>';
+    b.append(t("gv.page." + k), Object.assign(document.createElement("span"), { className: "tab-n" }));
     box.append(b);
   }
+  // an empty row would still draw its hairline, under nothing
+  box.classList.toggle("hidden", !box.children.length);
+  syncGvTabs();
+}
+
+function syncGvTabs() {
+  const counts = gvPageCounts();
+  for (const b of $("gv-tabs").children) {
+    const on = b.dataset.kind === gv.page;
+    b.classList.toggle("active", on);
+    b.setAttribute("aria-selected", String(on));
+    b.querySelector(".tab-n").textContent = String(counts[b.dataset.kind] || 0);
+  }
+}
+
+// A page is a different question about the same tree, so the list starts at the top and the
+// keyboard's row goes with it. gvAutoOpen runs ONCE per page: the aggregates it reads are
+// per-page (six rows want opening whole, four thousand do not), but re-running it on every visit
+// would re-open the folders the user closed by hand.
+function gvGoPage(k) {
+  if (gv.working || !k || k === gv.page) return;
+  gv.page = k;
+  gv.cursor = 0;
+  $("gv-area").scrollTop = 0;
+  if (!gv.seen.has(k)) {
+    gv.seen.add(k);
+    gvCompute(gv.root); // gvAutoOpen reads the aggregates, and they are computed per page
+    gvAutoOpen();
+  }
+  gvRebuild();
 }
 
 // ---- open ----
@@ -2450,19 +2510,19 @@ function openFilesView(v, origin, mode) {
   //
   // NOT in `yours` mode. There, every row is the user's own file by construction, so the same
   // default would open with a proposal to revert all of it — the one thing this screen must never
-  // suggest. It opens with nothing selected and the extras chip ON, because unclaimed files are
-  // half of what it exists to show. (The safety line that keeps a bulk gesture off rows the user
-  // has not seen still holds: `gvEachLeaf` walks VISIBLE rows, and here they are visible.)
-  if (gv.mode === "yours") {
-    gv.facets = new Set(GV_KINDS);
-  } else {
+  // suggest. It opens with nothing selected. (The safety line that keeps a bulk gesture off rows
+  // the user has not seen still holds, and pages sharpen it: `gvEachLeaf` walks VISIBLE rows,
+  // and only one page's rows are ever visible.)
+  if (gv.mode !== "yours") {
     for (const f of v.files) {
       if (gvRestorable(f) && f.state !== "kept") gv.sel.add(f.path);
     }
-    // Extras are shown but OFF: they are usually the game's own droppings plus the user's mods, and
-    // opening on a wall of files nobody is proposing to touch buries the ones that need a decision.
-    gv.facets = new Set(GV_KINDS.filter((k) => k !== "extra"));
   }
+  // Which kind is on screen first — never the extras one, see gvDefaultPage. It counts as seen
+  // because the open sequence below runs gvAutoOpen on it explicitly: the aggregates that reads
+  // cannot be computed until the tree exists.
+  gv.page = gvDefaultPage();
+  gv.seen = new Set(gv.page ? [gv.page] : []);
 
   renderGvChrome();
 
@@ -2476,7 +2536,7 @@ function openFilesView(v, origin, mode) {
   gv.warn = warn.join(" ");
   gvMsg("");
 
-  renderGvFacets();
+  renderGvTabs();
   gvCompute(gv.root); // gvAutoOpen reads the aggregates
   gvAutoOpen();
   // MEASURE AFTER SHOWING. A hidden view is `display:none`, so anything inside it has no layout
@@ -2672,13 +2732,17 @@ async function gvDelete() {
     gv.data.files = gv.data.files.filter((f) => !gone.has(f.path));
     for (const p of gone) gv.sel.delete(p);
     gv.root = gvBuild(gv.data.files);
-    renderGvFacets();
+    // deleting every row of a page takes the page with it — including the one being looked at
+    if (!gvPagesPresent().includes(gv.page)) gv.page = gvDefaultPage();
+    renderGvTabs();
     // the summary describes the same list, so it has to move with it — deleting every extra
     // otherwise left "12 files of your own · 7 nothing claims" printed above rows that no longer
     // contained a single one
     renderGvChrome();
     // rebuilding the tree makes fresh nodes, so the open state has to be re-established — without
-    // this the list collapsed to its roots the moment anything was deleted
+    // this the list collapsed to its roots the moment anything was deleted. Every other page goes
+    // back to un-seen for the same reason: its open state was on the nodes just thrown away.
+    gv.seen = new Set(gv.page ? [gv.page] : []);
     gvCompute(gv.root);
     gvAutoOpen();
     gvRebuild();
@@ -2779,8 +2843,14 @@ $("gv-filter").addEventListener("input", (e) => {
   $("gv-area").scrollTop = 0;
   gvRebuild();
 });
-// Bulk controls act on what is VISIBLE — which is also the safety line for extras, since those
-// are not shown until their chip is turned on.
+$("gv-tabs").addEventListener("click", (e) => {
+  const b = e.target.closest(".tab");
+  if (b) gvGoPage(b.dataset.kind);
+});
+// Bulk controls act on what is VISIBLE — one page's rows, less whatever the filter hides. That is
+// also the safety line for extras: they have a page of their own, so no bulk gesture can reach
+// one while the user is looking at something else. The footer's tally still names the total
+// across every page, so "Select none" cannot be mistaken for having cleared the whole screen.
 $("gv-all").addEventListener("click", () => {
   gvEachLeaf(gv.root, (f) => gv.sel.add(f.path));
   gvRebuild();
