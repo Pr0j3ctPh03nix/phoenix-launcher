@@ -833,8 +833,17 @@ async function doPlay() {
       // onError says exactly that, and there is nothing to offer beyond it
       if (!SOFT_ERR.has(e && e.kind)) { onError(e); return; }
       unverified = t("detail.unverified");
-    } else if (game.value.changes > 0 || !game.value.installed) {
-      setStatus(t("status.updateRequired"), "update", t("detail.updateRequired"));
+    } else if (state.primaryMode !== "play") {
+      // The check just re-armed the primary for whatever it found — Update / Install, Manage
+      // files, or the download — and applyCheck has already worded the status for it. Whatever
+      // that button is, it is the user's next act; launching over it would start the game and
+      // leave the finding waiting behind an "In game" button until the game closes. This used to
+      // gate on `changes` alone, which is the release's count and by design excludes `Modified`,
+      // so a Phoenix file the user had changed since the last check launched the game and only
+      // THEN, on the close re-plan, turned the button into "Manage files".
+      if (state.primaryMode === "apply") {
+        setStatus(t("status.updateRequired"), "update", t("detail.updateRequired"));
+      }
       return;
     }
 
