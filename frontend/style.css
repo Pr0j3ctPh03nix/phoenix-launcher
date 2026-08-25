@@ -463,7 +463,7 @@ body {
 }
 .gv-row:hover { background-color: rgba(255, 255, 255, 0.022); }
 
-/* A FOLDER ROW IS A HEADER; A FILE ROW IS AN ITEM. They used to differ by an 8px muted chevron and
+/* A FOLDER ROW IS A HEADER; A FILE ROW IS AN ITEM. They used to differ by one muted chevron and
    nothing else — same mono face, same checkbox, near-identical greys — so a list that is half
    structure and half content read as one undifferentiated column of paths. Three signals now say
    which is which, and they are the app's own vocabulary rather than new furniture:
