@@ -8,6 +8,57 @@
 </head>
 <body>
 
+  <!-- ===================== ICON SPRITE =====================
+       Row glyphs for the files view, defined once and referenced with <use>. A sprite rather than
+       per-row markup because those rows are a RECYCLED POOL: re-parsing an <svg> into 25 rows on
+       every scroll tick is work, where flipping one `href` is not. Stroked, currentColor, 24-box —
+       same drawing conventions as the inline icons above. -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <defs>
+      <symbol id="ic-folder" viewBox="0 0 24 24">
+        <path d="M3 7.2a1.8 1.8 0 0 1 1.8-1.8h4L11 7.9h8.2A1.8 1.8 0 0 1 21 9.7v8.1a1.8 1.8 0 0 1-1.8 1.8H4.8A1.8 1.8 0 0 1 3 17.8V7.2z" />
+      </symbol>
+      <!-- open: the back of the folder plus a sheared front, so a folder that is showing its
+           contents looks like one. The chevron says the same thing; two quiet signals beat one
+           loud one on a row this small. -->
+      <symbol id="ic-folder-open" viewBox="0 0 24 24">
+        <path d="M3 17.6V7.2a1.8 1.8 0 0 1 1.8-1.8h4L11 7.9h8.2A1.8 1.8 0 0 1 21 9.7v1.4" />
+        <path d="M3.3 18.9 6 11.9h15.4l-2.7 7a1.8 1.8 0 0 1-1.7 1.1H5a1.8 1.8 0 0 1-1.7-2.1z" />
+      </symbol>
+      <!-- a folder we deliberately did NOT walk into (an `extraDir` summary row): same folder,
+           drawn broken, because the one thing it must not claim is that its contents were read -->
+      <symbol id="ic-folder-sum" viewBox="0 0 24 24">
+        <path d="M3 7.2a1.8 1.8 0 0 1 1.8-1.8h4L11 7.9h8.2A1.8 1.8 0 0 1 21 9.7v8.1a1.8 1.8 0 0 1-1.8 1.8H4.8A1.8 1.8 0 0 1 3 17.8V7.2z"
+              stroke-dasharray="2.6 2.2" />
+      </symbol>
+      <symbol id="ic-file" viewBox="0 0 24 24">
+        <path d="M13.6 3H7.4A1.9 1.9 0 0 0 5.5 4.9v14.2A1.9 1.9 0 0 0 7.4 21h9.2a1.9 1.9 0 0 0 1.9-1.9V7.6L13.6 3z" />
+        <path d="M13.4 3.2v4.5h4.8" />
+      </symbol>
+      <!-- something you can read: a page with lines in it (cfg, txt, res, vdf, json, lst, log) -->
+      <symbol id="ic-file-txt" viewBox="0 0 24 24">
+        <path d="M13.6 3H7.4A1.9 1.9 0 0 0 5.5 4.9v14.2A1.9 1.9 0 0 0 7.4 21h9.2a1.9 1.9 0 0 0 1.9-1.9V7.6L13.6 3z" />
+        <path d="M13.4 3.2v4.5h4.8" />
+        <path d="M8.6 12.9h6.8M8.6 16.1h4.4" />
+      </symbol>
+      <!-- a sealed container of many files: the VPKs, which are most of the game by weight -->
+      <symbol id="ic-file-pak" viewBox="0 0 24 24">
+        <path d="M12 3.2 20.2 7.7v8.6L12 20.8 3.8 16.3V7.7L12 3.2z" />
+        <path d="M3.9 7.8 12 12.2l8.1-4.4M12 12.2v8.5" />
+      </symbol>
+      <!-- code the machine runs, not data (dll, exe, so, asi) -->
+      <symbol id="ic-file-bin" viewBox="0 0 24 24">
+        <path d="M7.2 7.2h9.6v9.6H7.2z" />
+        <path d="M10.4 3.6v3.6M13.6 3.6v3.6M10.4 16.8v3.6M13.6 16.8v3.6M3.6 10.4h3.6M3.6 13.6h3.6M16.8 10.4h3.6M16.8 13.6h3.6" />
+      </symbol>
+      <symbol id="ic-file-img" viewBox="0 0 24 24">
+        <path d="M4.4 4.8h15.2v14.4H4.4z" />
+        <path d="M4.6 15.9 9 11.6l4 4 2.8-2.7 3.7 3.6" />
+        <circle cx="9.1" cy="9.1" r="1.3" />
+      </symbol>
+    </defs>
+  </svg>
+
   <div class="stage">
     <div class="app">
 

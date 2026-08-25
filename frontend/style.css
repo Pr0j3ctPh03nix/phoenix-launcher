@@ -431,8 +431,10 @@ body {
 
 /* the rule the checkbox column obeys, sitting on the hairline that opens the list — a legend for
    the thing directly beneath it, not a paragraph somewhere else */
+/* Inset to match a ROW's content, not the column — this explains the checkbox directly beneath it,
+   so it has to start where that column starts (see .gv-row's padding). */
 .gv-legend {
-  padding-bottom: 0.5rem; padding-right: var(--gutter);
+  padding-bottom: 0.5rem; padding-left: var(--gutter); padding-right: var(--gutter);
   font-size: 0.71875rem; line-height: 1.45; color: var(--text-mute);
 }
 .gv-legend:empty { display: none; }
@@ -440,9 +442,13 @@ body {
 
 /* The scroller. `.gv-list` is a spacer whose HEIGHT is the full row count — that is what gives the
    scrollbar an honest size while only a screenful of rows exists in the DOM. */
+/* No padding of its own: the inset lives on the ROW instead (see below), so a row spans the exact
+   width of the hairline above it. While the gutter was here, a row stopped 14px short of that
+   hairline on the right and touched it on the left — invisible while a row was just text, glaring
+   the moment folder rows became bands, which is a lopsided band on every one of them. */
 .gv-area {
   flex: 1; min-height: 0; overflow-y: auto; position: relative;
-  border-top: 1px solid var(--line); padding-right: var(--gutter);
+  border-top: 1px solid var(--line);
 }
 .gv-list { position: relative; }
 .gv-empty {
@@ -455,14 +461,40 @@ body {
   display: flex; align-items: center; gap: 0.5rem;
   border-bottom: 1px solid var(--line-soft);
 }
-.gv-row:hover { background: rgba(255, 255, 255, 0.022); }
+.gv-row:hover { background-color: rgba(255, 255, 255, 0.022); }
+
+/* A FOLDER ROW IS A HEADER; A FILE ROW IS AN ITEM. They used to differ by an 8px muted chevron and
+   nothing else — same mono face, same checkbox, near-identical greys — so a list that is half
+   structure and half content read as one undifferentiated column of paths. Three signals now say
+   which is which, and they are the app's own vocabulary rather than new furniture:
+     - GROUND: a folder sits on a faint band, a file on the page. The band is what makes a subtree
+       legible as a block at a glance, which is the whole reason the tree is the spine here.
+     - FACE: folders are Inter, files are Mono. That is this app's existing split — Inter is UI,
+       Mono is paths and data — and a folder name IS structure while a file name IS the datum
+       being ruled on.
+     - GLYPH: a folder, open or closed, against the file's own kind (see GV_ICON_FAMILY).
+   Specificity note: this must sit AFTER .gv-row:hover, which it ties with, and therefore has to
+   restate the hover itself — otherwise folder rows silently lose their hover feedback. */
+.gv-row.dir {
+  background-color: rgba(255, 255, 255, 0.032);
+  border-bottom-color: var(--line);
+}
+.gv-row.dir:hover { background-color: rgba(255, 255, 255, 0.055); }
+.gv-row.dir .gv-name {
+  font-family: "Inter", sans-serif; font-weight: 600; font-size: 0.78125rem;
+  letter-spacing: 0.00625rem;
+}
 /* the keyboard's row. `inset` rather than an outer ring: rows are absolutely positioned inside a
    scroller, which clips an outline drawn outside the box */
 .gv-row:focus-visible {
   outline: 2px solid rgba(201, 168, 106, 0.55); outline-offset: -2px; border-radius: var(--r-sm);
 }
-/* indent is the tree — one step per depth, applied as padding so the hover band still spans */
-.gv-row { padding-left: calc(var(--d) * 0.9375rem); }
+/* Indent is the tree — one step per depth, applied as padding so the band still spans the row.
+   The `--gutter` term is the row's own INTERIOR inset, relocated here from .gv-area: it is what
+   keeps the chevron off the left edge and the tally off the right, on both sides equally, while
+   the band itself runs the full width. The right-hand edge it produces is the one #gv-total and
+   .gv-legend align to, so all three move together if this is retuned. */
+.gv-row { padding-left: calc(var(--gutter) + var(--d) * 0.9375rem); padding-right: var(--gutter); }
 
 /* the disclosure triangle: a rotating chevron, present only on directories */
 .gv-twist {
@@ -496,6 +528,21 @@ body {
 }
 /* an extra has nothing to restore — the slot stays, empty, so every name still starts on one axis */
 .gv-box.none { border: none; cursor: default; }
+
+/* The row glyph. Deliberately quiet and deliberately COLOURLESS: on this screen colour is state
+   (gold = attention, sage = yours, violet = unclaimed), and an icon tinted by anything else would
+   be entering that conversation with a fact — the extension — that says nothing about condition.
+   So it is shape only, and the folder's is a step brighter than the file's because the band it
+   sits on is the thing being scanned. */
+.gv-ic {
+  flex: none; width: 0.9375rem; height: 0.9375rem; margin-right: -0.0625rem;
+  fill: none; stroke: var(--mark-mute); stroke-width: 1.5;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.gv-row.dir .gv-ic { stroke: var(--text-dim); }
+/* the one row whose glyph carries the state: it is about to be deleted, and the strike-through on
+   the name would otherwise be arguing with a neutral icon beside it */
+.gv-row.doomed .gv-ic { stroke: var(--terra); }
 
 .gv-name {
   flex: 1; min-width: 0; font-family: "Mono", monospace; font-size: 0.75rem; color: #b7b1a6;

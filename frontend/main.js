@@ -2101,9 +2101,28 @@ function gvPass(f) {
 function gvFlatten(n, depth, out) {
   for (const k of n.order) {
     if (k.agg.vis === 0) continue;
-    out.push({ node: k, depth });
+    // Corridor rows, folded HERE rather than in the tree. `gvCompress` already merges chains of
+    // single-child directories, but it runs over the whole payload while the rows on screen are
+    // one PAGE of it — so a folder with three children, two of them on other pages, is a corridor
+    // on this one and compression never saw it. That is why `game/dota/cfg/autoexec.cfg` spent
+    // three folder rows on one file. Visibility is the only thing that changes underneath, so the
+    // fold is done on the flatten, where visibility already lives.
+    //
+    // The row that survives is the DEEPEST node in the chain, which makes its `open` the one the
+    // row toggles and its subtree the one the checkbox acts on — the same set either end of the
+    // chain described, since by construction there is exactly one visible child at every step.
+    let node = k, label = k.name;
+    for (;;) {
+      if (node.visFiles.length) break;
+      let only = null, count = 0;
+      for (const c of node.order) if (c.agg.vis > 0 && ++count === 1) only = c;
+      if (count !== 1) break;
+      node = only;
+      label += "/" + node.name;
+    }
+    out.push({ node, label, depth });
     // A filter is a search, and a search that makes you open folders to see its hits is not one.
-    if (k.open || gv.filter) gvFlatten(k, depth + 1, out);
+    if (node.open || gv.filter) gvFlatten(node, depth + 1, out);
   }
   // visFiles is a filter of the pre-sorted files, and filter preserves order
   for (const f of n.visFiles) out.push({ file: f, depth });
@@ -2187,10 +2206,33 @@ function gvRowEl() {
   el.innerHTML =
     '<span class="gv-twist"><svg viewBox="0 0 12 12"><polyline points="4,2 8,6 4,10"/></svg></span>' +
     '<span class="gv-box"></span>' +
+    // <use href> flipped per row, never re-parsed: see the sprite in index.html
+    '<svg class="gv-ic" aria-hidden="true"><use href="#ic-file"/></svg>' +
     '<span class="gv-name"></span>' +
     '<span class="gv-badge hidden"></span>' +
     '<span class="gv-meta"></span>';
   return el;
+}
+
+// Which glyph a row wears. A folder says "this is a place"; a file says what KIND of thing it is,
+// which in a game folder is the difference between a 5 MB packed asset and a 512 B text config —
+// the two the user acts on least alike. FAMILIES, not extensions: the table stays short on purpose
+// and anything unrecognised falls back to a plain page rather than growing it. It is shape only,
+// never colour: colour on this screen means state, and an icon that borrowed it would be making a
+// claim about the file's condition that its extension cannot support.
+const GV_ICON_FAMILY = {
+  vpk: "pak", pak: "pak", bin: "pak", zip: "pak", gcf: "pak", phxb: "pak",
+  cfg: "txt", txt: "txt", res: "txt", vdf: "txt", json: "txt", lst: "txt", ini: "txt",
+  log: "txt", inf: "txt", md: "txt", xml: "txt", kv3: "txt", vcfg: "txt",
+  dll: "bin", exe: "bin", so: "bin", asi: "bin", sys: "bin", dylib: "bin",
+  png: "img", jpg: "img", jpeg: "img", tga: "img", dds: "img", bmp: "img", ico: "img",
+  svg: "img", vtex: "img", vtex_c: "img",
+};
+function gvIconRef(path) {
+  const base = path.slice(path.lastIndexOf("/") + 1);
+  const dot = base.lastIndexOf(".");
+  const fam = dot > 0 ? GV_ICON_FAMILY[base.slice(dot + 1).toLowerCase()] : null;
+  return fam ? "#ic-file-" + fam : "#ic-file";
 }
 
 function gvFill(el, item, idx) {
@@ -2198,34 +2240,38 @@ function gvFill(el, item, idx) {
   // roving: one tab stop for the list, on whichever row the keyboard is currently on
   el.tabIndex = idx === gv.cursor ? 0 : -1;
   el.style.setProperty("--d", item.depth);
-  const twist = el.children[0], box = el.children[1], name = el.children[2];
-  const badge = el.children[3], meta = el.children[4];
+  const twist = el.children[0], box = el.children[1], ic = el.children[2];
+  const name = el.children[3], badge = el.children[4], meta = el.children[5];
+  const use = ic.firstElementChild;
 
   if (item.node) {
     const n = item.node, a = n.agg;
+    const open = !!n.open || !!gv.filter;
     el.classList.add("dir");
-    el.classList.toggle("open", !!n.open || !!gv.filter);
+    el.classList.toggle("open", open);
     el.classList.remove("doomed");
     twist.classList.remove("leaf");
     twist.classList.remove("hidden");
-    // a compressed chain greys everything but the folder this row actually is
-    const cut = n.name.lastIndexOf("/");
+    use.setAttribute("href", open ? "#ic-folder-open" : "#ic-folder");
+    // a merged chain greys everything but the folder this row actually is
+    const label = item.label || n.name;
+    const cut = label.lastIndexOf("/");
     name.textContent = "";
     if (cut >= 0) {
       const lead = document.createElement("span");
       lead.className = "gv-lead";
-      lead.textContent = n.name.slice(0, cut + 1);
-      name.append(lead, n.name.slice(cut + 1));
+      lead.textContent = label.slice(0, cut + 1);
+      name.append(lead, label.slice(cut + 1));
     } else {
-      name.textContent = n.name;
+      name.textContent = label;
     }
     box.className = "gv-box";
     box.dataset.s = a.sel === 0 ? "off" : a.sel === a.vis ? "on" : "part";
     // what the row IS, for anything not reading pixels: a checkbox whose third state is real
     el.setAttribute("role", "checkbox");
     el.setAttribute("aria-checked", a.sel === 0 ? "false" : a.sel === a.vis ? "true" : "mixed");
-    el.setAttribute("aria-expanded", String(!!n.open || !!gv.filter));
-    el.setAttribute("aria-label", n.name);
+    el.setAttribute("aria-expanded", String(open));
+    el.setAttribute("aria-label", label);
     badge.classList.add("hidden");
     meta.className = "gv-count";
     meta.textContent = t("gv.dirCount", { n: a.vis, sel: a.sel });
@@ -2239,6 +2285,9 @@ function gvFill(el, item, idx) {
   // a checked extra is about to be DELETED — the row says so itself
   el.classList.toggle("doomed", picked && !restorable);
   twist.classList.add("leaf");
+  // an `extraDir` row IS a directory — one we deliberately did not walk into. It must not wear a
+  // file's glyph (it is not one) nor a folder's (that would claim its contents were read).
+  use.setAttribute("href", f.state === "extraDir" ? "#ic-folder-sum" : gvIconRef(f.path));
   name.textContent = f.path.slice(f.path.lastIndexOf("/") + 1);
   box.className = "gv-box" + (restorable ? "" : " del");
   box.dataset.s = picked ? "on" : "off";
@@ -2605,9 +2654,15 @@ function gvAutoOpen() {
     all(gv.root);
     return;
   }
+  // VISIBLE children, the same test gvFlatten folds corridors on — so the node this leaves open is
+  // the node whose row is actually drawn. Counting structural children instead would open a folder
+  // that this page merges away, and the one row it does draw would come up closed.
   let n = gv.root;
-  while (n.kids.size === 1 && n.visFiles.length === 0) {
-    const [only] = n.kids.values();
+  for (;;) {
+    if (n.visFiles.length) break;
+    let only = null, count = 0;
+    for (const c of n.order) if (c.agg.vis > 0 && ++count === 1) only = c;
+    if (count !== 1) break;
     only.open = true;
     n = only;
   }

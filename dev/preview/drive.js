@@ -103,6 +103,14 @@ window.addEventListener("load", () => {
         // `doomed`: extras ticked, so the terracotta strike + the delete button can be seen
         if (mode === "doomed") for (const f of GV.files) if (f.owner === "extra") gv.sel.add(f.path);
         gvRebuild();
+      } else if (mode === "modified") {
+        // the DENSE page: 240 rows in one folder, which is where the folder/file distinction has
+        // to survive a wall of near-identical paths
+        gvGoPage("modified");
+        for (const n of gv.root.kids.values()) n.open = true;
+        const dota = [...gv.root.kids.values()][0];
+        if (dota) for (const k of dota.kids.values()) k.open = true;
+        gvRebuild();
       } else if (mode === "kept") {
         // only the pins: the review route for "what have I told the launcher to leave alone"
         gvGoPage("kept");
@@ -185,6 +193,27 @@ window.addEventListener("load", () => {
         t("gd.confirm", { gb: "7.9", disk: "14.8", n: 4635, dir: "D:\\Games\\Dota 2 6.88" });
       document.getElementById("gd-modal").classList.remove("hidden");
       gdStage("confirm");
+    }
+
+    // ?measure=1 — dump the horizontal geometry of the screen into the DOM, so
+    // `chrome --headless=new --dump-dom` answers "where does this edge actually sit" instead of
+    // a PNG being squinted at. Every number is a viewport x, so they compare directly.
+    if (new URLSearchParams(location.search).has("measure")) {
+      const box = document.createElement("pre");
+      box.id = "measure";
+      const rect = (sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return sel + ": absent";
+        const r = el.getBoundingClientRect();
+        return sel + ": L=" + r.left.toFixed(1) + " R=" + r.right.toFixed(1) + " W=" + r.width.toFixed(1);
+      };
+      box.textContent = [
+        "root-font-size: " + getComputedStyle(document.documentElement).fontSize,
+        rect(".app"), rect("#gv-summary"), rect(".gv-legend"), rect("#gv-area"),
+        rect("#gv-list"), rect(".gv-row"), rect(".gv-row .gv-twist"),
+        rect(".gv-row .gv-count"), rect("#gv-total"),
+      ].join("\n");
+      document.body.append(box);
     }
   }, 900);
 });
