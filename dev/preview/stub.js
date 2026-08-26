@@ -18,6 +18,12 @@ const CHECK = {
     { dest: "game\\bin\\win64\\winmm.dll", status: "update" },
     { dest: "game\\dota\\pak01_dir.vpk", status: "ok" },
     { dest: "game\\dota\\cfg\\autoexec.cfg", status: "install" },
+    // a manifest-tree heading: collapses like an option's set but stays a plain category —
+    // core glyph, no checkbox semantics (treeGroup is what renderFiles keys that on)
+    { dest: "game\\dota_addons_phoenix\\hero_demo\\scripts\\vscripts\\events.lua", status: "install",
+      groupId: "tree:/1", treeGroup: true, group: { en: "Hero Demo Plus", ru: "Hero Demo Plus" } },
+    { dest: "game\\dota_addons_phoenix\\polygon\\scripts\\vscripts\\lasthit.lua", status: "install",
+      groupId: "tree:/1", treeGroup: true, group: { en: "Hero Demo Plus", ru: "Hero Demo Plus" } },
     // an option-owned set: renders as ONE "New graphics" row, not three paths
     { dest: "game\\dota_phoenix\\textures_a.vpk", status: "update", groupId: "gfx", group: { en: "New graphics", ru: "Новая графика" } },
     { dest: "game\\dota_phoenix\\textures_b.vpk", status: "update", groupId: "gfx", group: { en: "New graphics", ru: "Новая графика" } },

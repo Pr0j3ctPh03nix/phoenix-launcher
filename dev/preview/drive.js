@@ -126,8 +126,9 @@ window.addEventListener("load", () => {
         gvRebuild();
       }
     } else if (h === "main:open") {
-      // categories expanded: the member paths and their individual states, under the summary row
-      for (const id of ["__core", "gfx"]) state.filesOpen.add(id);
+      // categories expanded: the member paths and their individual states, under the summary row —
+      // including a manifest-tree heading ("Hero Demo Plus"), which must read as a plain category
+      for (const id of ["__core", "gfx", "tree:/1"]) state.filesOpen.add(id);
       renderFiles(state.filesShown);
     } else if (h === "yours") {
       // the cheap "what is mine" view — pins plus what nothing claims, no verification behind it

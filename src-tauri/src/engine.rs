@@ -133,6 +133,8 @@ pub struct CheckResult {
     pub notes: Option<String>,
     /// The manifest's user-selectable options, for the customization UI.
     pub options: Vec<OptionEntry>,
+    /// The manifest's display tree over files[] — presentational grouping for the files view.
+    pub tree: Vec<crate::manifest::TreeNode>,
     /// Effective selection per option id (the user's valid choice, else the manifest default).
     pub selections: BTreeMap<String, serde_json::Value>,
 }
@@ -639,6 +641,7 @@ pub fn evaluate(settings: &Settings, tag_name: &str, manifest: &Manifest) -> Res
         files,
         notes: manifest.notes.clone(),
         options: manifest.options.clone(),
+        tree: manifest.tree.clone(),
         selections: effective_selections(manifest, &settings.selections),
     })
 }

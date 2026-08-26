@@ -410,13 +410,16 @@ function renderFiles(v) {
     return li;
   };
 
-  // bucket first, in manifest order — both the categories and the files inside them
+  // bucket first, in manifest order — both the categories and the files inside them. A groupId
+  // names an OPTION unless the row says treeGroup: then it is a heading from the manifest's
+  // display tree ("Hero Demo Plus") — same collapsible row, no option semantics, core glyph.
+  // Files the tree does not claim keep falling into the generic core bucket.
   const cats = new Map();
   for (const f of v.files) {
     const id = f.groupId || (f.yours ? FILES_YOURS : FILES_CORE);
     let c = cats.get(id);
     if (!c) {
-      c = { id, option: !!f.groupId, group: f.group, variant: f.variant, files: [] };
+      c = { id, option: !!f.groupId && !f.treeGroup, group: f.group, variant: f.variant, files: [] };
       cats.set(id, c);
     }
     c.files.push(f);
@@ -430,12 +433,13 @@ function renderFiles(v) {
     name.innerHTML =
       '<svg class="fchev" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2 8.5 6l-4 4"/></svg>' +
       '<svg class="fgroup-ic" viewBox="0 0 12 12" aria-hidden="true">' +
-      (c.option ? FILES_CAT_IC.option : FILES_CAT_IC[c.id]) +
+      // a tree heading is still the shim's own always-installed content — the core glyph
+      (c.option ? FILES_CAT_IC.option : FILES_CAT_IC[c.id] || FILES_CAT_IC[FILES_CORE]) +
       "</svg>";
     const label = document.createElement("span");
     label.className = "fgroup-name";
-    label.textContent = c.option
-      ? mlabel(c.group) || c.id
+    label.textContent = c.group
+      ? mlabel(c.group) || c.id // an option's label, or a tree heading's — both localized
       : t(c.id === FILES_YOURS ? "files.catYours" : "files.catCore");
     name.append(label);
     // a choice's row names the SELECTED variant, not the shared dest ("Lighting · Mod")

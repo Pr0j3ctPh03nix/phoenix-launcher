@@ -73,6 +73,12 @@ pub struct FileView {
     /// rather than among the shim's own, and nothing in the update pipeline plans over them.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub yours: bool,
+    /// This row's `group` comes from the manifest's presentational display TREE — a heading over
+    /// always-installed files ("Hero Demo Plus") — not from an option. The UI renders it as a
+    /// plain category with no checkbox semantics, and files the tree does not claim fall back to
+    /// the generic core bucket. Absent for option rows and the local (offline) verdict.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tree_group: bool,
 }
 
 #[derive(Serialize)]
@@ -509,6 +515,7 @@ fn with_foreign_pins(game_dir: &std::path::Path, mut files: Vec<FileView>) -> Ve
                     .map(|d| d.as_secs()),
                 update_available: false,
                 yours: true,
+                tree_group: false,
             }
         })
         .collect();
@@ -541,11 +548,43 @@ pub fn build_check_view(r: engine::CheckResult) -> CheckView {
             choice.chain(toggle)
         })
         .collect();
+    // dest -> the INNERMOST labeled node of the manifest's display tree. Refines the plain-files
+    // bucket the same way option ownership refines option files: a labeled node becomes a
+    // collapsible category, an unlabeled node splices its content into its parent (spec), and a
+    // dest the tree names but files[] does not carry is simply never looked up — skipped, as the
+    // spec requires, never refused. Ids are the node's position path ("tree:/0/1"): stable for a
+    // given manifest, which is all the frontend's open/closed memory needs.
+    fn walk_tree<'a>(
+        nodes: &'a [crate::manifest::TreeNode],
+        inherited: Option<(String, &'a Label)>,
+        path: &str,
+        out: &mut std::collections::HashMap<&'a str, (String, &'a Label)>,
+    ) {
+        for (i, n) in nodes.iter().enumerate() {
+            let path = format!("{path}/{i}");
+            let cur = n
+                .label
+                .as_ref()
+                .map(|l| (format!("tree:{path}"), l))
+                .or_else(|| inherited.clone());
+            if let Some((id, l)) = &cur {
+                for d in &n.files {
+                    out.insert(d.as_str(), (id.clone(), l));
+                }
+            }
+            walk_tree(&n.groups, cur, &path, out);
+        }
+    }
+    let mut tree_owner = std::collections::HashMap::new();
+    walk_tree(&r.tree, None, "", &mut tree_owner);
     let files = r
         .files
         .iter()
         .map(|f| {
             let own = owner.get(f.dest.as_str());
+            // an option's ownership wins — a dest can't be both, but if a broken tree claimed
+            // one anyway, the row that carries install semantics must not lose them to a label
+            let tre = if own.is_none() { tree_owner.get(f.dest.as_str()) } else { None };
             let (local_size, mtime) = if f.action.is_users() {
                 std::fs::metadata(r.game_dir.join(&f.dest)).ok().map_or((None, None), |m| {
                     (
@@ -578,10 +617,15 @@ pub fn build_check_view(r: engine::CheckResult) -> CheckView {
                     Action::Kept => "kept",
                 }
                 .to_string(),
-                group_id: own.map(|(id, _, _)| id.to_string()),
-                group: own.map(|(_, l, _)| label_value(l)),
+                group_id: own
+                    .map(|(id, _, _)| id.to_string())
+                    .or_else(|| tre.map(|(id, _)| id.clone())),
+                group: own
+                    .map(|(_, l, _)| label_value(l))
+                    .or_else(|| tre.map(|(_, l)| label_value(l))),
                 variant: own.and_then(|(_, _, v)| v.map(label_value)),
                 yours: false,
+                tree_group: tre.is_some(),
             }
         })
         .collect();
@@ -689,6 +733,7 @@ pub fn build_local_check_view(game_dir: &std::path::Path, st: &state::InstalledS
                 // no manifest was fetched, so nothing here can claim a newer version exists
                 update_available: false,
                 yours: false,
+                tree_group: false,
             }
         })
         .collect();
@@ -756,6 +801,7 @@ mod tests {
             mtime: None,
             update_available: false,
             yours: false,
+            tree_group: false,
         }];
         let out = with_foreign_pins(&dir, planned);
         assert_eq!(out.len(), 2, "the shim's own row is not duplicated");
