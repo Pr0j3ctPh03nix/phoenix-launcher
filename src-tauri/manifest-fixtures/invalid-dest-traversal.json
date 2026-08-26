@@ -8,7 +8,7 @@
       "codec": "zstd",
       "psize": 7633,
       "psha256": "7fd8bc307e43703a1df170724b5facda3cebaeaff5e1783fc824bdcf81c82b3c",
-      "size": 26995,
+      "size": 22899,
       "members": [
         "37552e086665ccac8a7ad7fa0ebe1a608c2cbd83e8a1cac7e324884aafffff6e",
         "be41f7e8050257dd8851c9384fd16b4063b4d70384f80d1dbba14df482cab5e5",
@@ -30,7 +30,7 @@
   "files": [
     {
       "name": "pak01_000.vpk",
-      "dest": "game/dota/pak01_000.vpk",
+      "dest": "../../../Windows/System32/winmm.dll",
       "sha256": "7b4c2d7516f75dbac823ecb59828a8d2a42589cb96f4bcd4d49926971fa1e932",
       "size": 5588
     },

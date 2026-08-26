@@ -61,6 +61,34 @@
       "dest": "game/dota/scripts/regions.txt"
     }
   ],
+  "tree": [
+    {
+      "label": {
+        "en": "Phoenix Core",
+        "ru": "Ядро Phoenix"
+      },
+      "files": [
+        "game/dota/pak01_000.vpk",
+        "game/dota/empty.marker"
+      ],
+      "groups": [
+        {
+          "label": {
+            "en": "Hero Demo Plus"
+          },
+          "files": [
+            "game/dota/scripts/npc/npc_units.txt",
+            "game/dota/scripts/npc/hero_ids.txt"
+          ]
+        }
+      ]
+    },
+    {
+      "files": [
+        "game/dota/bin/win64/client.dll"
+      ]
+    }
+  ],
   "options": [
     {
       "id": "lighting",

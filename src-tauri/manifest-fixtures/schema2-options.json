@@ -10,6 +10,12 @@
       "size": 1560
     },
     {
+      "name": "events.lua",
+      "dest": "game/dota_addons_phoenix/hero_demo/scripts/vscripts/events.lua",
+      "sha256": "c7fb02f7fa6631c45d23ccf4b3c4b10dd012db736e9956129d9ebaa9aa18e756",
+      "size": 7219
+    },
+    {
       "name": "regions.txt",
       "dest": "game/dota_phoenix/scripts/regions.txt",
       "sha256": "9b73a25d93b7fbaf9895e03bfe89ad98fac432055911dd4a568b10262697731f",
@@ -19,6 +25,28 @@
   "remove": [
     {
       "dest": "game/dota/scripts/regions.txt"
+    }
+  ],
+  "tree": [
+    {
+      "label": {
+        "en": "Phoenix Core",
+        "ru": "Ядро Phoenix"
+      },
+      "files": [
+        "game/bin/win64/winmm.dll",
+        "game/dota_phoenix/scripts/regions.txt"
+      ],
+      "groups": [
+        {
+          "label": {
+            "en": "Hero Demo Plus"
+          },
+          "files": [
+            "game/dota_addons_phoenix/hero_demo/scripts/vscripts/events.lua"
+          ]
+        }
+      ]
     }
   ],
   "options": [

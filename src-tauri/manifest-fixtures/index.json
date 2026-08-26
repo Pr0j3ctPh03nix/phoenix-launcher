@@ -5,7 +5,7 @@
   "expectations": {
     "accept": "The reader parses the manifest and proceeds normally.",
     "refuse:schema": "Rejected specifically because the schema is unsupported, with a message telling the user to update. NOT a parse error.",
-    "refuse:invalid": "The schema is supported but the document violates a producer guarantee (B1-B8 in docs/manifest-format-v3.md) and cannot be acted on. A broken release — NOT an 'update the app' message, and not a schema refusal.",
+    "refuse:invalid": "The schema is supported but the document cannot be safely acted on — an unsafe `dest` (escapes the game root), or a violated bundle guarantee (the B1-B8 invariants in tools/validate_manifest.py). A broken release — NOT an 'update the app' message, and not a schema refusal.",
     "refuse:codec": "The schema is supported but a bundle names a codec the reader cannot decode. Same user-facing outcome as refuse:schema (tell the user to update); different detection point."
   },
   "cases": [
@@ -38,6 +38,11 @@
       "file": "future-unknown-option-kind.json",
       "expect": "refuse:schema",
       "why": "THE ORDERING TEST. Carries an option kind that does not exist, so a reader that parses the document before checking `schema` dies on the unknown kind and reports a parse failure. Correct behaviour is the SAME clean schema refusal as future-schema.json: read `schema` first, decide, only then parse."
+    },
+    {
+      "file": "tree-dangling-ref.json",
+      "expect": "accept",
+      "why": "A `tree` node referencing a dest that files[] does not carry. The tree is PRESENTATIONAL, so this must not be fatal — skip the reference and install exactly as declared. A reader that refuses here turns a display slip into a client that cannot update at all."
     },
     {
       "file": "additive-unknown-keys.json",
@@ -73,6 +78,11 @@
       "file": "unknown-codec.json",
       "expect": "refuse:codec",
       "why": "A codec this build cannot decode, under a schema it CAN read. Adding a codec is supposed to bump `schema`, so this is a producer that broke that rule — but the user-facing answer is still 'update the app', never 'your download is corrupt'. Must be caught at parse time (R9), not deferred to when the bundle is needed."
+    },
+    {
+      "file": "invalid-dest-traversal.json",
+      "expect": "refuse:invalid",
+      "why": "A `dest` with `..` components that escapes the game root. dest is the one field that turns a compromised manifest into an arbitrary file write, so a reader must REFUSE it rather than trust the producer — a supported schema, but not safely installable."
     }
   ]
 }

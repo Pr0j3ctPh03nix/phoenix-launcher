@@ -8,7 +8,7 @@
       "codec": "zstd",
       "psize": 7633,
       "psha256": "7fd8bc307e43703a1df170724b5facda3cebaeaff5e1783fc824bdcf81c82b3c",
-      "size": 26995,
+      "size": 22899,
       "members": [
         "37552e086665ccac8a7ad7fa0ebe1a608c2cbd83e8a1cac7e324884aafffff6e",
         "be41f7e8050257dd8851c9384fd16b4063b4d70384f80d1dbba14df482cab5e5",
@@ -85,6 +85,14 @@
     {
       "files": [
         "game/dota/bin/win64/client.dll"
+      ]
+    },
+    {
+      "label": {
+        "en": "Ghost"
+      },
+      "files": [
+        "game/dota/not-shipped.bin"
       ]
     }
   ],

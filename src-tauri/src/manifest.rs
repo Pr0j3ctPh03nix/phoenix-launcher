@@ -110,6 +110,15 @@ pub struct Manifest {
     /// a schema-3 document with no bundles is exactly a schema-2 document (R1).
     #[serde(default)]
     pub bundles: Vec<Bundle>,
+    /// The producer's display hierarchy over `files[]` — how the launcher groups the
+    /// always-installed content on screen ("Phoenix Core", "Hero Demo Plus", …). PRESENTATIONAL
+    /// by contract: ignoring it wholesale is conforming (a flat list is plainer, not wrong, which
+    /// is why it carries no schema number), and a ref to a dest `files[]` does not carry must be
+    /// SKIPPED at render — never refused. That is why `validate` deliberately does not look at it:
+    /// refusing a release over presentation would turn a display slip into a client that cannot
+    /// update.
+    #[serde(default)]
+    pub tree: Vec<TreeNode>,
     /// Paths the files view must not report as FOREIGN even though the manifest does not ship
     /// them — the game's own runtime droppings (configs it rewrites, logs, replays, crash dumps).
     /// Nothing here is ever written, deleted or verified; the list only decides what is worth
@@ -524,6 +533,19 @@ pub struct Bundle {
     pub members: Vec<String>,
 }
 
+/// One node of the display `tree`: dest refs into `files[]` plus child groups, to any depth.
+/// A node WITHOUT a `label` just splices its content into its parent — the producer emits one for
+/// files declared outside any named group.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TreeNode {
+    #[serde(default)]
+    pub label: Option<Label>,
+    #[serde(default)]
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<TreeNode>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct RemoveEntry {
     /// Path (relative to the game root) to delete from a client carrying an earlier release.
@@ -716,6 +738,15 @@ mod tests {
         assert_eq!(toggle.kind, OptionKind::Toggle);
         assert_eq!(toggle.files[0].name, None);
         assert!(multi.members.contains(&toggle.files[0].sha256));
+
+        // the display tree: a labeled node with a nested group, and an UNLABELED node whose
+        // content splices into its parent — both shapes the renderer has to know
+        assert_eq!(m.tree.len(), 2);
+        let core = &m.tree[0];
+        assert!(matches!(&core.label, Some(Label::Localized(l)) if l["en"] == "Phoenix Core"));
+        assert!(core.files.contains(&"game/dota/pak01_000.vpk".to_string()));
+        assert_eq!(core.groups.len(), 1, "Hero Demo Plus nests under Phoenix Core here");
+        assert!(m.tree[1].label.is_none(), "an unlabeled node is legal and splices inline");
     }
 
     /// Exactly what the shim producer emits today — and will keep emitting: the shim never cuts
@@ -727,12 +758,19 @@ mod tests {
             Manifest::parse(&std::fs::read(fixtures().join("schema2-options.json")).unwrap()).unwrap();
         assert_eq!(m.schema, 2);
         assert!(m.bundles.is_empty(), "absent bundles mean none (R1)");
-        assert_eq!(m.files.len(), 2);
+        assert_eq!(m.files.len(), 3);
         assert_eq!(m.files[0].name.as_deref(), Some("winmm.dll"));
         assert_eq!(m.files[0].dest, "game/bin/win64/winmm.dll");
         assert_eq!(m.files[0].size, 1560);
+        assert_eq!(
+            m.files[1].dest,
+            "game/dota_addons_phoenix/hero_demo/scripts/vscripts/events.lua",
+            "an always-installed file that the tree files under a heading"
+        );
         assert_eq!(m.remove.len(), 1);
         assert_eq!(m.remove[0].dest, "game/dota/scripts/regions.txt");
+        assert_eq!(m.tree.len(), 1);
+        assert!(m.tree[0].groups[0].files.contains(&m.files[1].dest));
 
         assert_eq!(m.options.len(), 2);
         let choice = &m.options[0];
