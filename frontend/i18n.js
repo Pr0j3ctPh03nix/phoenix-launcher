@@ -283,8 +283,7 @@ const I18N = {
     "set.launchHint": "Always passed. Add your own after.",
     "set.launchPh": "additional options",
     "set.flags": "Tweaks",
-    // one per launch::LAUNCH_FLAGS id — key is "set.flag." + id
-    "set.flag.noCloudKeybinds": "Keep keybinds local (no Steam Cloud sync)",
+    // one per launch::LAUNCH_FLAGS id — key is "set.flag." + id (table currently empty)
     "set.renderer": "Renderer",
     "set.autoexec": "Config",
     "set.autoexecBtn": "Edit autoexec.cfg",
@@ -314,6 +313,7 @@ const I18N = {
     "opt.hint": "Changes apply on the next install or update.",
     "ae.unsaved": "unsaved changes",
     "ae.lossy": "This file is not UTF-8 — shown read-only so saving can't corrupt it.",
+    "ae.pinned": "The servers run at 60 tickrate, so the launcher has to fix {names} at 60 itself.\nThe struck-through lines are removed on every launch.",
     "wn.loading": "Loading earlier versions…",
     "wn.none": "No release notes yet.",
     // The two histories: the mod's own releases, and the launcher's. "Mod", not "Phoenix" — the
@@ -592,7 +592,6 @@ const I18N = {
     "set.launchHint": "Передаются всегда. Свои — после них.",
     "set.launchPh": "дополнительные параметры",
     "set.flags": "Твики",
-    "set.flag.noCloudKeybinds": "Хранить раскладку локально (без Steam Cloud)",
     "set.renderer": "Рендер",
     "set.autoexec": "Конфиг",
     "set.autoexecBtn": "Править autoexec.cfg",
@@ -622,6 +621,7 @@ const I18N = {
     "opt.hint": "Изменения применятся при следующей установке или обновлении.",
     "ae.unsaved": "есть несохранённые изменения",
     "ae.lossy": "Файл не в UTF-8 — открыт только для чтения, чтобы сохранение его не испортило.",
+    "ae.pinned": "Серверы работают на тикрейте 60, поэтому лаунчер сам фиксирует {names} на 60.\nЗачёркнутые строки удаляются при каждом запуске.",
     "wn.loading": "Загружаю предыдущие версии…",
     "wn.none": "Примечания к выпускам отсутствуют.",
     "wn.tabMod": "Mod",

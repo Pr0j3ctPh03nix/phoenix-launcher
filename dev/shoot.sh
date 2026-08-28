@@ -42,7 +42,7 @@ sed -i 's|<script src="i18n.js"></script>|<script src="stub.js"></script>\n  <sc
 sed -i 's|<script src="main.js"></script>|<script src="main.js"></script>\n  <script src="drive.js"></script>|' "$APP/index.html"
 
 SIZE="${SIZE:-825,740}"   # matches tauri.conf.json's window; SIZE=616,594 is its minimum
-SCREENS="${*:-main main:open yours setup settings:general settings:launch settings:files options confirm confirm:keep confirm:restore confirm:restore2 dest dest:flat dest:warn dest:bad gd verify manage update whatsnew whatsnew:launcher files files:modified files:kept files:doomed files:onlyextras}"
+SCREENS="${*:-main main:open yours setup settings:general settings:launch settings:files autoexec options confirm confirm:keep confirm:restore confirm:restore2 dest dest:flat dest:warn dest:bad gd verify manage update whatsnew whatsnew:launcher files files:modified files:kept files:doomed files:onlyextras}"
 # UILANG=ru renders the Russian tables (the long labels). Not LANG — that is bash's own locale.
 QUERY=""; SUFFIX=""
 [ -n "$UILANG" ] && QUERY="?lang=$UILANG" && SUFFIX="-$UILANG"

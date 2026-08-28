@@ -1065,7 +1065,11 @@ input::placeholder { color: #4d4941; }
 .hl-cmd { color: var(--gold-soft); }
 .hl-str { color: var(--verd); }
 .hl-com { color: var(--text-mute); font-style: italic; }
+/* a line launch will strip (it sets a pinned convar): struck through in terracotta OVER the
+   syntax colours, which stay — the decoration propagates through the inner spans */
+.hl-pin { text-decoration: line-through; text-decoration-color: var(--terra); background: rgba(212, 119, 103, 0.1); }
 #ae-msg { margin-top: 0.875rem; }
+#ae-pin-note { margin-top: 0.875rem; white-space: pre-line; } /* its two statements, one per line */
 .dirty { display: inline-flex; align-items: center; gap: 0.4375rem; font-size: 0.6875rem; font-weight: 600; color: var(--gold-soft); }
 .dirty.hidden { display: none; }
 .dirty-dot { width: 0.3125rem; height: 0.3125rem; border-radius: 50%; background: var(--gold-soft); }

@@ -240,7 +240,8 @@
           <div class="fields hidden" data-panel="launch" role="tabpanel">
             <label class="field">
               <span class="label" data-i18n="set.launch"></span>
-              <div class="launch-base"><code>-insecure -console +exec autoexec.cfg</code><span class="hint" data-i18n="set.launchHint"></span></div>
+              <!-- mirrors launch::BASE_OPTIONS — keep in step when that table changes -->
+              <div class="launch-base"><code>-insecure -console +exec autoexec.cfg +dota_keybindings_cloud_disable 1 +cl_updaterate 60 +cl_cmdrate 60</code><span class="hint" data-i18n="set.launchHint"></span></div>
               <input id="in-launch" type="text" spellcheck="false" data-i18n-ph="set.launchPh" />
             </label>
 
@@ -423,6 +424,10 @@
           <pre id="ae-hl" class="editor-hl" aria-hidden="true"></pre>
           <textarea id="ae-text" class="editor" spellcheck="false" wrap="off"></textarea>
         </div>
+
+        <!-- why some lines are struck through: they set a launcher-pinned convar and launch
+             strips them. Text set by JS (refreshAeHl) — it carries the pinned names. -->
+        <div class="notice" id="ae-pin-note" hidden></div>
 
         <div class="msg" id="ae-msg" hidden></div>
 

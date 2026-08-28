@@ -46,24 +46,26 @@ pub async fn game_running() -> Result<bool, CmdError> {
 fn autoexec_path() -> Result<PathBuf, CmdError> {
     let s = Settings::load();
     let gd = s.resolve_game_dir().map_err(CmdError::from)?;
-    Ok(gd.join("game").join("dota").join("cfg").join("autoexec.cfg"))
+    Ok(launch::autoexec_cfg(&gd))
 }
 
 #[tauri::command]
 pub fn read_autoexec() -> Result<AutoexecView, CmdError> {
     let p = autoexec_path()?;
+    let pinned = launch::PINNED_CONVARS.to_vec();
     match std::fs::read(&p) {
         Ok(bytes) => match String::from_utf8(bytes) {
-            Ok(content) => Ok(AutoexecView { content, lossy: false }),
+            Ok(content) => Ok(AutoexecView { content, lossy: false, pinned }),
             // not UTF-8 (e.g. cp1251 comments): still show it, but flagged — the UI blocks
             // saving so a lossy round-trip can never overwrite the user's real bytes
             Err(e) => Ok(AutoexecView {
                 content: String::from_utf8_lossy(e.as_bytes()).into_owned(),
                 lossy: true,
+                pinned,
             }),
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(AutoexecView { content: String::new(), lossy: false })
+            Ok(AutoexecView { content: String::new(), lossy: false, pinned })
         }
         Err(e) => Err(CmdError::from(format!("reading {}: {e}", p.display()))),
     }

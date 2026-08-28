@@ -363,6 +363,9 @@ pub struct AutoexecView {
     /// lossy decode. The UI must show it read-only: saving the lossy text back would corrupt
     /// the original bytes.
     pub lossy: bool,
+    /// `launch::PINNED_CONVARS` — the editor flags lines that set these, because launch strips
+    /// them from the file. Shipped with the view so the list has one source of truth.
+    pub pinned: Vec<&'static str>,
 }
 
 #[derive(Serialize)]

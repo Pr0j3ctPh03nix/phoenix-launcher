@@ -39,6 +39,10 @@ window.addEventListener("load", () => {
     if (h.startsWith("settings")) {
       await openSettings();
       setSettingsTab(h.split(":")[1] || "general"); // settings:general | :launch | :files
+    } else if (h === "autoexec") {
+      // the editor over the stub's cfg, which includes pinned-convar lines — the strikethrough
+      // and the notice under the editor are the point of this screen
+      await openAutoexec();
     } else if (h === "setup") {
       showView("setup");
     } else if (h === "options") {

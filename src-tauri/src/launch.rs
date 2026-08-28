@@ -5,12 +5,33 @@
 
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::fslock;
 
-/// Always passed, before everything else.
-pub const BASE_OPTIONS: [&str; 4] = ["-insecure", "-console", "+exec", "autoexec.cfg"];
+/// Always passed, before everything else. The `+convar` values are policy, not preference:
+/// keybinds stay local (a Steam Cloud sync can overwrite real bindings on launch), and the
+/// network rates are fixed at 60 because the Phoenix servers run at 60 ticks. The rates are
+/// additionally PINNED (see `PINNED_CONVARS`): autoexec.cfg wins over command-line `+` options,
+/// so launch strips their setters from the cfg and the editor flags them. The keybinds convar is
+/// deliberately NOT pinned — an autoexec line is the one remaining way to opt back into cloud
+/// sync now that its tweak switch is gone.
+pub const BASE_OPTIONS: [&str; 10] = [
+    "-insecure",
+    "-console",
+    "+exec",
+    "autoexec.cfg",
+    "+dota_keybindings_cloud_disable",
+    "1",
+    "+cl_updaterate",
+    "60",
+    "+cl_cmdrate",
+    "60",
+];
+
+/// The BASE_OPTIONS convars whose value must actually HOLD: `strip_pinned` removes their setters
+/// from autoexec.cfg before every launch, and the editor flags such lines as it highlights.
+pub const PINNED_CONVARS: &[&str] = &["cl_updaterate", "cl_cmdrate"];
 
 /// An optional launch option that settings expose as a switch.
 pub struct LaunchFlag {
@@ -25,13 +46,9 @@ pub struct LaunchFlag {
 /// The single source of truth for the optional flags. A new row here becomes a new settings
 /// checkbox (the view, the save command and the spawn all read this table) — the frontend only
 /// needs the matching `set.flag.<id>` string, and falls back to showing the raw args without it.
-pub const LAUNCH_FLAGS: &[LaunchFlag] = &[LaunchFlag {
-    // Dota syncs keybindings through Steam Cloud and can overwrite local ones on launch; this
-    // convar keeps whatever is on disk.
-    id: "noCloudKeybinds",
-    args: &["+dota_keybindings_cloud_disable", "1"],
-    default: false,
-}];
+/// Currently empty (the former tweaks are baked into BASE_OPTIONS); the machinery stays for the
+/// next genuinely optional flag.
+pub const LAUNCH_FLAGS: &[LaunchFlag] = &[];
 
 /// Is `id` on? An id settings never stored falls back to the flag's own default; an id that is
 /// not in the table is off — only the table decides what can reach the command line, so a stale
@@ -39,6 +56,81 @@ pub const LAUNCH_FLAGS: &[LaunchFlag] = &[LaunchFlag {
 pub fn flag_enabled(flags: &BTreeMap<String, bool>, id: &str) -> bool {
     let Some(f) = LAUNCH_FLAGS.iter().find(|f| f.id == id) else { return false };
     flags.get(id).copied().unwrap_or(f.default)
+}
+
+/// The user's autoexec.cfg for a game folder — one implementation, shared with the editor's
+/// read/save commands.
+pub fn autoexec_cfg(game_dir: &Path) -> PathBuf {
+    game_dir.join("game").join("dota").join("cfg").join("autoexec.cfg")
+}
+
+/// Split a cfg line into code and its `//` comment, quote-aware (a `//` inside a quoted value,
+/// e.g. a URL, stays value) — the same rule the editor's highlighter applies.
+fn split_comment(line: &str) -> (&str, &str) {
+    let b = line.as_bytes();
+    let mut quoted = false;
+    for i in 0..b.len().saturating_sub(1) {
+        match b[i] {
+            b'"' => quoted = !quoted,
+            b'/' if !quoted && b[i + 1] == b'/' => return (&line[..i], &line[i..]),
+            _ => {}
+        }
+    }
+    (line, "")
+}
+
+/// The command a single `;`-separated statement issues: its first token, quote-trimmed and
+/// lowercased (the console is case-insensitive). First token only — a convar named in an
+/// argument position (a `bind`, an `echo`) is mentioned, not set.
+fn stmt_command(stmt: &str) -> Option<String> {
+    let tok = stmt.split_whitespace().next()?.trim_matches('"');
+    (!tok.is_empty()).then(|| tok.to_ascii_lowercase())
+}
+
+/// The autoexec body without the statements that set a `PINNED_CONVARS` convar — `None` when
+/// there is nothing to strip. Everything else survives verbatim, line endings included (`\r`
+/// rides as trailing whitespace): a line reduced to nothing disappears, one reduced to its
+/// comment keeps the comment.
+pub fn strip_pinned(content: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out: Vec<String> = Vec::new();
+    for line in content.split('\n') {
+        let (code, comment) = split_comment(line);
+        let mut removed = false;
+        let kept: Vec<&str> = code
+            .split(';')
+            .filter(|s| {
+                let hit = stmt_command(s).is_some_and(|c| PINNED_CONVARS.contains(&c.as_str()));
+                removed |= hit;
+                !hit
+            })
+            .collect();
+        if !removed {
+            out.push(line.to_string());
+            continue;
+        }
+        changed = true;
+        let code = kept.join(";");
+        if !code.trim().is_empty() || !comment.is_empty() {
+            out.push(format!("{code}{comment}"));
+        } // else: the line only set pinned convars — gone entirely
+    }
+    changed.then(|| out.join("\n"))
+}
+
+/// Make the pinned rates actually hold: rewrite autoexec.cfg without their setters, atomically
+/// (temp + rename — this is the USER'S file). Deliberately quiet about failure: a missing cfg has
+/// nothing to strip, a non-UTF-8 one must not be rewritten from a lossy decode (the editor's rule),
+/// and a write error only means the pin doesn't hold this run — never a reason not to launch.
+fn enforce_pins(game_dir: &Path) {
+    let p = autoexec_cfg(game_dir);
+    let Ok(bytes) = std::fs::read(&p) else { return };
+    let Ok(content) = String::from_utf8(bytes) else { return };
+    let Some(stripped) = strip_pinned(&content) else { return };
+    let tmp = p.with_extension("cfg.tmp");
+    if std::fs::write(&tmp, stripped).is_ok() {
+        let _ = std::fs::rename(&tmp, &p);
+    }
 }
 
 /// Is the game currently running? Detected by write-probing the executable: a running process
@@ -104,6 +196,7 @@ pub fn launch(
     if !exe.exists() {
         bail!("dota2.exe not found at {}", exe.display());
     }
+    enforce_pins(game_dir);
     let mut cmd = std::process::Command::new(&exe);
     cmd.current_dir(&win64).args(args_for(renderer, extra, flags));
     cmd.spawn()
@@ -116,42 +209,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn optional_flags_are_table_driven_and_ordered() {
+    fn args_are_base_then_renderer_then_extras() {
         let none = BTreeMap::new();
         let base = args_for("dx11", "", &none);
-        assert_eq!(base, ["-insecure", "-console", "+exec", "autoexec.cfg", "-dx11"]);
-
-        // unset -> the flag's own default (all currently ship off)
-        for f in LAUNCH_FLAGS {
-            assert_eq!(flag_enabled(&none, f.id), f.default);
-        }
-        // an id that isn't in the table can never contribute args
-        let mut junk = BTreeMap::new();
-        junk.insert("notAFlag".to_string(), true);
-        assert!(!flag_enabled(&junk, "notAFlag"));
-        assert_eq!(args_for("dx11", "", &junk), base);
-
-        // on -> args land after the renderer and before the user's extras
-        let mut on = BTreeMap::new();
-        on.insert("noCloudKeybinds".to_string(), true);
         assert_eq!(
-            args_for("dx9", "-novid \"a b\"", &on),
+            base,
             [
                 "-insecure",
                 "-console",
                 "+exec",
                 "autoexec.cfg",
-                "-dx9",
                 "+dota_keybindings_cloud_disable",
                 "1",
-                "-novid",
-                "a b",
+                "+cl_updaterate",
+                "60",
+                "+cl_cmdrate",
+                "60",
+                "-dx11",
             ]
         );
 
-        // explicitly off -> nothing added
-        on.insert("noCloudKeybinds".to_string(), false);
-        assert_eq!(args_for("dx11", "", &on), base);
+        // a flag id the (currently empty) table doesn't know can never contribute args
+        let mut junk = BTreeMap::new();
+        junk.insert("notAFlag".to_string(), true);
+        assert!(!flag_enabled(&junk, "notAFlag"));
+        assert_eq!(args_for("dx11", "", &junk), base);
+
+        // extras come last, quoted values intact
+        let extras = args_for("dx9", "-novid \"a b\"", &none);
+        assert_eq!(&extras[..4], ["-insecure", "-console", "+exec", "autoexec.cfg"]);
+        assert_eq!(&extras[extras.len() - 3..], ["-dx9", "-novid", "a b"]);
+    }
+
+    #[test]
+    fn strip_pinned_removes_only_setters() {
+        // nothing to strip: mentions in comments and argument positions are not setters
+        assert!(strip_pinned(
+            "echo hi\n// cl_updaterate 30\nbind q \"say cl_cmdrate\"\nvolume 1\n"
+        )
+        .is_none());
+        assert!(strip_pinned("").is_none());
+
+        // setters go (case-insensitive, quoted, mid-line); everything else survives verbatim
+        let s = strip_pinned(
+            "volume 1\r\n\
+             CL_UPDATERATE \"128\"\n\
+             cl_cmdrate 128; echo hi // keep\n\
+             \"cl_updaterate\" 1 // why\n\
+             \n\
+             last\n",
+        )
+        .unwrap();
+        assert_eq!(s, "volume 1\r\n echo hi // keep\n// why\n\nlast\n");
     }
 
     #[test]

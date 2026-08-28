@@ -23,6 +23,8 @@ const state = {
   afBusy: false,       // a scan invoke is in flight (double-start guard)
   aeDirty: false,
   aeReadOnly: false,   // autoexec shown read-only (non-UTF-8 file or failed read)
+  aePinned: [],        // launch::PINNED_CONVARS via read_autoexec — lines setting these are
+                       // stripped at launch, so the editor strikes them through as it highlights
   gameRunning: false,  // polled — the game is currently running
   busyOwner: null,     // token of the flow holding the busy lock (see acquireBusy)
   gameDamaged: 0,      // files a verify reported damaged and the user declined to repair
@@ -3191,8 +3193,21 @@ function setAeDirty(d) {
   $("ae-dirty").classList.toggle("hidden", !d);
 }
 
-// Source cfg highlight: `<command> <valueвЂ¦>` per line, `//` comments, "quoted" values.
+// Does this code (comment already split off) set a pinned convar? Mirrors launch::strip_pinned:
+// the first token of any `;`-separated statement, quote-trimmed, case-insensitive — an argument
+// position (a bind, an echo) is a mention, not a setter, and is left alone.
+function aeSetsPinned(code) {
+  return code.split(";").some((s) => {
+    const tok = s.trim().split(/\s+/)[0]?.replace(/^"+|"+$/g, "").toLowerCase();
+    return !!tok && state.aePinned.includes(tok);
+  });
+}
+
+// Source cfg highlight: `<command> <value…>` per line, `//` comments, "quoted" values. Also
+// counts and strikes through the lines launch will strip (see aeSetsPinned) — flagging rides
+// this pass because both need the same quote-aware comment split.
 function hlAutoexec(text) {
+  let pins = 0;
   const lines = text.split(/\r?\n/).map((line) => {
     // a comment starts at the first // OUTSIDE quotes (a // inside a quoted value, e.g. a
     // URL, stays value)
@@ -3211,17 +3226,27 @@ function hlAutoexec(text) {
     m[3].replace(/("[^"]*"?)|([^"]+)/g, (_, str, plain) => {
       html += str ? `<span class="hl-str">${escHtml(str)}</span>` : escHtml(plain);
     });
+    if (aeSetsPinned(code)) {
+      pins++;
+      return `<span class="hl-pin">${html + com}</span>`;
+    }
     return html + com;
   });
-  return lines.join("\n") + "\n"; // trailing newline keeps pre/textarea heights in step
+  // trailing newline keeps pre/textarea heights in step
+  return { html: lines.join("\n") + "\n", pins };
 }
 
 function refreshAeHl() {
   const ta = $("ae-text");
   const hl = $("ae-hl");
-  hl.innerHTML = hlAutoexec(ta.value);
+  const { html, pins } = hlAutoexec(ta.value);
+  hl.innerHTML = html;
   hl.scrollTop = ta.scrollTop;
   hl.scrollLeft = ta.scrollLeft;
+  // the why behind the strikethrough — present exactly while a struck line is
+  const note = $("ae-pin-note");
+  note.hidden = pins === 0;
+  if (pins) note.textContent = t("ae.pinned", { names: state.aePinned.join(", ") });
 }
 
 async function openAutoexec() {
@@ -3229,9 +3254,11 @@ async function openAutoexec() {
   // be saved back — that would corrupt or blank the user's real cfg
   let msg = null;
   let readOnly = false;
+  state.aePinned = [];
   try {
     const r = await invoke("read_autoexec");
     $("ae-text").value = r.content;
+    state.aePinned = r.pinned || [];
     if (r.lossy) { readOnly = true; msg = t("ae.lossy"); }
   } catch (e) {
     $("ae-text").value = "";

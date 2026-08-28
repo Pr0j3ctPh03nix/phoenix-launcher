@@ -65,7 +65,7 @@ const HANDLERS = {
     launchExtra: "-novid",
     renderer: "dx11",
     animations: true,
-    launchFlags: [{ id: "noCloudKeybinds", args: "+dota_keybindings_cloud_disable 1", enabled: true }],
+    launchFlags: [],
   }),
   launcher_info: () => ({ version: "1.2.1", justUpdated: false }),
   game_dir_status: () => ({ configured: true, clientVersion: "1805" }),
@@ -114,7 +114,11 @@ const HANDLERS = {
     { tag: "v1.2.0", version: "1.2.0", notes: "#### Added\n- Self-update" },
     ];
   },
-  read_autoexec: () => ({ content: '// comment\ndota_camera_distance "1200"\n', lossy: false }),
+  read_autoexec: () => ({
+    content: '// comment\ndota_camera_distance "1200"\ncl_updaterate 128\ncl_cmdrate 128; echo hi\n',
+    lossy: false,
+    pinned: ["cl_updaterate", "cl_cmdrate"],
+  }),
   set_language: () => null,
   save_settings: () => null,
   set_selection: () => null,
