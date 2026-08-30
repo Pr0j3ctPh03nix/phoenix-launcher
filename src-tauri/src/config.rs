@@ -354,18 +354,26 @@ impl Settings {
         seen.max(payload.baked_min_serial())
     }
 
-    /// Move the ratchet forward. Returns whether anything changed, so a caller can skip a disk
-    /// write on the ordinary case (the same release checked again, which is most checks).
+    /// Is this serial past what we have recorded for `payload`? The read half of the ratchet, so a
+    /// caller holding a settings snapshot can decide whether a WRITE is needed at all —
+    /// `Settings::update` always saves, and the common case is the same release checked again.
+    ///
+    /// Deliberately NOT `serial_floor`: that folds in the baked backstop, and a build whose baked
+    /// floor already exceeds the persisted one would then never record anything.
+    pub fn serial_is_newer(&self, payload: crate::trust::Payload, serial: u64) -> bool {
+        serial > self.max_serial_seen.get(payload.id()).copied().unwrap_or(0)
+    }
+
+    /// Move the ratchet forward. Returns whether anything changed.
     ///
     /// Never moves it BACK: the floor is a high-water mark, and a lower serial arriving here at
     /// all would mean the gate that rejects one had already been passed.
     pub fn advance_serial(&mut self, payload: crate::trust::Payload, serial: u64) -> bool {
-        let slot = self.max_serial_seen.entry(payload.id().to_string()).or_insert(0);
-        if serial > *slot {
-            *slot = serial;
-            return true;
+        if !self.serial_is_newer(payload, serial) {
+            return false;
         }
-        false
+        self.max_serial_seen.insert(payload.id().to_string(), serial);
+        true
     }
 
     pub fn save(&self) -> Result<()> {
@@ -463,8 +471,10 @@ mod tests {
         let mut s = Settings::default();
         assert_eq!(s.serial_floor(Payload::Mod), baked, "no history: the baked backstop alone");
 
+        assert!(s.serial_is_newer(Payload::Mod, 5));
         assert!(s.advance_serial(Payload::Mod, 5));
         assert_eq!(s.serial_floor(Payload::Mod), 5.max(baked));
+        assert!(!s.serial_is_newer(Payload::Mod, 5), "so no settings write is needed for it");
         assert!(!s.advance_serial(Payload::Mod, 5), "the same release again is not news");
         assert!(!s.advance_serial(Payload::Mod, 4), "and it never walks back");
         assert_eq!(s.max_serial_seen["mod"], 5);

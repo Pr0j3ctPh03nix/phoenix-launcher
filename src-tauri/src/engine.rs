@@ -259,26 +259,32 @@ pub fn manifest_of(
     let manifest = Manifest::parse(&bytes)?;
     let serial = trust::accept(payload, &manifest, settings.serial_floor(payload))
         .map_err(anyhow::Error::new)?;
-    ratchet(payload, serial);
+    ratchet(settings, payload, serial);
     Ok(manifest)
 }
 
 /// Remember that this payload has been seen at `serial`, so nothing older is ever accepted again.
+///
+/// Only when it MOVES. `Settings::update` always saves, and most fetches are the same release
+/// being checked again — writing settings.json every time would also bump its mtime, which is the
+/// key `Settings::load_cached` memoizes on, so the three-second game-running poll would go back to
+/// re-reading and re-parsing the file. `settings` is a snapshot and may be stale, but it only
+/// decides whether to bother: `update` re-loads, and the ratchet is monotonic either way.
 ///
 /// Best-effort: a failed write costs the ratchet one step, never the update. Skipped entirely in
 /// test builds — `Settings::update` writes the REAL user config (there is one config path per
 /// machine, not per test), and a suite that quietly edits the developer's settings.json is a worse
 /// bug than an untested line. What it persists is `Settings::advance_serial`, which is tested
 /// directly, and what it protects is `trust::accept`, which is tested against explicit floors.
-fn ratchet(payload: Payload, serial: u64) {
+fn ratchet(settings: &Settings, payload: Payload, serial: u64) {
     #[cfg(not(test))]
-    {
+    if settings.serial_is_newer(payload, serial) {
         let _ = Settings::update(|s| {
             s.advance_serial(payload, serial);
         });
     }
     #[cfg(test)]
-    let _ = (payload, serial);
+    let _ = (settings, payload, serial);
 }
 
 /// Merge every release of the game repo's assets into the manifest release.
