@@ -2,7 +2,7 @@
 //! user's option selections, and diff it against what is installed. `check` is the read-only
 //! surface over this; `install` (in install.rs) reuses `fetch`, `resolve` and `plan`.
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -11,6 +11,7 @@ use crate::config::Settings;
 use crate::downloader::{Downloader, Release};
 use crate::manifest::{FileEntry, Manifest, OptionEntry, OptionKind, UnsupportedSchema};
 use crate::state::InstalledState;
+use crate::trust::{self, Payload};
 use crate::verify;
 
 // ---- long-operation progress (the shell bridges these to UI events) ----
@@ -189,6 +190,9 @@ pub(crate) fn version_lt(a: &str, b: &str) -> bool {
     false
 }
 
+/// The release asset every payload describes itself with.
+pub const MANIFEST_ASSET: &str = "manifest.json";
+
 /// Fetch the release and its manifest.json. Returned together so an install can reuse the release's
 /// asset list (for private downloads) without a second round trip. Fails with `UnsupportedSchema`
 /// when the manifest declares a format this build cannot read — a stale launcher must refuse a
@@ -197,21 +201,84 @@ pub fn fetch(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Res
     let release = dl
         .fetch_release(&settings.source_repo, tag)
         .context("fetching the release")?;
-    let manifest = manifest_of(dl, &release)?;
+    let manifest = manifest_of(settings, dl, &release, Payload::Mod)?;
     Ok((release, manifest))
 }
 
-/// The manifest.json of an already-fetched release — for callers that resolved the release
-/// themselves (the base-game commands probe repo credentials first and hold a `Release` by the
-/// time they need the manifest). Same schema gate as `fetch`.
-pub fn manifest_of(dl: &dyn Downloader, release: &Release) -> Result<Manifest> {
+/// The manifest.json of an already-fetched release, VERIFIED — for callers that resolved the
+/// release themselves (the base-game commands probe repo credentials first and hold a `Release` by
+/// the time they need the manifest, and self-update reads the launcher payload).
+///
+/// This is the trust boundary of the whole updater. Below it every sha256 the launcher acts on is
+/// hearsay; above it they are what a pinned key said. Four gates, and the ORDER is load-bearing:
+///
+/// 1. **bounded read** — the document is buffered to be verified, so its size is a trust input
+///    (`trust::MAX_DOC_BYTES`); an unbounded read hands a hostile host the process's memory before
+///    a single check has run;
+/// 2. **signature, BEFORE parsing** — the parser is the largest attack surface here, and running
+///    it over unauthenticated bytes is the thing signing exists to stop;
+/// 3. **format** — `Manifest::parse` then owns compatibility, exactly as before (a manifest from
+///    the future fails as "update the launcher", never as a syntax error);
+/// 4. **identity and freshness** — `trust::accept`: a valid signature says we produced this
+///    document, not that it is the document that was asked for, nor that it is current.
+///
+/// Every refusal here reaches the user as "no release available" (`views::wire_kind` maps the
+/// typed errors to `notFound`), and that is deliberate: an unverifiable release is one we do not
+/// have. It must never turn into an error that stops somebody playing a game already installed
+/// and clean — the failure mode of a signing scheme should be "no update today", not "no game".
+pub fn manifest_of(
+    settings: &Settings,
+    dl: &dyn Downloader,
+    release: &Release,
+    payload: Payload,
+) -> Result<Manifest> {
+    let sig_name = format!("{MANIFEST_ASSET}{}", trust::SIG_SUFFIX);
     let manifest_asset = release
-        .asset("manifest.json")
-        .context("the release has no manifest.json asset")?;
-    let bytes = dl.download(manifest_asset).context("downloading manifest.json")?;
-    // Manifest::parse owns the compatibility gate: it reads `schema` before deserializing, so a
-    // manifest from the future fails as "update the launcher", never as a syntax error
-    Manifest::parse(&bytes)
+        .asset(MANIFEST_ASSET)
+        .with_context(|| format!("the release has no {MANIFEST_ASSET} asset"))?;
+    let sig_asset = release
+        .asset(&sig_name)
+        .ok_or_else(|| anyhow!(trust::TrustError::Unsigned(MANIFEST_ASSET.to_string())))?;
+
+    let bytes = dl
+        .download_limited(manifest_asset, trust::MAX_DOC_BYTES)
+        .with_context(|| format!("downloading {MANIFEST_ASSET}"))?;
+    let sig = dl
+        .download_limited(sig_asset, trust::MAX_SIG_BYTES)
+        .with_context(|| format!("downloading {sig_name}"))?;
+    let sig = String::from_utf8(sig)
+        .map_err(|_| anyhow!(trust::TrustError::Malformed("not UTF-8")))?;
+    // WHICH key signed is deliberately not acted on: a release signed by the cold spare installs
+    // exactly like one signed by the active key (the spare exists for the day the other is gone,
+    // and a client that treated it as suspicious would defeat its only purpose). The id is
+    // returned so a future "signed by the recovery key" notice has something to read.
+    let _key = trust::verify(&bytes, &sig)
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("verifying {MANIFEST_ASSET}"))?;
+
+    let manifest = Manifest::parse(&bytes)?;
+    let serial = trust::accept(payload, &manifest, settings.serial_floor(payload))
+        .map_err(anyhow::Error::new)?;
+    ratchet(payload, serial);
+    Ok(manifest)
+}
+
+/// Remember that this payload has been seen at `serial`, so nothing older is ever accepted again.
+///
+/// Best-effort: a failed write costs the ratchet one step, never the update. Skipped entirely in
+/// test builds — `Settings::update` writes the REAL user config (there is one config path per
+/// machine, not per test), and a suite that quietly edits the developer's settings.json is a worse
+/// bug than an untested line. What it persists is `Settings::advance_serial`, which is tested
+/// directly, and what it protects is `trust::accept`, which is tested against explicit floors.
+fn ratchet(payload: Payload, serial: u64) {
+    #[cfg(not(test))]
+    {
+        let _ = Settings::update(|s| {
+            s.advance_serial(payload, serial);
+        });
+    }
+    #[cfg(test)]
+    let _ = (payload, serial);
 }
 
 /// Merge every release of the game repo's assets into the manifest release.
@@ -346,8 +413,13 @@ pub fn fetch_notes_history(
                     return;
                 }
                 let (i, rel) = (jobs[j], &releases[jobs[j]]);
-                let Some(asset) = rel.asset("manifest.json") else { continue };
-                let Ok(bytes) = dl.download(asset) else { continue };
+                // Deliberately NOT verified, unlike `manifest_of`. This is the archive page: it
+                // reads two display strings and yields no hash anything is ever installed from,
+                // while a rebuild walks EVERY release — signature-checking it would double that
+                // round trip count to authenticate prose. The notes that matter, the ones on the
+                // release being offered, ride the verified manifest through `evaluate`.
+                let Some(asset) = rel.asset(MANIFEST_ASSET) else { continue };
+                let Ok(bytes) = dl.download_limited(asset, trust::MAX_DOC_BYTES) else { continue };
                 // A garbage manifest is skipped (not fatal — one bad release must not sink the
                 // whole history). A FUTURE-schema one is different: the full parse is off the
                 // table, but `version`/`notes` are additive-stable strings, and its notes are
@@ -696,6 +768,109 @@ mod tests {
         assert!(fetch(&settings, &ok, None).is_ok());
         let legacy = Fake::new("v1.0.0", r#"{ "version": "1.0.0", "files": [] }"#, vec![]);
         assert!(fetch(&settings, &legacy, None).is_ok());
+    }
+
+    /// The gate itself: a release whose manifest is not signed by a key we pin is not a release
+    /// we have. Every variant is checked at the boundary the shell sees, because that is where the
+    /// consequence lives — `views::wire_kind` turns each of these into `notFound`, which is in the
+    /// frontend's soft set and therefore never blocks Play on an install that is already clean.
+    #[test]
+    fn an_unverifiable_manifest_is_refused_as_notfound() {
+        use crate::trust::TrustError;
+        let settings = Settings::default();
+        let doc = r#"{"schema":2,"version":"1.0.0","files":[]}"#;
+        let refusal = |dl: &dyn Downloader| -> String {
+            let release = dl.fetch_release("r", None).unwrap();
+            let e = manifest_of(&settings, dl, &release, Payload::Mod).unwrap_err();
+            assert!(
+                e.chain().any(|c| c.downcast_ref::<TrustError>().is_some()),
+                "must carry a typed trust failure so the shell can classify it: {e:#}"
+            );
+            assert_eq!(crate::views::CmdError::from(e).kind, "notFound");
+            String::new()
+        };
+
+        // no signature at all
+        refusal(&Fake::new("v1.0.0", doc, vec![]).unsigned());
+        // a signature over a DIFFERENT document (the manifest was edited after signing)
+        let mut edited = Fake::new("v1.0.0", doc, vec![]);
+        let tampered = String::from_utf8(edited.assets["manifest.json"].clone())
+            .unwrap()
+            .replace("1.0.0", "9.9.9");
+        edited.assets.insert("manifest.json".into(), tampered.into_bytes());
+        refusal(&edited);
+        // a signature file that is not a signature file
+        let mut junk = Fake::new("v1.0.0", doc, vec![]);
+        junk.assets.insert("manifest.json.minisig".into(), b"nonsense".to_vec());
+        refusal(&junk);
+    }
+
+    /// A document signed by our own key, for a different payload, is not this payload. Without
+    /// this the game repo could be answered with a perfectly valid shim manifest.
+    #[test]
+    fn a_manifest_for_another_payload_is_refused() {
+        let settings = Settings::default();
+        let dl = Fake::new("v1.0.0", r#"{"schema":2,"version":"1.0.0","files":[]}"#, vec![]);
+        let release = dl.fetch_release("r", None).unwrap();
+        assert!(manifest_of(&settings, &dl, &release, Payload::Mod).is_ok());
+        let e = manifest_of(&settings, &dl, &release, Payload::Game).unwrap_err();
+        assert!(format!("{e:#}").contains("\"game\" was asked for"), "got: {e:#}");
+    }
+
+    /// The rollback ratchet, from both directions. A mirror keeps a valid signature over every
+    /// release it ever served, so "correctly signed" is not the same as "current".
+    #[test]
+    fn a_serial_below_the_floor_is_refused() {
+        let doc = r#"{"schema":2,"version":"1.0.0","files":[]}"#;
+        // relative to the BAKED floor, which a release build can set and which the effective
+        // floor is the max of — an absolute serial here would only be testing an unbaked build
+        let base = Payload::Mod.baked_min_serial();
+        let dl = Fake::new("v1.0.0", doc, vec![]).serial(base + 5);
+        let release = dl.fetch_release("r", None).unwrap();
+        let at = |seen: u64| {
+            let mut s = Settings::default();
+            s.max_serial_seen.insert("mod".into(), seen);
+            manifest_of(&s, &dl, &release, Payload::Mod)
+        };
+        assert!(at(base + 4).is_ok(), "newer than what we have seen");
+        assert!(at(base + 5).is_ok(), "the same release, checked again — the common case");
+        let e = at(base + 6).unwrap_err();
+        assert!(format!("{e:#}").contains(&format!("older than {}", base + 6)), "got: {e:#}");
+
+        // and a manifest with no serial cannot be shown to be current at all
+        let dl = Fake::new("v1.0.0", doc, vec![]).without("serial");
+        let e = manifest_of(&Settings::default(), &dl, &dl.fetch_release("r", None).unwrap(), Payload::Mod)
+            .unwrap_err();
+        assert!(format!("{e:#}").contains("no serial"), "got: {e:#}");
+    }
+
+    /// The baked floor is the backstop under the persisted one, and `serial_floor` is where they
+    /// meet. Nothing may compare a serial against half of it — the settings file is plaintext in
+    /// the user's own profile, and the baked value is the half that cannot be edited.
+    #[test]
+    fn the_effective_floor_is_the_higher_of_the_two() {
+        let mut s = Settings::default();
+        assert_eq!(s.serial_floor(Payload::Mod), Payload::Mod.baked_min_serial());
+        s.max_serial_seen.insert("mod".into(), 12);
+        assert_eq!(s.serial_floor(Payload::Mod), 12.max(Payload::Mod.baked_min_serial()));
+        assert_eq!(
+            s.serial_floor(Payload::Game),
+            Payload::Game.baked_min_serial(),
+            "one payload's history says nothing about another's"
+        );
+    }
+
+    /// A document is buffered whole to be verified, so its SIZE is a trust input: a host that
+    /// answers manifest.json with an endless stream must be refused before the bytes are believed,
+    /// not after they are in memory.
+    #[test]
+    fn a_document_over_the_cap_is_refused() {
+        let big = vec![b'x'; 1024];
+        let dl = Fake::new("v1.0.0", "{}", vec![("big", &big)]);
+        let release = dl.fetch_release("r", None).unwrap();
+        let asset = release.asset("big").unwrap();
+        assert_eq!(dl.download_limited(asset, 1024).unwrap().len(), 1024, "exactly at the cap");
+        assert!(dl.download_limited(asset, 1023).is_err(), "one byte over");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::downloader::NetKind;
 use crate::engine::{self, Action, Cancelled, GameRunning};
 use crate::manifest::{Label, OptionKind, UnsupportedCodec, UnsupportedSchema};
 use crate::state;
+use crate::trust::TrustError;
 
 // ---------------- view types serialized to the webview ----------------
 
@@ -519,6 +520,15 @@ fn wire_kind(e: &anyhow::Error) -> &'static str {
             || c.downcast_ref::<UnsupportedCodec>().is_some()
         {
             return "tooOld";
+        }
+        // An unverifiable release is a release we do not have — the same answer as one that was
+        // pulled or renamed, and `notFound` is what says that. Not `tooOld` (nothing about a bad
+        // signature is fixed by updating), and emphatically not an error kind of its own: the
+        // frontend's SOFT_ERR set is `network | auth | notFound`, and those are the failures that
+        // let Play proceed on an install that was already clean. A signing scheme whose failure
+        // mode is "your game stops working" would be worse than the exposure it removes.
+        if c.downcast_ref::<TrustError>().is_some() {
+            return "notFound";
         }
         if c.downcast_ref::<GameRunning>().is_some() {
             return "gameRunning";

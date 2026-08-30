@@ -3498,7 +3498,7 @@ mod tests {
     fn base_repair_writes_only_the_selection() {
         let dir = tempdir("base-partial");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3524,7 +3524,7 @@ mod tests {
     fn a_pinned_file_survives_an_unrestricted_repair() {
         let dir = tempdir("base-pinned");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3562,7 +3562,7 @@ mod tests {
     fn a_partial_repair_plans_only_the_selection() {
         let dir = tempdir("base-partial-plan");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3603,7 +3603,7 @@ mod tests {
     fn a_subset_plan_reads_only_what_it_was_asked_about() {
         let dir = tempdir("base-plan-subset");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3636,7 +3636,7 @@ mod tests {
     fn a_pin_expires_when_the_content_changes_again() {
         let dir = tempdir("base-pin-expiry");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3663,7 +3663,7 @@ mod tests {
     fn a_plan_carries_the_evidence_for_each_difference() {
         let dir = tempdir("base-evidence");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         std::fs::write(dir.join("game/dota/cfg/a.cfg"), b"much longer than three").unwrap();
@@ -3687,7 +3687,7 @@ mod tests {
     fn extras_report_unclaimed_files_and_summarize_unknown_trees() {
         let dir = tempdir("base-extras");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3737,7 +3737,7 @@ mod tests {
     fn a_legacy_winmm_orig_is_an_extra_the_user_can_delete() {
         let dir = tempdir("winmm-extra");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
@@ -3766,7 +3766,7 @@ mod tests {
     fn a_phoenix_only_directory_is_never_foreign() {
         let dir = tempdir("base-extras-shim");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3863,9 +3863,17 @@ mod tests {
         m.files.iter().find(|f| f.dest == dest).unwrap().sha256.clone()
     }
 
+    /// A base-game release double. It publishes the GAME payload, because `manifest_of` refuses a
+    /// signed manifest naming a different one — the same gate the real game repo clears.
+    fn base_fake(tag: &str, manifest_json: &str, assets: Vec<(&str, &[u8])>) -> Fake {
+        Fake::new(tag, manifest_json, assets).payload("game")
+    }
+
     fn base_fetch(dl: &Fake) -> (Release, Manifest) {
         let release = dl.fetch_release("r", None).unwrap();
-        let manifest = engine::manifest_of(dl, &release).unwrap();
+        let manifest =
+            engine::manifest_of(&Settings::default(), dl, &release, crate::trust::Payload::Game)
+                .unwrap();
         (release, manifest)
     }
 
@@ -3873,7 +3881,7 @@ mod tests {
     fn base_install_into_empty_dir_writes_everything_and_no_state() {
         let dir = tempdir("base-fresh");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
 
         let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
@@ -3913,7 +3921,7 @@ mod tests {
         })
         .to_string();
         // note: no "empty" asset — an upload of it would have been rejected
-        let dl = Fake::new("v1805", &m, vec![("real", b"DATA")]);
+        let dl = base_fake("v1805", &m, vec![("real", b"DATA")]);
         let (release, manifest) = base_fetch(&dl);
 
         let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
@@ -3938,7 +3946,7 @@ mod tests {
             "files": [{ "name": "e", "dest": "game/x.bin", "sha256": sha(b"not empty"), "size": 0 }]
         })
         .to_string();
-        let dl = Fake::new("v1805", &m, vec![]);
+        let dl = base_fake("v1805", &m, vec![]);
         let (release, manifest) = base_fetch(&dl);
         let err = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("not the empty hash"), "got: {err:#}");
@@ -3957,7 +3965,7 @@ mod tests {
         assert!(!dir.exists(), "the point of the test");
 
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 4);
@@ -3972,7 +3980,7 @@ mod tests {
     fn base_repair_touches_only_damaged_files() {
         let dir = tempdir("base-repair");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -3997,7 +4005,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         let dir = tempdir("base-unreadable");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -4031,7 +4039,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         let dir = tempdir("base-size-gate");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
 
@@ -4128,7 +4136,7 @@ mod tests {
         // hash memo and the file would still read as intact.
         std::fs::write(dir.join(".phoenix-vanilla/game/dota/cfg/a.cfg"), b"ROTTEN").unwrap();
         let (mm, assets) = base_release();
-        let dl = Fake::new("v1805", &mm, assets);
+        let dl = base_fake("v1805", &mm, assets);
         let (release, manifest) = base_fetch(&dl);
         let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 1);
@@ -4486,7 +4494,7 @@ mod tests {
         .to_string();
         let manifest = Manifest::parse(m.as_bytes()).unwrap();
         let dl = Counting {
-            inner: Fake::new("v1805", &m, vec![("a.phxb", &packed_a), ("b.phxb", &packed_b)]),
+            inner: base_fake("v1805", &m, vec![("a.phxb", &packed_a), ("b.phxb", &packed_b)]),
             calls: Mutex::new(Vec::new()),
         };
         let release = dl.fetch_release("r", None).unwrap();
@@ -4559,7 +4567,7 @@ mod tests {
         std::fs::write(cache.join(format!("{}.part", sha(b"other"))), b"par").unwrap();
 
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
         install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
         let leftover = std::fs::read_dir(&cache).map(|rd| rd.count()).unwrap_or(0);
@@ -4598,7 +4606,7 @@ mod tests {
     fn base_install_cancel_stops_before_placing_and_is_typed() {
         let dir = tempdir("base-cancel");
         let (m, assets) = base_release();
-        let dl = Fake::new("v1805", &m, assets);
+        let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
 
         let cancel = AtomicBool::new(true); // cancelled before the first chunk lands

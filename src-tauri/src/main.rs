@@ -28,6 +28,7 @@ mod mirror;
 mod selfupdate;
 mod state;
 mod steaminf;
+mod trust;
 mod verify;
 mod views;
 

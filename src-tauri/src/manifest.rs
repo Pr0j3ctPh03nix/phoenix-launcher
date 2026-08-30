@@ -94,6 +94,31 @@ pub struct Manifest {
     /// truth for this field; `parse` assigns it afterwards.
     #[serde(skip, default = "default_schema")]
     pub schema: u32,
+    /// Which payload this document describes: "mod" | "launcher" | "game" | "mirrors".
+    ///
+    /// OPTIONAL HERE, REQUIRED THERE — and the split is the point. This type is a format reader:
+    /// it answers "is this a well-formed manifest", and a schema-1 document from 2024 is, without
+    /// ever having heard of payload ids. Making the field mandatory would refuse every existing
+    /// release (and every conformance fixture) over a key that did not exist when they were
+    /// written. The requirement belongs to the TRUST boundary instead — `trust::accept`, reached
+    /// only from the signed path — where it costs nothing and buys everything: a document that
+    /// carries a valid signature from a pinned key was produced by the current tooling, which
+    /// always states both fields, so demanding them there can only ever reject a substitution.
+    /// See `engine::manifest_of`.
+    #[serde(default)]
+    pub payload_id: Option<String>,
+    /// Monotonic per payload, and the SOLE ordering authority — `version` is a display string
+    /// ("1.0.0", "1805") and is never compared. Same optionality rationale as `payload_id`.
+    #[serde(default)]
+    pub serial: Option<u64>,
+    /// When the producer signed this document, unix seconds. ADVISORY ONLY: a clock is not an
+    /// authority, and nothing in the reader may fail on it — a producer whose machine is a day
+    /// off must not be able to lock every client out. Parsed so the field is DECLARED where the
+    /// format is declared; deliberately unread, since `serial` answers the only question
+    /// ("is this current") that a timestamp looks like it could.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub signed_at: Option<i64>,
     pub version: String,
     /// Markdown release notes ("What's new"), embedded by gen_manifest.py --notes-file. Optional so
     /// manifests written before this field are still accepted.
@@ -812,6 +837,28 @@ mod tests {
         assert_eq!(m.files[0].sha256.len(), 64);
         assert_eq!(m.bundles[0].members.len(), 4);
         assert!(m.options[0].description.is_some(), "a known optional key next to unknown ones");
+    }
+
+    /// The signing fields are additive in both directions: a document that carries them keeps
+    /// them, and one written before they existed still parses. Whether a document is ALLOWED to
+    /// omit them is not a format question — it is `trust::accept`'s, on the signed path only, and
+    /// that split is what keeps every fixture here valid.
+    #[test]
+    fn the_signing_fields_are_read_and_never_required() {
+        let signed = Manifest::parse(
+            br#"{"schema":2,"payload_id":"mod","serial":42,"signed_at":1756500000,
+                 "version":"1.0.0","files":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(signed.payload_id.as_deref(), Some("mod"));
+        assert_eq!(signed.serial, Some(42));
+        assert_eq!(signed.signed_at, Some(1_756_500_000));
+
+        // every fixture in the suite predates all three, and must keep parsing
+        let legacy = Manifest::parse(br#"{"schema":2,"version":"1.0.0","files":[]}"#).unwrap();
+        assert_eq!((legacy.payload_id, legacy.serial, legacy.signed_at), (None, None, None));
+        // MAX_SCHEMA does NOT move for an additive key — that is the whole compatibility rule
+        assert_eq!(MAX_SCHEMA, 3);
     }
 
     #[test]

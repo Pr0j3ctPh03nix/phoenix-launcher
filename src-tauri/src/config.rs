@@ -196,6 +196,16 @@ pub struct Settings {
     /// automatically, so nothing reorders and nothing touches the pin.
     #[serde(default = "default_true")]
     pub auto_pick_best: bool,
+    /// The highest signed `serial` accepted for each payload id, ever. The rollback ratchet: a
+    /// mirror can always serve an older release it once held a valid signature for, and nothing
+    /// else in a signed document says it is not the current one.
+    ///
+    /// Plaintext in the user's profile, which is exactly why it is not the only floor — anything
+    /// that can edit this file can hand the ratchet back, so `trust::Payload::baked_min_serial`
+    /// sits underneath it in the binary. `serial_floor` is where the two meet, and it is the ONE
+    /// definition: nothing may compare a serial against half of it.
+    #[serde(default)]
+    pub max_serial_seen: BTreeMap<String, u64>,
 }
 
 fn default_sources() -> Vec<Source> {
@@ -236,6 +246,7 @@ impl Default for Settings {
             sources: default_sources(),
             selected: None,
             auto_pick_best: true,
+            max_serial_seen: BTreeMap::new(),
         }
     }
 }
@@ -334,6 +345,29 @@ impl Settings {
         self.game_repo.as_deref().unwrap_or(DEFAULT_GAME_REPO)
     }
 
+    /// The lowest `serial` a signed manifest for `payload` may carry: whichever of the baked
+    /// backstop and this machine's own high-water mark is greater. Neither alone is enough — the
+    /// baked one cannot know what the user has since installed, and the persisted one lives in an
+    /// editable file.
+    pub fn serial_floor(&self, payload: crate::trust::Payload) -> u64 {
+        let seen = self.max_serial_seen.get(payload.id()).copied().unwrap_or(0);
+        seen.max(payload.baked_min_serial())
+    }
+
+    /// Move the ratchet forward. Returns whether anything changed, so a caller can skip a disk
+    /// write on the ordinary case (the same release checked again, which is most checks).
+    ///
+    /// Never moves it BACK: the floor is a high-water mark, and a lower serial arriving here at
+    /// all would mean the gate that rejects one had already been passed.
+    pub fn advance_serial(&mut self, payload: crate::trust::Payload, serial: u64) -> bool {
+        let slot = self.max_serial_seen.entry(payload.id().to_string()).or_insert(0);
+        if serial > *slot {
+            *slot = serial;
+            return true;
+        }
+        false
+    }
+
     pub fn save(&self) -> Result<()> {
         let p = Self::config_path().context("no config directory available")?;
         if let Some(parent) = p.parent() {
@@ -417,6 +451,35 @@ mod tests {
         s.migrate();
         assert_eq!(s.sources.first(), Some(&Source::Primary));
         assert_eq!(s.sources.len(), 2);
+    }
+
+    /// The rollback ratchet: forward only, per payload, and durable. It is half of the floor —
+    /// `trust::Payload::baked_min_serial` is the other half, and `serial_floor` is the only place
+    /// they are allowed to meet.
+    #[test]
+    fn the_serial_ratchet_only_ever_moves_forward() {
+        use crate::trust::Payload;
+        let baked = Payload::Mod.baked_min_serial();
+        let mut s = Settings::default();
+        assert_eq!(s.serial_floor(Payload::Mod), baked, "no history: the baked backstop alone");
+
+        assert!(s.advance_serial(Payload::Mod, 5));
+        assert_eq!(s.serial_floor(Payload::Mod), 5.max(baked));
+        assert!(!s.advance_serial(Payload::Mod, 5), "the same release again is not news");
+        assert!(!s.advance_serial(Payload::Mod, 4), "and it never walks back");
+        assert_eq!(s.max_serial_seen["mod"], 5);
+        assert_eq!(
+            s.serial_floor(Payload::Game),
+            Payload::Game.baked_min_serial(),
+            "one payload's history says nothing about another's"
+        );
+
+        // it has to survive the round trip — an in-memory ratchet protects nothing
+        let saved: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert_eq!(saved.max_serial_seen["mod"], 5);
+        // and a file written before the field existed simply has no history
+        let old: Settings = serde_json::from_str(r#"{"version":1}"#).unwrap();
+        assert!(old.max_serial_seen.is_empty());
     }
 
     #[test]

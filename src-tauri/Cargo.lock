@@ -2524,6 +2524,7 @@ dependencies = [
  "directories",
  "hex",
  "rfd",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

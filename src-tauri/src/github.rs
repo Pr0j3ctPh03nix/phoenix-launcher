@@ -205,6 +205,20 @@ impl Downloader for Github {
         Ok(buf)
     }
 
+    /// `download` with a hard ceiling, for bytes whose size is a trust input.
+    ///
+    /// `take(max + 1)` rather than a Content-Length check: the length header is the peer's claim,
+    /// and a host that intends to exhaust this process's memory is not going to declare it. The
+    /// extra byte is what distinguishes "exactly at the limit" from "there was more coming".
+    fn download_limited(&self, asset: &Asset, max: u64) -> Result<Vec<u8>> {
+        let mut buf = Vec::new();
+        asset_response(self, asset, None)?.into_reader().take(max + 1).read_to_end(&mut buf)?;
+        if buf.len() as u64 > max {
+            bail!("{} is larger than the {max} bytes allowed for it", asset.name);
+        }
+        Ok(buf)
+    }
+
     /// Stream an asset to `dest`, returning (bytes written, sha256 of the WHOLE file). Never
     /// buffers the body. `resume_from` > 0 continues an interrupted attempt: the existing prefix
     /// is hashed (so the returned sha covers everything) and the rest fetched with a Range

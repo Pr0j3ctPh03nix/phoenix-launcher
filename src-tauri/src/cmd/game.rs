@@ -14,6 +14,7 @@ use crate::config::Settings;
 use crate::engine;
 use crate::github::Github;
 use crate::install::{self, BaseAction};
+use crate::trust::Payload;
 use crate::views::{
     CmdError, FileStateView, GameInstallView, GamePlanView, GameTargetView, GameVerifyView,
 };
@@ -73,7 +74,9 @@ pub async fn game_plan(
         let settings = Settings::load();
         let dir = PathBuf::from(target);
         let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest = engine::manifest_of(dl.as_ref(), &release).map_err(CmdError::from)?;
+        let manifest =
+            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
+                .map_err(CmdError::from)?;
         // Planning an EMPTY folder is instant, but the user may well pick one that already holds
         // a game — then this hashes gigabytes. Emit ticks so the dialog reports progress instead
         // of showing a motionless spinner for minutes, and honour a cancel: closing the dialog
@@ -125,7 +128,9 @@ pub async fn game_install(
         let settings = Settings::load();
         let dir = PathBuf::from(&target);
         let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest = engine::manifest_of(dl.as_ref(), &release).map_err(CmdError::from)?;
+        let manifest =
+            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
+                .map_err(CmdError::from)?;
         // the file assets live sharded across prereleases (GitHub caps 1000 assets/release)
         let release = engine::merged_game_release(dl.as_ref(), settings.game_repo(), release)
             .map_err(CmdError::from)?;
@@ -210,7 +215,9 @@ pub async fn game_repair(
         let settings = Settings::load();
         let dir = settings.resolve_game_dir().map_err(CmdError::from)?;
         let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest = engine::manifest_of(dl.as_ref(), &release).map_err(CmdError::from)?;
+        let manifest =
+            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
+                .map_err(CmdError::from)?;
 
         // Pins FIRST, and only then the writes. If the order were reversed a failure mid-download
         // would lose the "leave these alone" half of the answer, and the retry would open with the
@@ -284,7 +291,9 @@ pub async fn game_delete_extras(
         let settings = Settings::load();
         let dir = settings.resolve_game_dir().map_err(CmdError::from)?;
         let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest = engine::manifest_of(dl.as_ref(), &release).map_err(CmdError::from)?;
+        let manifest =
+            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
+                .map_err(CmdError::from)?;
         // The same claimed-set the verify used, rebuilt: whatever the shim accounts for is not an
         // extra and must stay unreachable from here even if the UI thought otherwise.
         let mut claimed: HashSet<String> = manifest.files.iter().map(|f| f.dest.clone()).collect();
@@ -374,7 +383,9 @@ pub async fn your_files(
             )));
         }
         let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest = engine::manifest_of(dl.as_ref(), &release).map_err(CmdError::from)?;
+        let manifest =
+            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
+                .map_err(CmdError::from)?;
         let identity = install::build_identity(&dir, &manifest);
         if identity == install::BuildIdentity::Unknown {
             return Err(CmdError::from(format!(
@@ -526,7 +537,9 @@ pub async fn game_verify(
             }));
         }
         let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest = engine::manifest_of(dl.as_ref(), &release).map_err(CmdError::from)?;
+        let manifest =
+            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
+                .map_err(CmdError::from)?;
 
         // Which build is this? Decided BEFORE the plan, not after: hashing a full install is
         // minutes of work, and if the answer is "we cannot tell" none of that work can be acted

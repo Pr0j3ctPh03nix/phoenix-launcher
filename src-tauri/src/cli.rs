@@ -151,7 +151,7 @@ fn game_repo_manifest(
     // env var is available for testing against a private one
     let dl = Github::new(settings.token());
     let release = dl.fetch_release(settings.game_repo(), None)?;
-    let manifest = engine::manifest_of(&dl, &release)?;
+    let manifest = engine::manifest_of(settings, &dl, &release, crate::trust::Payload::Game)?;
     // file assets are sharded across prereleases (GitHub caps 1000 assets per release)
     let release = engine::merged_game_release(&dl, settings.game_repo(), release)?;
     Ok((dl, release, manifest))
