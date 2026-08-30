@@ -15,7 +15,7 @@
 //! ```text
 //! untrusted comment: <arbitrary text>
 //! <base64 of: 2-byte algo || 8-byte key_id || 64-byte signature>
-//! trusted_comment: <arbitrary text>
+//! trusted comment: <arbitrary text>
 //! <base64 of: 64-byte global signature>
 //! ```
 //!
@@ -25,7 +25,7 @@
 //!   scheme we do not implement is how a verifier ends up verifying nothing.
 //! * `signature` is `Ed25519(secret, <the document's exact bytes>)`.
 //! * `global signature` is `Ed25519(secret, <the 64 signature bytes> || <trusted comment>)`, where
-//!   the trusted comment is the line's text AFTER `trusted_comment: `. It binds the one part of
+//!   the trusted comment is the line's text AFTER `trusted comment: `. It binds the one part of
 //!   the file that is both attacker-visible and otherwise unauthenticated; skipping it is a small
 //!   hole, but it is a hole in the only field a reader might one day be tempted to believe.
 //!
@@ -312,7 +312,7 @@ fn parse(text: &str) -> Result<Minisig<'_>, TrustError> {
         return Err(Malformed("the first line is not an untrusted comment"));
     }
     let trusted = cr(trusted)
-        .strip_prefix("trusted_comment:")
+        .strip_prefix("trusted comment:")
         .ok_or(Malformed("the third line is not a trusted comment"))?;
     // minisign's prefix includes one space, and the signed text is what follows it
     let trusted = trusted.strip_prefix(' ').unwrap_or(trusted);
@@ -438,7 +438,7 @@ pub(crate) mod testing {
         global.extend_from_slice(sig.as_ref());
         global.extend_from_slice(trusted.as_bytes());
         format!(
-            "untrusted comment: signature from the test suite\n{}\ntrusted_comment: {trusted}\n{}\n",
+            "untrusted comment: signature from the test suite\n{}\ntrusted comment: {trusted}\n{}\n",
             b64_encode(&head),
             b64_encode(kp.sign(&global).as_ref())
         )
@@ -522,14 +522,14 @@ mod tests {
     #[test]
     fn a_rewritten_trusted_comment_fails_the_global_signature() {
         let sig = test_sig(DOC);
-        let tampered = sig.replace("trusted_comment: test signature", "trusted_comment: something else");
+        let tampered = sig.replace("trusted comment: test signature", "trusted comment: something else");
         assert_ne!(tampered, sig);
         assert_eq!(verify(DOC, &tampered), Err(TrustError::BadComment));
         // an empty comment is legal, but only if it is the one that was signed
         let empty = sign(&TEST_SEED, TEST_KEY_ID, *b"Ed", DOC, "");
         assert!(verify(DOC, &empty).is_ok());
         assert_eq!(
-            verify(DOC, &empty.replace("trusted_comment: \n", "trusted_comment: x\n")),
+            verify(DOC, &empty.replace("trusted comment: \n", "trusted comment: x\n")),
             Err(TrustError::BadComment)
         );
     }
@@ -547,7 +547,7 @@ mod tests {
             format!("{good}extra line\n"),                    // five
             lines.join("\r\n"),                               // CRLF is tolerated — see below
             good.replace("untrusted comment:", "hello:"),     // wrong first line
-            good.replace("trusted_comment:", "comment:"),     // wrong third line
+            good.replace("trusted comment:", "comment:"),     // wrong third line
             format!("{}\n!!!!{}\n{}\n{}\n", lines[0], &lines[1][4..], lines[2], lines[3]), // not base64
             format!("{}\n{}\n{}\n{}\n", lines[0], &lines[1][..96], lines[2], lines[3]), // short sig
             format!("{}\n{}\n{}\n{}\n", lines[0], lines[1], lines[2], &lines[3][..84]), // short global
@@ -640,4 +640,43 @@ mod tests {
             );
         }
     }
+    /// A signature produced by the PYTHON producer, parsed and checked by this reader.
+    ///
+    /// The two implementations share no code, so nothing else catches a disagreement about the
+    /// wire format — and such a disagreement is not a test failure in either repo, it is a release
+    /// nobody can install. Fixtures and provenance: `tests/interop/README.md`.
+    ///
+    /// The key comes from the fixture rather than from `PINNED`, so these bytes never carry
+    /// authority in a real build; what is under test is the FORMAT, not the trust root.
+    #[test]
+    fn a_python_produced_signature_verifies_here() {
+        let doc = include_bytes!("../tests/interop/manifest.json");
+        let sig_text = include_str!("../tests/interop/manifest.json.minisig");
+        let pub_text = include_str!("../tests/interop/test.pub");
+
+        // second line of the .pub: base64(algo || key_id || 32-byte key)
+        let blob = b64(pub_text.lines().nth(1).unwrap()).expect("pubkey line is base64");
+        assert_eq!(&blob[..2], b"Ed", "the producer wrote a non-Ed algorithm");
+        let key_id: KeyId = blob[2..10].try_into().unwrap();
+        let key: [u8; 32] = blob[10..].try_into().expect("32-byte public key");
+
+        let parsed = parse(sig_text).expect("the producer's .minisig must parse here");
+        assert_eq!(parsed.algo, *b"Ed");
+        assert_eq!(parsed.key_id, key_id, "signature key id != pubkey key id");
+
+        let ed = |msg: &[u8], s: &[u8]| {
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key).verify(msg, s)
+        };
+        ed(doc, &parsed.sig).expect("the primary signature must verify");
+        let mut global = Vec::new();
+        global.extend_from_slice(&parsed.sig);
+        global.extend_from_slice(parsed.trusted.as_bytes());
+        ed(&global, &parsed.global).expect("the global signature must verify");
+
+        // and it still fails closed on a tampered document
+        let mut bad = doc.to_vec();
+        bad[0] ^= 1;
+        assert!(ed(&bad, &parsed.sig).is_err(), "a tampered document must not verify");
+    }
+
 }

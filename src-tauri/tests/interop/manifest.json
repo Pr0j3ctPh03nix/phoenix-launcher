@@ -1,0 +1,510 @@
+{
+  "schema": 3,
+  "version": "1.2.3",
+  "payload_id": "mod",
+  "serial": 1002003,
+  "signed_at": 1788086756,
+  "notes": "### Added\n- test",
+  "bundles": [
+    {
+      "name": "mod-9066c89eb1f3.phxb",
+      "codec": "zstd",
+      "psize": 2156564,
+      "psha256": "9066c89eb1f3bb446fa579c87e5472360e3b312be0b65dab72fb9f026f810acb",
+      "size": 24945346,
+      "members": [
+        "fec11a7cd3e5c790e4d39ee7c8cfeabd9893b2cb8c0b6abd1b6d476aaa6a9d38",
+        "85ecca30e543eb9be7b001165ad991b061ba19d30f98706b90561c28f020e840",
+        "425d19c49d0c10a4c687caf3fdfe03a5ef9ae7c0fd370c7205bc1bc228c0739b",
+        "6b1bc0f474cfc28b3309138d529d719eedfa021d3f41968e784e628662e6a184",
+        "5005e84690596cf2f62c636163d5c00111a638072cf35748fae20748b0d4f219",
+        "5d434f86d1b2dac234264c23fe1eff782d7d0bcb650e980856c6cab3c4fcb418",
+        "df14f34803c5ed9a123f81faa4d1c8b04bac2b670286492b2720e4cc056fb077",
+        "12461b8340fe84fd0ebee3ba6c414867dea28db6982a3ddbdd092c57e6eef0a1",
+        "b871fb869c8f68209f8f93c3893c90716b5b743bb953b5fe81672f4a0d3793ef",
+        "bf3053facb51887fed042f790595a28130a8c9a4ea0a3ebf043da912f8d154fc",
+        "c698b21a50f482e5aebe7eac5d0871f38d6ed1bbd9203d9a7124b7cb466b70a0",
+        "d9137b41af64a0a69e614e53bd098dac85594c975f57b0bfc7a8858cc1df72fb",
+        "0c4a47c338077552daf2f83dbb73516199d4266a736db0014839fd71ad01f59f",
+        "49daaf02bec58a3723097eb3df7de96cc5984b2d1a324aca4f8df19e536a6519",
+        "f681a7ce1c164c4e4ce6828763a3114ef5f31ec81f40468496606cf62c34ea14",
+        "e045e69d716e5a5cf4f8a8fef38616bc39f9caa7658b9c8632fe9bd110d6127d",
+        "0afc9a18e1fa5895a0bff2a0f216d1f8b368b2632a8cc2d36686411bbf06ea75",
+        "0353520d7f529dcabe49423efe2d71de36582c246e3ea6039052f6e3be8d9d40",
+        "e135b6184973b6e12ff469b2b308fe445f29eb6bd1ae32885cc1526843a622f1",
+        "36e09e66d0097816d99f85265066c782ac1cfac9429162d13a9b245029a33e1a",
+        "0ffeef969aa1f36ec45f07cacda87940f1eadfcc7d850f41ffbb219bc706c72b",
+        "bcebadf2c9870b130008ef9e3e432e7ba4379f9db1d3eba2317592776ba10ba7",
+        "84f3ca00333dcca34b93245037aeb6303b44bfda6bdf73d827a05c21a148be38",
+        "f2f63df10432352a68ad8863c5552f94e1a7b1bbab5b748dbf92e5c15daa7286",
+        "f8988f5abeeda774bcd36c017db8a8d82a6f80f7cf340af6e3a50de5b1ae48cc",
+        "abf7129e34107639b49637158f149a4a4b0909445408961c977199d9193e4de9",
+        "badaf69813b0543fbce2425c8ba9e1f259a40a50b711d5ff600efee077008be6",
+        "4a7906e8a3c91c9ce4f4ab85ba76f635bbc3d76cd2de17cb0a6b8a3d34faf9ed",
+        "7ebcd6073955e7833bb4ee80f01c7c516d96f438057be530617b16d20169aeac",
+        "33a950d54dd675caf6dcca18e5db35249afff16d13eefbe0ad699d228e26a469",
+        "d465d82d6dfe48e40fdf7cd328f4475f2cf69e105f6ad7c880db926bea4cd027",
+        "9a714bef2e3d9002700a532a57c0192cc9639ff42d40c2f59be25d16f31c9953",
+        "8079db2fb65ba05cbdd5c9d90751d6148d85d7f6496b4e415b7ba74bdf462f43",
+        "f003c2653cea55b948ec1740300061309cf32c48fd142fb73c5460c04b317610",
+        "5dc6e440b22d94e5b597bd58d2c141df318c4f536fa8a49e6624a0e2cd35f32b",
+        "80572b105ae1ad4dc7f31f90d84f184d56d474e1c82b44b03e1a2d0299617f15",
+        "269ae997af6f7430426febd8cb8e168105a9ba90d9774eab47f6ade03bd5494e",
+        "863397fb78462bc88d1c486f6630c5536f0e7ab6f23d660f5707e963901f6f61",
+        "e1d6aa77517a956273102148aa43c6f960d969b0df6bc5994b8482116f496d20",
+        "91de4851f8af1d703f308ab3518bdbdc83a065f5b0bc0d25df8c9da0aeeef823",
+        "6cc79d1e9c065220bc4c175f0ba88a0e8060c86b47a4beab3f182e180f8d7969",
+        "4d7725acdcfc40fb1d0dc0b49c62dad42a6262005bedb7f5d37b3c9d60bb784e",
+        "f239493ad1b8118cefb017b33b357bbb85a0eeb9da5dd6b776646f15b41f780b",
+        "41867d65463aa1e218f19391e450ab98735a0e6e690db0791ea45b6e70340287",
+        "6d2f4e47f2889097197f69122413fe1b2514dc9fe6872b418b20066a952eccb5",
+        "d943e3b7b2d7e5508ebd8fd56a5072823e3e87ff62e32d009b4d9d872495b1e7",
+        "431b6086815276d27e0261ab514d330b83083ee5efb9ebc251194d62e4b63820",
+        "af2ff10d9cdd766c4d1ecc043d4efefb54bfe0a20a5943915218f7ca545c4e3b",
+        "aa0030506b3374e528ddd29038303379271eeafd8b4006ef84ae549240ab5f61",
+        "55b97692ef587eea8204b33ba0e933d0b0c26d0ba56123107d00cd8ed8a34e6e",
+        "a30b06a453ac81eb813a28f3e018b2b44e9906c67d8b777e492eed21ca7e7d61",
+        "28b5b452ce40aac0fc4423ef244fb20ff03436e2a33b2e06776b1fc2eef9f96f",
+        "23e827c10faae673b6d949a025793403817d2b62ed7cc23f3531771617f24c75",
+        "7a81ef0933dfd1451df0057284f7526cc727ed4409129185742cc4c93396c3b0",
+        "069eab06d368d3ecde309b345c51471b4791fdc3e3a63d1a821d1916b74e9b69",
+        "383073cabdb42b9256d95ad1defa2aed5a607160723db289552498eb3dc8340a",
+        "dcebcaa5c281b28d8ee11b29e605aec72ab4cb1529ce4adc391772a52d13529d",
+        "b251dcf8a1f9df79c5f06db39ce992b04eca96b9760eaa83699a76f4279df995",
+        "01aae0a37541e97225a3acd5c23e1c87d4355787cc61a9fa1cc91d250d8f62f1",
+        "445645a2fef6f297ff42a51771fcd4a7d0120641231c7d7b2c10a846f5b79aa7",
+        "7c8d523f2a192281d58cf7ea67425ac27e3f1ea4bdac2b2e83b1ca6d5810699d",
+        "796daf3e08d53040c6d37c7b692f89641600429131652acf452f15cc0a0c7b11",
+        "2358fec7d0aa50f9215e9e4c534b27dd34995c3a98d5d0ec4b74a39ab4ae3d5b",
+        "1be0d020f19a0971180181260ae76da263491e1e7fda8c92501b26e614ddd30f",
+        "7cddb96fed8762be82fa680797da0abe1c66809cd0910ffebd886fb10fd8e8b5",
+        "85f4073a2686fc829a01fdf8641866fd065b62dc201562ee8bf1d4595f279231",
+        "216f89c816d279c8b7bc7ff4783ecf03f715ae2fa0e294d6a466210d820e2fe6",
+        "bacdba127a8ff2b6ddd0bc64e53c661f6e375bde37f6bc83adeb58f7f817c194"
+      ]
+    }
+  ],
+  "files": [
+    {
+      "dest": "game/bin/win64/winmm.dll",
+      "sha256": "85ecca30e543eb9be7b001165ad991b061ba19d30f98706b90561c28f020e840",
+      "size": 190000
+    },
+    {
+      "dest": "game/dota/gameinfo.gi",
+      "sha256": "425d19c49d0c10a4c687caf3fdfe03a5ef9ae7c0fd370c7205bc1bc228c0739b",
+      "size": 7385
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/maps/hero_demo_main.vpk",
+      "sha256": "796daf3e08d53040c6d37c7b692f89641600429131652acf452f15cc0a0c7b11",
+      "size": 2319675
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/panorama/layout/custom_game/hud_hero_demo.vxml_c",
+      "sha256": "7cddb96fed8762be82fa680797da0abe1c66809cd0910ffebd886fb10fd8e8b5",
+      "size": 14129
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/panorama/scripts/custom_game/hud_hero_demo.vjs_c",
+      "sha256": "4a7906e8a3c91c9ce4f4ab85ba76f635bbc3d76cd2de17cb0a6b8a3d34faf9ed",
+      "size": 7640
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/panorama/styles/hud_hero_demo.vcss_c",
+      "sha256": "f8988f5abeeda774bcd36c017db8a8d82a6f80f7cf340af6e3a50de5b1ae48cc",
+      "size": 27857
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/resource/addon_english.txt",
+      "sha256": "d9137b41af64a0a69e614e53bd098dac85594c975f57b0bfc7a8858cc1df72fb",
+      "size": 7150
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/resource/addon_russian.txt",
+      "sha256": "0c4a47c338077552daf2f83dbb73516199d4266a736db0014839fd71ad01f59f",
+      "size": 7322
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/scripts/custom_net_tables.txt",
+      "sha256": "49daaf02bec58a3723097eb3df7de96cc5984b2d1a324aca4f8df19e536a6519",
+      "size": 180
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/scripts/npc/npc_units_custom.txt",
+      "sha256": "f681a7ce1c164c4e4ce6828763a3114ef5f31ec81f40468496606cf62c34ea14",
+      "size": 767
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/scripts/vscripts/addon_game_mode.lua",
+      "sha256": "6b1bc0f474cfc28b3309138d529d719eedfa021d3f41968e784e628662e6a184",
+      "size": 11089
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/scripts/vscripts/events.lua",
+      "sha256": "5005e84690596cf2f62c636163d5c00111a638072cf35748fae20748b0d4f219",
+      "size": 22130
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/scripts/vscripts/lm_take_no_damage.lua",
+      "sha256": "5d434f86d1b2dac234264c23fe1eff782d7d0bcb650e980856c6cab3c4fcb418",
+      "size": 916
+    },
+    {
+      "dest": "game/dota_addons_phoenix/hero_demo/scripts/vscripts/utility_functions.lua",
+      "sha256": "df14f34803c5ed9a123f81faa4d1c8b04bac2b670286492b2720e4cc056fb077",
+      "size": 30783
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/addoninfo.txt",
+      "sha256": "e045e69d716e5a5cf4f8a8fef38616bc39f9caa7658b9c8632fe9bd110d6127d",
+      "size": 168
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/maps/hero_demo_main.vpk",
+      "sha256": "796daf3e08d53040c6d37c7b692f89641600429131652acf452f15cc0a0c7b11",
+      "size": 2319675
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/materials/overviews/hero_demo_main.vmat_c",
+      "sha256": "33a950d54dd675caf6dcca18e5db35249afff16d13eefbe0ad699d228e26a469",
+      "size": 3624
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/materials/overviews/hero_demo_main_tga_10bb8a0.vtex_c",
+      "sha256": "2358fec7d0aa50f9215e9e4c534b27dd34995c3a98d5d0ec4b74a39ab4ae3d5b",
+      "size": 1050372
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/panorama/layout/custom_game/custom_ui_manifest.vxml_c",
+      "sha256": "85f4073a2686fc829a01fdf8641866fd065b62dc201562ee8bf1d4595f279231",
+      "size": 588
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/panorama/layout/custom_game/hud_polygon.vxml_c",
+      "sha256": "216f89c816d279c8b7bc7ff4783ecf03f715ae2fa0e294d6a466210d820e2fe6",
+      "size": 5196
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/panorama/scripts/custom_game/hud_polygon.vjs_c",
+      "sha256": "7ebcd6073955e7833bb4ee80f01c7c516d96f438057be530617b16d20169aeac",
+      "size": 8090
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/panorama/styles/hud_polygon.vcss_c",
+      "sha256": "abf7129e34107639b49637158f149a4a4b0909445408961c977199d9193e4de9",
+      "size": 6570
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/resource/addon_english.txt",
+      "sha256": "0afc9a18e1fa5895a0bff2a0f216d1f8b368b2632a8cc2d36686411bbf06ea75",
+      "size": 2276
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/resource/addon_russian.txt",
+      "sha256": "0353520d7f529dcabe49423efe2d71de36582c246e3ea6039052f6e3be8d9d40",
+      "size": 2300
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/resource/overviews/hero_demo_main.txt",
+      "sha256": "e135b6184973b6e12ff469b2b308fe445f29eb6bd1ae32885cc1526843a622f1",
+      "size": 108
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/scripts/custom_net_tables.txt",
+      "sha256": "36e09e66d0097816d99f85265066c782ac1cfac9429162d13a9b245029a33e1a",
+      "size": 178
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/scripts/vscripts/addon_game_mode.lua",
+      "sha256": "12461b8340fe84fd0ebee3ba6c414867dea28db6982a3ddbdd092c57e6eef0a1",
+      "size": 13858
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/scripts/vscripts/lasthit.lua",
+      "sha256": "b871fb869c8f68209f8f93c3893c90716b5b743bb953b5fe81672f4a0d3793ef",
+      "size": 19404
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/scripts/vscripts/sniper_ai.lua",
+      "sha256": "bf3053facb51887fed042f790595a28130a8c9a4ea0a3ebf043da912f8d154fc",
+      "size": 13827
+    },
+    {
+      "dest": "game/dota_addons_phoenix/polygon/scripts/vscripts/timers.lua",
+      "sha256": "c698b21a50f482e5aebe7eac5d0871f38d6ed1bbd9203d9a7124b7cb466b70a0",
+      "size": 6560
+    },
+    {
+      "dest": "game/dota_phoenix/cfg/phoenix.cfg",
+      "sha256": "fec11a7cd3e5c790e4d39ee7c8cfeabd9893b2cb8c0b6abd1b6d476aaa6a9d38",
+      "size": 1968
+    },
+    {
+      "dest": "game/dota_phoenix/panorama/layout/popups/popup_settings.vxml_c",
+      "sha256": "bacdba127a8ff2b6ddd0bc64e53c661f6e375bde37f6bc83adeb58f7f817c194",
+      "size": 97474
+    },
+    {
+      "dest": "game/dota_phoenix/scripts/items/items_game.txt",
+      "sha256": "0ffeef969aa1f36ec45f07cacda87940f1eadfcc7d850f41ffbb219bc706c72b",
+      "size": 19307896
+    },
+    {
+      "dest": "game/dota_phoenix/scripts/matchgroups.txt",
+      "sha256": "bcebadf2c9870b130008ef9e3e432e7ba4379f9db1d3eba2317592776ba10ba7",
+      "size": 316
+    },
+    {
+      "dest": "game/dota_phoenix/scripts/phoenix_herowheel.txt",
+      "sha256": "84f3ca00333dcca34b93245037aeb6303b44bfda6bdf73d827a05c21a148be38",
+      "size": 108638
+    },
+    {
+      "dest": "game/dota_phoenix/scripts/regions.txt",
+      "sha256": "f2f63df10432352a68ad8863c5552f94e1a7b1bbab5b748dbf92e5c15daa7286",
+      "size": 636
+    }
+  ],
+  "remove": [],
+  "options": [
+    {
+      "id": "game-dota-phoenix-new-graphics",
+      "kind": "toggle",
+      "label": {
+        "ru": "Новая графика (попытка воссоздания Source 1 6.84)",
+        "en": "New graphics (6.84 Source 1 replication attempt)"
+      },
+      "default": false,
+      "files": [
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_000.vmat_c",
+          "sha256": "d465d82d6dfe48e40fdf7cd328f4475f2cf69e105f6ad7c880db926bea4cd027",
+          "size": 6800
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_001.vmat_c",
+          "sha256": "9a714bef2e3d9002700a532a57c0192cc9639ff42d40c2f59be25d16f31c9953",
+          "size": 6856
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_002.vmat_c",
+          "sha256": "8079db2fb65ba05cbdd5c9d90751d6148d85d7f6496b4e415b7ba74bdf462f43",
+          "size": 6800
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_base_000.vmat_c",
+          "sha256": "f003c2653cea55b948ec1740300061309cf32c48fd142fb73c5460c04b317610",
+          "size": 7184
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_base_angled_000.vmat_c",
+          "sha256": "5dc6e440b22d94e5b597bd58d2c141df318c4f536fa8a49e6624a0e2cd35f32b",
+          "size": 7368
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_coloseum_000.vmat_c",
+          "sha256": "80572b105ae1ad4dc7f31f90d84f184d56d474e1c82b44b03e1a2d0299617f15",
+          "size": 6864
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_coloseum_003.vmat_c",
+          "sha256": "269ae997af6f7430426febd8cb8e168105a9ba90d9774eab47f6ade03bd5494e",
+          "size": 7008
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_coloseum_angled_000.vmat_c",
+          "sha256": "863397fb78462bc88d1c486f6630c5536f0e7ab6f23d660f5707e963901f6f61",
+          "size": 6888
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_coloseum_horizontal_000.vmat_c",
+          "sha256": "e1d6aa77517a956273102148aa43c6f960d969b0df6bc5994b8482116f496d20",
+          "size": 6896
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_coloseum_riverbed_path_000.vmat_c",
+          "sha256": "91de4851f8af1d703f308ab3518bdbdc83a065f5b0bc0d25df8c9da0aeeef823",
+          "size": 7280
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_coloseum_vertical_000.vmat_c",
+          "sha256": "6cc79d1e9c065220bc4c175f0ba88a0e8060c86b47a4beab3f182e180f8d7969",
+          "size": 6888
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_000.vmat_c",
+          "sha256": "4d7725acdcfc40fb1d0dc0b49c62dad42a6262005bedb7f5d37b3c9d60bb784e",
+          "size": 6888
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_002.vmat_c",
+          "sha256": "f239493ad1b8118cefb017b33b357bbb85a0eeb9da5dd6b776646f15b41f780b",
+          "size": 6872
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_coloseum_001.vmat_c",
+          "sha256": "41867d65463aa1e218f19391e450ab98735a0e6e690db0791ea45b6e70340287",
+          "size": 7216
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_path_000.vmat_c",
+          "sha256": "6d2f4e47f2889097197f69122413fe1b2514dc9fe6872b418b20066a952eccb5",
+          "size": 7368
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_path_001.vmat_c",
+          "sha256": "d943e3b7b2d7e5508ebd8fd56a5072823e3e87ff62e32d009b4d9d872495b1e7",
+          "size": 7216
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_path_002.vmat_c",
+          "sha256": "431b6086815276d27e0261ab514d330b83083ee5efb9ebc251194d62e4b63820",
+          "size": 7216
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_spring_001.vmat_c",
+          "sha256": "af2ff10d9cdd766c4d1ecc043d4efefb54bfe0a20a5943915218f7ca545c4e3b",
+          "size": 6912
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_spring_path_001.vmat_c",
+          "sha256": "aa0030506b3374e528ddd29038303379271eeafd8b4006ef84ae549240ab5f61",
+          "size": 7224
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dire_spring_path_002.vmat_c",
+          "sha256": "55b97692ef587eea8204b33ba0e933d0b0c26d0ba56123107d00cd8ed8a34e6e",
+          "size": 7240
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dry_default_path_001.vmat_c",
+          "sha256": "a30b06a453ac81eb813a28f3e018b2b44e9906c67d8b777e492eed21ca7e7d61",
+          "size": 6936
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_dry_spring_path_001.vmat_c",
+          "sha256": "28b5b452ce40aac0fc4423ef244fb20ff03436e2a33b2e06776b1fc2eef9f96f",
+          "size": 6936
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_path_000.vmat_c",
+          "sha256": "23e827c10faae673b6d949a025793403817d2b62ed7cc23f3531771617f24c75",
+          "size": 7384
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_path_001.vmat_c",
+          "sha256": "7a81ef0933dfd1451df0057284f7526cc727ed4409129185742cc4c93396c3b0",
+          "size": 7184
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_path_002.vmat_c",
+          "sha256": "069eab06d368d3ecde309b345c51471b4791fdc3e3a63d1a821d1916b74e9b69",
+          "size": 7184
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_path_003.vmat_c",
+          "sha256": "383073cabdb42b9256d95ad1defa2aed5a607160723db289552498eb3dc8340a",
+          "size": 7168
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_spring_000.vmat_c",
+          "sha256": "dcebcaa5c281b28d8ee11b29e605aec72ab4cb1529ce4adc391772a52d13529d",
+          "size": 6872
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_spring_path_000.vmat_c",
+          "sha256": "b251dcf8a1f9df79c5f06db39ce992b04eca96b9760eaa83699a76f4279df995",
+          "size": 7208
+        },
+        {
+          "dest": "game/dota_phoenix/materials/blends/mod_radiant_spring_path_003.vmat_c",
+          "sha256": "01aae0a37541e97225a3acd5c23e1c87d4355787cc61a9fa1cc91d250d8f62f1",
+          "size": 7208
+        },
+        {
+          "dest": "game/dota_phoenix/materials/water/water_generic_000.vmat_c",
+          "sha256": "7c8d523f2a192281d58cf7ea67425ac27e3f1ea4bdac2b2e83b1ca6d5810699d",
+          "size": 6352
+        },
+        {
+          "dest": "game/dota_phoenix/maps/dota/entities/default_ents.vents_c",
+          "sha256": "badaf69813b0543fbce2425c8ba9e1f259a40a50b711d5ff600efee077008be6",
+          "size": 1367684
+        },
+        {
+          "dest": "game/dota_phoenix/materials/skybox/sky_dotasky_01.vmat_c",
+          "sha256": "445645a2fef6f297ff42a51771fcd4a7d0120641231c7d7b2c10a846f5b79aa7",
+          "size": 2928
+        },
+        {
+          "dest": "game/dota_phoenix/materials/skybox/sky_dotasky_01_strip_png_405338ae.vtex_c",
+          "sha256": "1be0d020f19a0971180181260ae76da263491e1e7fda8c92501b26e614ddd30f",
+          "size": 66248
+        }
+      ]
+    }
+  ],
+  "tree": [
+    {
+      "label": {
+        "ru": "Ядро Phoenix",
+        "en": "Phoenix Core"
+      },
+      "files": [
+        "game/bin/win64/winmm.dll",
+        "game/dota/gameinfo.gi",
+        "game/dota_phoenix/cfg/phoenix.cfg",
+        "game/dota_phoenix/scripts/regions.txt",
+        "game/dota_phoenix/scripts/matchgroups.txt",
+        "game/dota_phoenix/scripts/phoenix_herowheel.txt",
+        "game/dota_phoenix/panorama/layout/popups/popup_settings.vxml_c"
+      ]
+    },
+    {
+      "label": {
+        "ru": "Hero Demo Plus",
+        "en": "Hero Demo Plus"
+      },
+      "files": [
+        "game/dota_addons_phoenix/hero_demo/maps/hero_demo_main.vpk",
+        "game/dota_addons_phoenix/hero_demo/panorama/layout/custom_game/hud_hero_demo.vxml_c",
+        "game/dota_addons_phoenix/hero_demo/panorama/scripts/custom_game/hud_hero_demo.vjs_c",
+        "game/dota_addons_phoenix/hero_demo/panorama/styles/hud_hero_demo.vcss_c",
+        "game/dota_addons_phoenix/hero_demo/resource/addon_english.txt",
+        "game/dota_addons_phoenix/hero_demo/resource/addon_russian.txt",
+        "game/dota_addons_phoenix/hero_demo/scripts/custom_net_tables.txt",
+        "game/dota_addons_phoenix/hero_demo/scripts/npc/npc_units_custom.txt",
+        "game/dota_addons_phoenix/hero_demo/scripts/vscripts/addon_game_mode.lua",
+        "game/dota_addons_phoenix/hero_demo/scripts/vscripts/events.lua",
+        "game/dota_addons_phoenix/hero_demo/scripts/vscripts/lm_take_no_damage.lua",
+        "game/dota_addons_phoenix/hero_demo/scripts/vscripts/utility_functions.lua",
+        "game/dota_addons_phoenix/polygon/addoninfo.txt",
+        "game/dota_addons_phoenix/polygon/maps/hero_demo_main.vpk",
+        "game/dota_addons_phoenix/polygon/materials/overviews/hero_demo_main.vmat_c",
+        "game/dota_addons_phoenix/polygon/materials/overviews/hero_demo_main_tga_10bb8a0.vtex_c",
+        "game/dota_addons_phoenix/polygon/panorama/layout/custom_game/custom_ui_manifest.vxml_c",
+        "game/dota_addons_phoenix/polygon/panorama/layout/custom_game/hud_polygon.vxml_c",
+        "game/dota_addons_phoenix/polygon/panorama/scripts/custom_game/hud_polygon.vjs_c",
+        "game/dota_addons_phoenix/polygon/panorama/styles/hud_polygon.vcss_c",
+        "game/dota_addons_phoenix/polygon/resource/addon_english.txt",
+        "game/dota_addons_phoenix/polygon/resource/addon_russian.txt",
+        "game/dota_addons_phoenix/polygon/resource/overviews/hero_demo_main.txt",
+        "game/dota_addons_phoenix/polygon/scripts/custom_net_tables.txt",
+        "game/dota_addons_phoenix/polygon/scripts/vscripts/addon_game_mode.lua",
+        "game/dota_addons_phoenix/polygon/scripts/vscripts/lasthit.lua",
+        "game/dota_addons_phoenix/polygon/scripts/vscripts/sniper_ai.lua",
+        "game/dota_addons_phoenix/polygon/scripts/vscripts/timers.lua"
+      ]
+    },
+    {
+      "label": {
+        "ru": "Исправление свечения приманки Слардара",
+        "en": "Slardar's Esca Glow Fix"
+      },
+      "files": [
+        "game/dota_phoenix/scripts/items/items_game.txt"
+      ]
+    }
+  ]
+}
