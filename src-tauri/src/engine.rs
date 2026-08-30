@@ -1330,4 +1330,31 @@ mod tests {
         assert!(!st.action.is_unattended(), "a pin is an instruction that outlasts one dialog");
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// Old releases predate signing, and their notes must stay readable: the history page is an
+    /// archive of prose, not an install path. Regression guard for the signing cutover — the day a
+    /// signed launcher ships, every already-published release is unsigned.
+    #[test]
+    fn the_notes_history_still_reads_unsigned_releases() {
+        let doc = concat!(
+            "{\"schema\":2,\"version\":\"1.2.0\",",
+            "\"notes\":\"### Fixed\\n- an old bug\",\"files\":[]}"
+        );
+        // a release carrying manifest.json and NO manifest.json.minisig
+        let dl = Fake::new("v1.2.0", doc, vec![]).unsigned();
+        let settings = Settings::default();
+
+        let hist =
+            fetch_notes_history(&settings, &dl, &[]).expect("history must not require signatures");
+        assert_eq!(hist.entries.len(), 1, "an unsigned release must still appear in the history");
+        assert_eq!(hist.entries[0].version, "1.2.0");
+        assert!(hist.entries[0].notes.contains("an old bug"));
+
+        // ...while the install path refuses that very same release
+        let rel = dl.fetch_release("r", None).unwrap();
+        assert!(
+            manifest_of(&settings, &dl, &rel, Payload::Mod).is_err(),
+            "an unsigned release must not be installable"
+        );
+    }
+
 }
