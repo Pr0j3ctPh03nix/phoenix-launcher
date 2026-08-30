@@ -26,7 +26,10 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      # Third-party actions are pinned to COMMIT SHAs, not tags. A tag is mutable, and this job now
+      # holds PHOENIX_SIGNING_KEY as well as the baked token. The trailing comment is the
+      # human-readable version; update both together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # The version lives in three files and the git tag, and self-update compares the TAG against
       # the binary's CARGO_PKG_VERSION. Ship a tag ahead of Cargo.toml and every client offers an
@@ -51,11 +54,11 @@ jobs:
             exit 1
           }
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
         with:
           workspaces: src-tauri
           # RESTORE-ONLY on tags. Actions caches are ref-scoped: a run may only read caches from
@@ -93,7 +96,7 @@ jobs:
 
       - name: Upload build artifacts (manual runs)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: phoenix-launcher
           path: |
@@ -114,14 +117,87 @@ jobs:
           git tag -l --format='%(contents:body)' "${{ github.ref_name }}" | Out-File -Encoding utf8 release_body.md
           Get-Content release_body.md
 
+      # The producer tooling lives in ONE place — the dist repo, which is the only repo every CI box
+      # can clone. Checked out here rather than vendored so this workflow signs with exactly the
+      # implementation the mod and game payloads are signed with; a fourth copy of the signer is the
+      # thing that eventually disagrees with the other three.
+      - name: Fetch the release tooling (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: Pr0j3ctPh03nix/client-dist-staging
+          token: ${{ secrets.PHOENIX_BAKED_TOKEN }}
+          path: .phoenix-tools
+          sparse-checkout: tools
+
+      # WHY THE LAUNCHER IS SIGNED AT ALL. selfupdate.rs prefers a signed manifest and falls back to
+      # the .sha256 sidecar when a release publishes none — and until this step existed, none ever
+      # did, so every self-update was decided by a bare hash published by whoever served the
+      # release. That is the one payload signing did not cover, and it is the payload that runs.
+      #
+      # The sidecar is still published, deliberately: already-installed launchers know nothing but
+      # the sidecar, and self-update is the one path that has to keep working for builds older than
+      # every change made to it. Clients move onto the signed path as they update through this one.
+      - name: Sign the launcher payload (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          # Same key as the mod and the game: PINNED in the launcher is ONE ring for every payload,
+          # not one key per payload_id, so anything else is refused by every client.
+          PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
+          # 2,000,000 + the build counter — see gen_launcher_manifest.SERIAL_FLOOR. Rises on every
+          # run, including a rebuild of the same tag, which a version-derived number cannot do.
+          PHOENIX_SERIAL: ${{ 2000000 + github.run_number }}
+        run: |
+          set -e
+          test -n "$PHOENIX_SIGNING_KEY" || {
+            echo "secrets.PHOENIX_SIGNING_KEY is not set — refusing to publish an unsigned launcher"
+            exit 1
+          }
+          out=src-tauri/target/release
+          python .phoenix-tools/tools/gen_launcher_manifest.py \
+            --version  "$TAG" \
+            --serial   "$PHOENIX_SERIAL" \
+            --exe      phoenix-launcher.exe \
+            --exe-path "$out/phoenix-launcher.exe" \
+            --notes-file release_body.md \
+            --out      "$out/manifest.json"
+          # Outside the workspace and removed by a trap: a failure between writing and deleting it
+          # must not leave the release key in a directory later steps read.
+          keyfile="$(mktemp)"
+          trap 'rm -f "$keyfile"' EXIT
+          printf '%s' "$PHOENIX_SIGNING_KEY" > "$keyfile"
+          python .phoenix-tools/tools/phoenix_minisign.py sign --sec "$keyfile" \
+            --trusted-comment "phoenix launcher $TAG" "$out/manifest.json"
+          # Prove it verifies under the published public half before anyone depends on it, and that
+          # the document itself is one a reader accepts.
+          python .phoenix-tools/tools/phoenix_minisign.py verify \
+            --pub .phoenix-tools/tools/phoenix-release.pub "$out/manifest.json"
+          python .phoenix-tools/tools/validate_manifest.py "$out/manifest.json"
+
+      # DRAFT first: this action creates the release and then uploads in PARALLEL, so a non-draft
+      # release is reachable by clients while its assets are still going up — and a client that sees
+      # the manifest before the exe reads it as a release it cannot install.
       - name: Publish release (tag pushes)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           # a release missing the sidecar cannot be auto-installed by any client — fail the run
           # rather than publish one, instead of relying on the checksum step having failed first
           fail_on_unmatched_files: true
+          draft: true
           body_path: release_body.md
           files: |
             src-tauri/target/release/phoenix-launcher.exe
             src-tauri/target/release/phoenix-launcher.exe.sha256
+            src-tauri/target/release/manifest.json
+            src-tauri/target/release/manifest.json.minisig
+
+      - name: Undraft the release (tag pushes)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$TAG" --draft=false

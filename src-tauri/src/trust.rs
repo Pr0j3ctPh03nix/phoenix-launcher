@@ -70,14 +70,6 @@ pub struct TrustedKey {
     pub key: [u8; 32],
 }
 
-// TODO(keys): replace both placeholders with the real published keys before any signed release is
-// cut. The 32 zero bytes are not a valid public key of any secret — the encoding decodes to a
-// low-order curve point, which is outside the subgroup the base point generates — so a build that
-// ships this table unchanged verifies NOTHING and fails closed. That is the intended failure
-// mode: a placeholder that accidentally accepted something would be far worse than one that
-// accepts nothing. The key ids are ASCII so an un-replaced table is obvious in a hex dump.
-const PLACEHOLDER: [u8; 32] = [0u8; 32];
-
 /// The keys a document may be signed by, in no particular order — a signature names its own key.
 ///
 /// TWO of them, and the second is not redundant: RECOVERY is a cold spare that never signs
@@ -85,11 +77,36 @@ const PLACEHOLDER: [u8; 32] = [0u8; 32];
 /// compromised, when the alternative is that every installed launcher becomes permanently
 /// unable to accept a release — an unrecoverable state, since the fix would have to ship
 /// through the very channel that broke.
+///
+/// These are the raw halves of the published `.pub` files, decoded once with the producer's own
+/// parser rather than re-read by hand here. Changing a byte of this table silently makes a build
+/// unable to install anything; there is no runtime signal, because the failure looks exactly like
+/// "no release is available" by design (see `TrustError` below).
 pub const PINNED: &[TrustedKey] = &[
-    // ACTIVE — signs every release.
-    TrustedKey { id: *b"PLACEHLD", key: PLACEHOLDER },
-    // RECOVERY — the cold spare, kept offline; signs nothing until it has to.
-    TrustedKey { id: *b"PLACEHL2", key: PLACEHOLDER },
+    // ACTIVE — signs every release. Published as `docs/keys/phoenix-active.pub` in the dev
+    // superset, synced to `dist/tools/phoenix-release.pub`, which release.yml verifies its own
+    // freshly-made signature against before it publishes anything.
+    TrustedKey {
+        id: [0xd7, 0x11, 0x58, 0xee, 0xfd, 0xdd, 0x64, 0x9c],
+        key: [
+            0x9b, 0xd5, 0xa9, 0x03, 0xa9, 0xa3, 0x29, 0xf9, //
+            0xd2, 0x4c, 0x0c, 0x31, 0xfd, 0x20, 0x00, 0x8c, //
+            0x3b, 0x40, 0xd4, 0x3f, 0x34, 0xe1, 0x35, 0xd4, //
+            0x71, 0x8a, 0xda, 0x9f, 0x07, 0x6d, 0xa6, 0xb7,
+        ],
+    },
+    // RECOVERY — the cold spare, kept offline; signs nothing until it has to. Deliberately absent
+    // from CI, so a release it signs is built and published BY HAND — the launcher accepts it
+    // because of this entry, which is the entire reason the entry exists years before it is used.
+    TrustedKey {
+        id: [0x27, 0x5e, 0x5c, 0x3a, 0x13, 0x7b, 0xe3, 0x5a],
+        key: [
+            0x97, 0xa2, 0x0a, 0x20, 0xc8, 0xe1, 0x5e, 0x27, //
+            0x1a, 0x5a, 0xe4, 0x4a, 0xce, 0x2b, 0x0b, 0x72, //
+            0x7d, 0x4a, 0xe8, 0x42, 0xd1, 0x39, 0x33, 0x9b, //
+            0x84, 0xf0, 0xfc, 0xd3, 0x44, 0x93, 0xef, 0xc1,
+        ],
+    },
 ];
 
 /// Why a document is not believable. Typed (like `NetKind` and `UnsupportedSchema`) so the command
@@ -311,11 +328,15 @@ fn parse(text: &str) -> Result<Minisig<'_>, TrustError> {
     if !cr(untrusted).starts_with("untrusted comment:") {
         return Err(Malformed("the first line is not an untrusted comment"));
     }
+    // The prefix INCLUDES the space, and the space is not optional. Upstream's
+    // TRUSTED_COMMENT_PREFIX is "trusted comment: " and our producer refuses to parse a line
+    // without it, so accepting both spellings meant one signature could be written two ways that
+    // verify identically under one global signature — the exact malleability `b64` below is
+    // intolerant to avoid, and a place where this reader silently accepted what the producer
+    // would reject.
     let trusted = cr(trusted)
-        .strip_prefix("trusted comment:")
+        .strip_prefix("trusted comment: ")
         .ok_or(Malformed("the third line is not a trusted comment"))?;
-    // minisign's prefix includes one space, and the signed text is what follows it
-    let trusted = trusted.strip_prefix(' ').unwrap_or(trusted);
 
     let head = b64(cr(sig_line)).ok_or(Malformed("the signature line is not base64"))?;
     let head: [u8; 74] = head.try_into().map_err(|_| Malformed("the signature line is not 74 bytes"))?;
@@ -627,16 +648,20 @@ mod tests {
         assert_eq!(parse_floor(Some("42")), 42);
     }
 
-    /// The shipped table must never accept anything: it is placeholders until the real keys are
-    /// generated, and a placeholder that verified would be worse than no signing at all.
+    /// Naming a pinned key must not be enough to be believed — only signing as one is.
+    ///
+    /// Every pinned entry is forged in turn: a signature made by a key we hold the secret for,
+    /// stamped with the REAL key's id. The id is untrusted routing metadata, so the only thing
+    /// standing between this and acceptance is the signature check itself. If a refactor ever
+    /// reduced verification to "is this id in PINNED", nothing else in the suite would notice.
     #[test]
-    fn the_placeholder_keys_verify_nothing() {
+    fn naming_a_pinned_key_does_not_forge_its_signature() {
         for k in PINNED {
             let sig = sign(&TEST_SEED, k.id, *b"Ed", DOC, "as if");
             assert!(
                 matches!(verify(DOC, &sig), Err(TrustError::BadSignature)),
-                "key {} accepted something",
-                String::from_utf8_lossy(&k.id)
+                "key {} accepted a signature it did not make",
+                k.id.iter().map(|b| format!("{b:02x}")).collect::<String>()
             );
         }
     }

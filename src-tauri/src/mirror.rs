@@ -24,6 +24,14 @@ const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 /// The published mirror list, as a release asset and at every mirror's root.
 pub const MIRRORS_ASSET: &str = "mirrors.json";
 
+/// Whether a mirror can serve an INSTALL yet. False until a `Downloader` implementation for
+/// mirrors exists — today the only one is `Github` (`github.rs`), so ranking mirrors by throughput
+/// orders a list that no download consults. Flip this in the same change that adds that impl; it
+/// exists so the boot-time sweep's cost (a 512 KiB transfer and up to `PROBE_BUDGET` per source,
+/// every launch) is not paid for a result nothing can act on. A user-initiated sweep still
+/// measures, because there the cost is asked for.
+pub const MIRROR_DOWNLOADS_ENABLED: bool = false;
+
 /// How much of a real asset to pull. Comfortably past the ~16 KiB that throttling middleboxes have
 /// been observed to let through before choking a connection, so a path that only *looks* alive is
 /// measured as slow rather than reported as healthy.
@@ -214,41 +222,53 @@ fn rebuild(existing: &[Source], urls: &[String]) -> Vec<Source> {
 /// The published mirror list: a JSON array of base URLs.
 ///
 /// `Ok(None)` means no list is published — a different thing from `Ok(Some(vec![]))`, which is a
-/// publisher stating there are no mirrors. Read from the primary first, then from each enabled
-/// mirror, so the list stays refreshable when the main source is the unreachable one.
+/// publisher stating there are no mirrors.
+///
+/// THE PRIMARY IS AUTHORITATIVE WHENEVER IT ANSWERS. Mirrors are consulted only when it could not
+/// be REACHED, which is the case the fallback was written for. It used to fall through whenever
+/// the primary merely published no list — the ordinary state today — and since `refresh` replaces
+/// the source set wholesale with whatever comes back, any one enabled mirror could evict every
+/// sibling and install its own hosts, permanently, with the primary perfectly healthy. This
+/// document is unverified (there is no `mirrors` payload reader yet), so until there is one, who
+/// is allowed to author it is the only control available.
 ///
 /// The document describes MIRRORS ONLY. There is no element in it that could name, reorder or
 /// remove the primary source.
 fn fetch_published_mirrors(settings: &Settings) -> Result<Option<Vec<String>>> {
-    let mut last_err = None;
-    let mut published = false;
-
     // primary: the release asset
     let gh = Github::new(settings.token());
-    match gh.fetch_release(&settings.source_repo, None) {
-        Ok(release) => match release.asset(MIRRORS_ASSET) {
-            Some(a) => match gh.download(a).and_then(|b| parse_list(&b)) {
-                Ok(urls) => return Ok(Some(urls)),
-                Err(e) => last_err = Some(e),
-            },
-            // the release simply carries no list — that is today's normal, not a failure
-            None => published = true,
-        },
-        Err(e) => last_err = Some(e),
-    }
+    let last_err = match gh.fetch_release(&settings.source_repo, None) {
+        Ok(release) => {
+            return match release.asset(MIRRORS_ASSET) {
+                // Bounded like every other trust-adjacent fetch (see engine::manifest_of): this is
+                // a list of hosts the installer will later take bytes from, so its size is a trust
+                // input.
+                Some(a) => gh
+                    .download_limited(a, crate::trust::MAX_DOC_BYTES)
+                    .and_then(|b| parse_list(&b))
+                    .map(Some),
+                // Reached, and publishes no list. That is an ANSWER, not a gap.
+                None => Ok(None),
+            };
+        }
+        Err(e) => e,
+    };
 
+    let mut published = false;
     for url in settings.sources.iter().filter(|s| s.enabled()).filter_map(|s| s.url()) {
         match fetch_list_from_mirror(url) {
             Ok(Some(urls)) => return Ok(Some(urls)),
             Ok(None) => published = true,
-            Err(e) => last_err = Some(e),
+            Err(_) => {}
         }
     }
 
-    match last_err {
-        // every source we could reach agreed there is no list to read
-        Some(e) if !published => Err(e),
-        _ => Ok(None),
+    // The primary was unreachable and no mirror had a list either: report the primary's failure,
+    // which is the one worth showing, unless a mirror positively answered "there is none".
+    if published {
+        Ok(None)
+    } else {
+        Err(last_err)
     }
 }
 
@@ -343,7 +363,11 @@ fn probe_mirror(source: &Source, url: &str) -> Probe {
         Ok(r) => r,
         Err(e) => return Probe::failed(source, format!("releases.json: {}", short(e))),
     };
-    let releases: Vec<Release> = match resp.into_json() {
+    // Through `read_all`'s ceiling, NOT `into_json`: ureq bounds `into_string` but not
+    // `into_json`, which hands the whole body to serde as a stream — so an endless
+    // `releases.json` from a host we have not authenticated would run the process out of memory
+    // before the probe ever judged it. This is the least trusted input the launcher reads.
+    let releases: Vec<Release> = match read_all(resp).and_then(|b| Ok(serde_json::from_slice(&b)?)) {
         Ok(v) => v,
         Err(e) => return Probe::failed(source, format!("releases.json is not readable: {e}")),
     };

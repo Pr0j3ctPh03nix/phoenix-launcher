@@ -100,7 +100,16 @@ pub async fn auto_sweep_mirrors() -> Result<(), CmdError> {
         let settings = Settings::load();
         let (sources, _) = mirror::refresh(&settings);
 
-        if !settings.auto_pick_best || !mirror::has_new_mirror(&sources) {
+        // MEASURING is gated on a mirror actually being usable as a download source, which today
+        // it is not: there is no `Downloader` implementation for a mirror, so every installed byte
+        // comes from GitHub regardless of how this ranks. Until that exists, a boot-time sweep
+        // spends a 512 KiB transfer and up to ~8s PER SOURCE, on every launch, to order a list
+        // nothing reads. Refreshing the list is still worth doing — it is one request and it is
+        // what surfaces a newly published mirror in the settings pane.
+        if !mirror::MIRROR_DOWNLOADS_ENABLED
+            || !settings.auto_pick_best
+            || !mirror::has_new_mirror(&sources)
+        {
             return Settings::update(move |s| s.sources = sources).map_err(CmdError::from);
         }
 

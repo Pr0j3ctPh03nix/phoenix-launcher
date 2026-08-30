@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 //! Tauri desktop app. The window/UI is HTML/CSS/JS under ../frontend; the engine
-//! (config/downloader/github/manifest/install/state/steaminf/verify/engine) is UI-agnostic pure
-//! Rust. This binary is only wiring: the command layer (cmd/*), the webview wire contract
-//! (views.rs), and a headless CLI (cli.rs) for testing in debug builds.
+//! (config/downloader/github/manifest/install/state/steaminf/verify/engine, plus
+//! keep/trust/selfupdate/mirror/launch/autofind/fslock) is UI-agnostic pure Rust. This binary is
+//! only wiring: the command layer (cmd/*), the webview wire contract (views.rs), and a headless
+//! CLI (cli.rs) for testing in debug builds.
 //!
 //! i18n note: user-facing labels are derived in the frontend (it owns the language); the shell
 //! ships raw data + minimal hints (`primary_action`, `can_play`, …). Manifest labels pass through

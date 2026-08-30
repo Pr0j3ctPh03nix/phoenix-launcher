@@ -303,6 +303,12 @@ pub fn install(
             // caching the remaining assets (unselected variants, disabled toggles) is NOT done
             // here — it can be hundreds of MB of optional content and must not hold the install
             // result hostage. The shell runs warm_cache detached after this returns.
+            //
+            // The anti-rollback floor advances HERE, on a committed install, not when the manifest
+            // was merely read. Ratcheting on a check meant a release the user only looked at — or
+            // was offered and declined — floored them permanently, so yanking a bad release left
+            // every client that had polled once unable to accept the good one that preceded it.
+            engine::ratchet_installed(settings, crate::trust::Payload::Mod, &manifest);
             Ok(InstallReport {
                 version: manifest.version.clone(),
                 tag: release.tag_name.clone(),
@@ -1328,7 +1334,15 @@ fn clear_dir_files(dir: &Path) {
 /// "stock"), a false YES merely declines to preserve a genuine original. Read errors therefore
 /// answer YES.
 fn shim_cache_used(game_dir: &Path) -> bool {
-    let Ok(rd) = std::fs::read_dir(game_dir.join(CACHE_DIR)) else { return false };
+    // NotFound is the ONE error that genuinely means no: there is no cache, so nothing was ever
+    // staged through it. Anything else (ACL, I/O) means we cannot tell, and per the asymmetry
+    // above "cannot tell" has to answer YES. Treating every error as `false` did exactly the
+    // damaging thing this doc comment says is avoided.
+    let rd = match std::fs::read_dir(game_dir.join(CACHE_DIR)) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
     rd.flatten().any(|e| e.file_type().map(|t| t.is_file()).unwrap_or(true))
 }
 

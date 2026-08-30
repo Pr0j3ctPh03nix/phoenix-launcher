@@ -257,10 +257,27 @@ pub fn manifest_of(
         .with_context(|| format!("verifying {MANIFEST_ASSET}"))?;
 
     let manifest = Manifest::parse(&bytes)?;
-    let serial = trust::accept(payload, &manifest, settings.serial_floor(payload))
-        .map_err(anyhow::Error::new)?;
-    ratchet(settings, payload, serial);
+    // Checked against the floor, but NOT advanced past it — see `ratchet_installed`. Reading a
+    // manifest is not consenting to it: this same call backs every poll, every "check for
+    // updates", and every self-update offer the user goes on to decline.
+    trust::accept(payload, &manifest, settings.serial_floor(payload)).map_err(anyhow::Error::new)?;
     Ok(manifest)
+}
+
+/// Advance the anti-rollback floor for a payload that has actually been INSTALLED.
+///
+/// Split from `manifest_of` deliberately. The floor is permanent and machine-wide, so what raises
+/// it has to be an act the user committed to, not one they merely performed a lookup for. With it
+/// on the read path, a release that was fetched and then rejected — by the user, or by a failure
+/// later in the install — still floored the machine, and pulling that release left every client
+/// that had polled once refusing the older good one with no in-band fix.
+///
+/// Takes the manifest rather than a bare serial so a caller cannot ratchet to a number that did
+/// not come from a verified document.
+pub fn ratchet_installed(settings: &Settings, payload: Payload, manifest: &Manifest) {
+    if let Some(serial) = manifest.serial {
+        ratchet(settings, payload, serial);
+    }
 }
 
 /// Remember that this payload has been seen at `serial`, so nothing older is ever accepted again.
@@ -578,13 +595,19 @@ pub fn plan(
     // What WE last wrote at each dest, and which bytes the user has approved there. Together they
     // answer the question a bare manifest comparison cannot: a file that matches neither the
     // manifest nor our own record was changed by somebody else, and is not ours to overwrite.
-    let ours: HashSet<(&str, &str)> = prev
-        .map(|p| p.files.iter().map(|f| (f.dest.as_str(), f.sha256.as_str())).collect())
-        .unwrap_or_default();
+    //
+    // ONE map answers all three questions this pass asks — "did we place this dest?" is
+    // `contains_key`, "are these exactly the bytes we wrote?" is `get(..) == Some(&h)`, and
+    // `baseline` reads the recorded hash directly. They were three collections built from three
+    // traversals of the same Vec, two of them holding identical (dest, sha256) pairs; a dest
+    // cannot legitimately be in one and not another, so any divergence between them could only
+    // ever have been a silent misclassification of somebody's modified file.
     let keep = crate::keep::KeepList::load(game_dir);
     let prev_sha: std::collections::HashMap<&str, &str> = prev
         .map(|p| p.files.iter().map(|f| (f.dest.as_str(), f.sha256.as_str())).collect())
         .unwrap_or_default();
+    let placed = |dest: &str| prev_sha.contains_key(dest);
+    let ours = |dest: &str, h: &str| prev_sha.get(dest) == Some(&h);
     // What this file's current state was decided against: the release version its pin was weighed
     // over, or — with no pin — the bytes we recorded installing.
     let baseline = |dest: &str| -> Option<&str> {
@@ -593,14 +616,11 @@ pub fn plan(
             .and_then(|p| p.theirs())
             .or_else(|| prev_sha.get(dest).copied())
     };
-    // Only dests we have actually written can be "modified by the user" — see `classify`.
-    let placed: HashSet<&str> =
-        prev.map(|p| p.files.iter().map(|f| f.dest.as_str()).collect()).unwrap_or_default();
 
     // How a local hash that is NOT the manifest's reads. Split out because the removal pass below
     // has to ask the same question about the same file, and the two answers must never diverge.
     let classify = |dest: &str, h: &str, theirs: &str| {
-        if !placed.contains(dest) || ours.contains(&(dest, h)) {
+        if !placed(dest) || ours(dest, h) {
             // Not a file we placed (a genuine pre-existing one — `back_up` preserves it into the
             // vanilla store on displacement, which is what makes installing over it reversible),
             // or exactly the bytes we last wrote. Either way, ours to replace.
@@ -628,7 +648,7 @@ pub fn plan(
                 // "not anybody's bytes we know" are different verdicts, and only the hash can
                 // tell them apart. That set is a handful of files, not the base game's 4,635.
                 Err(_) => Action::Update,
-                Ok(md) if md.len() != f.size && !placed.contains(f.dest.as_str()) => Action::Update,
+                Ok(md) if md.len() != f.size && !placed(f.dest.as_str()) => Action::Update,
                 Ok(_) => match verify::sha256_file_cached(&local) {
                     Ok(h) if h == f.sha256 => Action::UpToDate,
                     Ok(h) => {
@@ -673,7 +693,7 @@ pub fn plan(
     // A dest we never placed keeps its `Remove` (commit preserves it into the vanilla store, so
     // that path is already reversible); only our own files can be modified out from under us.
     let removal_action = |dest: &str| match verify::sha256_file_cached(&game_dir.join(dest)) {
-        Ok(h) if placed.contains(dest) && !ours.contains(&(dest, h.as_str())) => None,
+        Ok(h) if placed(dest) && !ours(dest, h.as_str()) => None,
         // unreadable: it was ours by record, and a read failure is not evidence of a change
         _ => Some(Action::Remove),
     };

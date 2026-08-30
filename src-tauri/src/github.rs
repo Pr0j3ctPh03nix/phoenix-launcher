@@ -234,8 +234,21 @@ impl Downloader for Github {
             }
         }
         let resp = asset_response(self, asset, (prefix > 0).then(|| format!("bytes={prefix}-")))?;
-        if prefix > 0 && resp.status() != 206 {
-            prefix = 0; // server declined the Range — restart from zero
+        // A 206 is only usable if it is the range we ASKED for. The status alone says "partial",
+        // not "partial from `prefix`" — a peer answering 206 with a different offset would have
+        // its bytes appended at `prefix`, producing a plausibly-sized file that fails only at the
+        // final hash, and burning the one clean restart a resume gets. Absent Content-Range is
+        // treated as a decline for the same reason: unverifiable is not the same as correct.
+        let range_ok = prefix == 0
+            || (resp.status() == 206
+                && resp
+                    .header("Content-Range")
+                    .and_then(|v| v.split_whitespace().nth(1))
+                    .and_then(|v| v.split('-').next())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    == Some(prefix));
+        if !range_ok {
+            prefix = 0; // server declined the Range, or answered a different one — restart at zero
             hasher = Sha256::new();
         }
         let total: Option<u64> = resp
