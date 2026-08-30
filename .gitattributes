@@ -1,0 +1,8 @@
+# Signed fixtures are BYTES, not text.
+#
+# A signature covers the exact bytes it was made over, so any normalisation git applies on
+# checkout — CRLF<->LF being the one that fires on Windows — produces a file that no longer
+# verifies. The failure is nasty in the specific way it presents: the machine that generated the
+# fixture still passes, and only a fresh clone fails, which reads as a broken verifier rather than
+# a mangled input.
+src-tauri/tests/interop/* -text
