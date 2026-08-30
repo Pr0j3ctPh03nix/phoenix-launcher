@@ -165,6 +165,8 @@ impl std::error::Error for TrustError {}
 pub enum Payload {
     /// The dist repo — the shim and its game files.
     Mod,
+    /// The launcher's own releases (self-update).
+    Launcher,
     /// The base game.
     Game,
 }
@@ -174,6 +176,7 @@ impl Payload {
     pub fn id(self) -> &'static str {
         match self {
             Self::Mod => "mod",
+            Self::Launcher => "launcher",
             Self::Game => "game",
         }
     }
@@ -182,6 +185,7 @@ impl Payload {
     pub fn baked_min_serial(self) -> u64 {
         match self {
             Self::Mod => MIN_SERIAL_MOD,
+            Self::Launcher => MIN_SERIAL_LAUNCHER,
             Self::Game => MIN_SERIAL_GAME,
         }
     }
@@ -204,6 +208,7 @@ impl Payload {
 /// `PHOENIX_MIN_SERIAL_MOD=v42` stops the build instead of quietly shipping a launcher whose
 /// backstop is missing — which is precisely the situation nobody would notice.
 const MIN_SERIAL_MOD: u64 = parse_floor(option_env!("PHOENIX_MIN_SERIAL_MOD"));
+const MIN_SERIAL_LAUNCHER: u64 = parse_floor(option_env!("PHOENIX_MIN_SERIAL_LAUNCHER"));
 const MIN_SERIAL_GAME: u64 = parse_floor(option_env!("PHOENIX_MIN_SERIAL_GAME"));
 
 /// Decimal parse in const context: absent is 0, anything that is not a non-empty run of ASCII

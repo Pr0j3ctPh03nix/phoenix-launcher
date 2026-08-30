@@ -91,7 +91,7 @@ pub async fn launcher_update(
             let _ = handle.emit("launcher-progress", LauncherProgress { bytes_done, bytes_total });
             true // nothing cancels a self-update mid-flight; the swap only happens after verify
         };
-        let exe = selfupdate::apply(dl.as_ref(), &release, &mut emit).map_err(CmdError::from)?;
+        let exe = selfupdate::apply(&s, dl.as_ref(), &release, &mut emit).map_err(CmdError::from)?;
 
         // A detached cache warm may still be streaming optional content. Exiting would abort it
         // anyway (it is best-effort and resumable), but stopping it deliberately keeps the handoff

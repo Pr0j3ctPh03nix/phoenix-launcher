@@ -15,17 +15,21 @@
 //! Step 5 cannot happen in the outgoing process: its own image stays locked until it exits, so
 //! the deletion has to outlive it (`cleanup_old`, called at startup).
 //!
-//! Nothing is swapped before the download is verified against the release's sha256 sidecar.
+//! Nothing is swapped before the download is verified against a hash the release committed to.
 //! Writing a truncated or corrupt exe over a working launcher leaves the user with neither a
 //! launcher nor a way back, so this mirrors install.rs: no unverified byte is ever committed.
+//!
+//! WHERE that hash comes from has two answers, and the order matters — see `expected_sha`.
 
 use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::config::Settings;
 use crate::downloader::{Asset, ChunkProgress, Downloader, Release};
-use crate::engine::version_lt;
+use crate::engine::{self, version_lt};
+use crate::trust::Payload;
 
 /// The launcher binary published by release.yml, and the checksum sidecar beside it.
 const EXE_ASSET: &str = "phoenix-launcher.exe";
@@ -89,18 +93,29 @@ pub fn available(release: &Release) -> Option<Available> {
 ///
 /// Installing the release the user was SHOWN (rather than re-resolving "latest" here) is
 /// deliberate: what the update button offers is what the update button installs.
-pub fn apply(dl: &dyn Downloader, release: &Release, progress: ChunkProgress) -> Result<PathBuf> {
-    apply_at(&exe_path()?, dl, release, progress)
+pub fn apply(
+    settings: &Settings,
+    dl: &dyn Downloader,
+    release: &Release,
+    progress: ChunkProgress,
+) -> Result<PathBuf> {
+    apply_at(&exe_path()?, settings, dl, release, progress)
 }
 
 /// `apply` with the target injected, so tests can drive the whole path — download, verify, swap,
 /// rollback — against a scratch file instead of the running test binary.
-fn apply_at(exe: &Path, dl: &dyn Downloader, release: &Release, progress: ChunkProgress) -> Result<PathBuf> {
+fn apply_at(
+    exe: &Path,
+    settings: &Settings,
+    dl: &dyn Downloader,
+    release: &Release,
+    progress: ChunkProgress,
+) -> Result<PathBuf> {
     let dir = exe.parent().context("the launcher executable has no parent directory")?;
     ensure_dir_writable(dir)?;
 
     let asset = exe_asset(release)?;
-    let expected = expected_sha(dl, release, &asset.name)?;
+    let expected = expected_sha(settings, dl, release, &asset.name)?;
 
     let new = sibling(exe, ".new.exe");
     // Deliberately never resumed. A `.part` left by an earlier attempt at a DIFFERENT version
@@ -167,11 +182,70 @@ fn exe_asset(release: &Release) -> Result<&Asset> {
     Ok(first)
 }
 
-/// The release's published sha256 for the CHOSEN exe asset. REQUIRED: a release without the
-/// sidecar fails loudly (the user can still download it by hand) instead of swapping in an
-/// unchecked binary. `<chosen>.sha256` first, so the renamed-exe fallback of `exe_asset` can
-/// still verify; the canonical name stays as the fallback.
-fn expected_sha(dl: &dyn Downloader, release: &Release, exe_name: &str) -> Result<String> {
+/// The hash the release commits to for the CHOSEN exe asset. Never optional: a release that
+/// commits to nothing fails loudly (the user can still download it by hand) instead of swapping in
+/// an unchecked binary.
+///
+/// TWO sources, and the SIGNED one wins. A `.minisig` over the launcher's manifest is a statement
+/// by a key we pinned; the `.sha256` sidecar is a statement by whoever served the release, which
+/// is exactly the party a mirror lets somebody else be. The sidecar is nonetheless still read, and
+/// release.yml must keep publishing it: launchers already installed check it and nothing else, and
+/// self-update is the one path that has to keep working for builds that predate every change made
+/// to it.
+///
+/// KNOWN AND DELIBERATE GAP: a release publishing no manifest at all falls back to the sidecar, so
+/// an attacker who can choose what we see can strip the signed pair and be believed on the weaker
+/// evidence. Closing it means refusing every release cut before signing existed — i.e. refusing to
+/// self-update the builds that most need to. It closes on its own once a floor can be baked
+/// (`PHOENIX_MIN_SERIAL_LAUNCHER`), because a floor above the last unsigned release makes the
+/// unsigned path unreachable. A release that publishes a manifest WITHOUT a signature is a
+/// different matter and is refused outright — that shape is only ever tampering.
+fn expected_sha(
+    settings: &Settings,
+    dl: &dyn Downloader,
+    release: &Release,
+    exe_name: &str,
+) -> Result<String> {
+    if let Some(sha) = signed_sha(settings, dl, release, exe_name)? {
+        return Ok(sha);
+    }
+    legacy_sha(dl, release, exe_name)
+}
+
+/// The exe's hash out of the launcher payload's signed manifest, or `None` when this release
+/// publishes no manifest to read.
+///
+/// Everything else — a signature that is missing, bad, from an unknown key, or over a document
+/// that names a different payload — is an ERROR, not a fallback. Silently dropping to the sidecar
+/// on a failed check would make the signature decorative: a downgrade would cost an attacker one
+/// deleted file.
+///
+/// The entry's `dest` is deliberately not consulted. A launcher payload installs nothing into a
+/// game folder; the producer still emits a legal `dest` because the format demands one, and the
+/// only thing this reads is the hash beside the asset name it already chose.
+fn signed_sha(
+    settings: &Settings,
+    dl: &dyn Downloader,
+    release: &Release,
+    exe_name: &str,
+) -> Result<Option<String>> {
+    if release.asset(engine::MANIFEST_ASSET).is_none() {
+        return Ok(None);
+    }
+    let manifest = engine::manifest_of(settings, dl, release, Payload::Launcher)?;
+    let entry = manifest
+        .files
+        .iter()
+        .find(|f| f.name.as_deref() == Some(exe_name))
+        .with_context(|| {
+            format!("the signed manifest of {} does not name {exe_name}", release.tag_name)
+        })?;
+    Ok(Some(entry.sha256.clone()))
+}
+
+/// The release's published sha256 sidecar. `<chosen>.sha256` first, so the renamed-exe fallback of
+/// `exe_asset` can still verify; the canonical name stays as the fallback.
+fn legacy_sha(dl: &dyn Downloader, release: &Release, exe_name: &str) -> Result<String> {
     let sidecar = format!("{exe_name}.sha256");
     let asset = release.asset(&sidecar).or_else(|| release.asset(SHA_ASSET)).with_context(|| {
         format!(
@@ -448,7 +522,16 @@ mod tests {
 
     /// A scratch dir holding a stand-in "installed launcher", plus a fake release serving `body`
     /// as the new exe with a matching (or deliberately wrong) checksum sidecar.
+    ///
+    /// LEGACY-SHAPED on purpose (`no_manifest`): this is every launcher release cut before signing
+    /// existed, and the sidecar path these tests cover has to keep working for exactly those. The
+    /// signed shape is `stage_signed` below.
     fn stage(name: &str, body: &[u8], sha: Option<&str>) -> (PathBuf, crate::downloader::fake::Fake) {
+        let (dir, fake) = stage_raw(name, body, sha);
+        (dir, fake.no_manifest())
+    }
+
+    fn stage_raw(name: &str, body: &[u8], sha: Option<&str>) -> (PathBuf, crate::downloader::fake::Fake) {
         use sha2::Digest;
         let dir = std::env::temp_dir().join(name);
         let _ = std::fs::remove_dir_all(&dir);
@@ -465,12 +548,54 @@ mod tests {
         (dir, fake)
     }
 
+    /// A signed launcher release: the manifest names the exe asset and its hash, and the sidecar
+    /// says something ELSE. Only a reader that actually prefers the signed manifest installs it.
+    fn stage_signed(
+        name: &str,
+        body: &[u8],
+        manifest_sha: &str,
+        payload: &str,
+    ) -> (PathBuf, crate::downloader::fake::Fake) {
+        let dir = std::env::temp_dir().join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("phoenix-launcher.exe"), b"OLD LAUNCHER").unwrap();
+        // a sidecar that disagrees with the manifest: whichever hash the exe is checked against
+        // decides whether this release installs, so the test can see which one was used
+        let sidecar = format!("{}  {EXE_ASSET}\n", "a".repeat(64));
+        let manifest = serde_json::json!({
+            "schema": 2,
+            "payload_id": payload,
+            // above the baked floor, whatever a release build set it to
+            "serial": Payload::Launcher.baked_min_serial() + 3,
+            "version": "999.0.0",
+            "files": [{
+                "name": EXE_ASSET,
+                // meaningless for this payload and never read — the format simply requires one
+                "dest": "phoenix-launcher.exe",
+                "sha256": manifest_sha,
+                "size": body.len(),
+            }]
+        })
+        .to_string();
+        let fake = crate::downloader::fake::Fake::new(
+            "v999.0.0",
+            &manifest,
+            vec![(EXE_ASSET, body), (SHA_ASSET, sidecar.as_bytes())],
+        );
+        (dir, fake)
+    }
+
+    fn settings() -> Settings {
+        Settings::default()
+    }
+
     #[test]
     fn apply_downloads_verifies_and_swaps() {
         let (dir, fake) = stage("phoenix-selfupdate-apply", b"MZ\x90\x00NEW LAUNCHER", None);
         let exe = dir.join("phoenix-launcher.exe");
         let mut ticks = 0;
-        let out = apply_at(&exe, &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| {
+        let out = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| {
             ticks += 1;
             true
         })
@@ -490,7 +615,7 @@ mod tests {
         // BEFORE the swap, or the user is left with a launcher that cannot start
         let (dir, fake) = stage("phoenix-selfupdate-corrupt", b"MZ\x90\x00NEW", Some(&"a".repeat(64)));
         let exe = dir.join("phoenix-launcher.exe");
-        let err = apply_at(&exe, &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true).unwrap_err();
+        let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true).unwrap_err();
 
         assert!(format!("{err:#}").contains("checksum mismatch"), "got: {err:#}");
         assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER", "the working launcher is untouched");
@@ -506,9 +631,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("phoenix-launcher.exe");
         std::fs::write(&exe, b"OLD LAUNCHER").unwrap();
-        let fake = crate::downloader::fake::Fake::new("v999.0.0", "{}", vec![(EXE_ASSET, b"MZ\x90\x00")]);
+        let fake = crate::downloader::fake::Fake::new("v999.0.0", "{}", vec![(EXE_ASSET, b"MZ\x90\x00")])
+            .no_manifest();
 
-        let err = apply_at(&exe, &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true).unwrap_err();
+        let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true).unwrap_err();
         assert!(format!("{err:#}").contains(SHA_ASSET), "got: {err:#}");
         assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER");
         let _ = std::fs::remove_dir_all(&dir);
@@ -522,7 +648,7 @@ mod tests {
         let exe = dir.join("phoenix-launcher.exe");
         std::fs::write(sibling(&exe, ".new.exe"), b"JUNK FROM AN OLDER ATTEMPT").unwrap();
 
-        apply_at(&exe, &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true).unwrap();
+        apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true).unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), b"MZ\x90\x00NEW LAUNCHER");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -541,6 +667,143 @@ mod tests {
         assert_eq!(std::fs::read(&exe).unwrap(), b"NEW");
         assert!(!new.exists(), "the staged file is consumed by the swap");
         assert_eq!(std::fs::read(sibling(&exe, ".old.exe")).unwrap(), b"OLD");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- signed launcher releases ----
+
+    /// The signed manifest and the sidecar disagree, and the signed one decides. If it did not,
+    /// signing the launcher payload would be decoration: whoever serves the release also serves
+    /// the sidecar.
+    #[test]
+    fn a_signed_manifest_outranks_the_sha256_sidecar() {
+        use sha2::Digest;
+        let body: &[u8] = b"MZ\x90\x00NEW LAUNCHER";
+        let (dir, fake) = stage_signed(
+            "phoenix-selfupdate-signed",
+            body,
+            &hex::encode(sha2::Sha256::digest(body)),
+            "launcher",
+        );
+        let exe = dir.join("phoenix-launcher.exe");
+        apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), body);
+
+        // and the same release with a manifest hash that is WRONG does not install, however
+        // agreeable the sidecar might have been — the sidecar is never consulted at all
+        let (dir2, fake) =
+            stage_signed("phoenix-selfupdate-signed-bad", body, &"b".repeat(64), "launcher");
+        let exe2 = dir2.join("phoenix-launcher.exe");
+        let err = apply_at(&exe2, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("checksum mismatch"), "got: {err:#}");
+        assert_eq!(std::fs::read(&exe2).unwrap(), b"OLD LAUNCHER");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// Stripping the signature must not be a way to be believed on the sidecar instead. A release
+    /// that publishes a manifest and no `.minisig` is refused — that shape is only ever tampering,
+    /// which is what makes it different from a release publishing no manifest at all (below).
+    #[test]
+    fn a_manifest_without_a_signature_is_refused_rather_than_downgraded() {
+        use sha2::Digest;
+        let body: &[u8] = b"MZ\x90\x00NEW LAUNCHER";
+        let (dir, fake) = stage_signed(
+            "phoenix-selfupdate-stripped",
+            body,
+            &hex::encode(sha2::Sha256::digest(body)),
+            "launcher",
+        );
+        let fake = fake.unsigned();
+        let exe = dir.join("phoenix-launcher.exe");
+        let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no signature"), "got: {err:#}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER");
+        assert!(!sibling(&exe, ".new.exe").exists(), "nothing was even downloaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A manifest edited after it was signed fails the signature, not the exe checksum — the
+    /// refusal has to happen before anything in that document is believed.
+    #[test]
+    fn an_edited_signed_manifest_is_refused() {
+        use sha2::Digest;
+        let body: &[u8] = b"MZ\x90\x00NEW LAUNCHER";
+        let (dir, mut fake) = stage_signed(
+            "phoenix-selfupdate-edited",
+            body,
+            &hex::encode(sha2::Sha256::digest(body)),
+            "launcher",
+        );
+        // swap in a hash of the attacker's choosing, leaving the signature where it was
+        let doc = String::from_utf8(fake.assets["manifest.json"].clone()).unwrap();
+        let edited = doc.replace(&hex::encode(sha2::Sha256::digest(body)), &"c".repeat(64));
+        assert_ne!(edited, doc);
+        fake.assets.insert("manifest.json".into(), edited.into_bytes());
+
+        let exe = dir.join("phoenix-launcher.exe");
+        let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("does not match the file"), "got: {err:#}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A validly signed manifest for a DIFFERENT payload is still one of ours. Serving the mod
+    /// manifest here would otherwise hand self-update a document full of legitimate hashes for
+    /// files that are not launchers.
+    #[test]
+    fn a_manifest_for_another_payload_is_refused() {
+        use sha2::Digest;
+        let body: &[u8] = b"MZ\x90\x00NEW LAUNCHER";
+        let (dir, fake) = stage_signed(
+            "phoenix-selfupdate-wrong-payload",
+            body,
+            &hex::encode(sha2::Sha256::digest(body)),
+            "mod",
+        );
+        let exe = dir.join("phoenix-launcher.exe");
+        let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("\"launcher\" was asked for"), "got: {err:#}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A signed manifest that says nothing about the exe we chose is not an excuse to fall back —
+    /// it is a broken release, and guessing which hash it meant is the one thing we must not do.
+    #[test]
+    fn a_signed_manifest_that_does_not_name_the_exe_is_refused() {
+        let body: &[u8] = b"MZ\x90\x00NEW LAUNCHER";
+        let (dir, fake) = stage_signed("phoenix-selfupdate-unnamed", body, &"d".repeat(64), "launcher");
+        // the manifest's one entry names a different asset. Re-signed rather than edited in
+        // place, so this tests the missing ENTRY and not a broken signature.
+        let doc = String::from_utf8(fake.assets["manifest.json"].clone())
+            .unwrap()
+            .replace(EXE_ASSET, "something-else.exe");
+        let fake = crate::downloader::fake::Fake::new("v999.0.0", &doc, vec![(EXE_ASSET, body)]);
+        let exe = dir.join("phoenix-launcher.exe");
+        let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("does not name"), "got: {err:#}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The legacy shape — no manifest at all — still installs from the sidecar. Every launcher in
+    /// the wild predates signing, and refusing them would strand exactly the builds that most need
+    /// to update. (See `expected_sha` for how that gap closes.)
+    #[test]
+    fn a_release_that_predates_signing_still_installs_from_the_sidecar() {
+        let (dir, fake) = stage("phoenix-selfupdate-legacy", b"MZ\x90\x00NEW LAUNCHER", None);
+        assert!(fake.fetch_release("r", None).unwrap().asset("manifest.json").is_none());
+        let exe = dir.join("phoenix-launcher.exe");
+        apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"MZ\x90\x00NEW LAUNCHER");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

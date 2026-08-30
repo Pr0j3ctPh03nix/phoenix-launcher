@@ -179,6 +179,14 @@ pub mod fake {
             self
         }
 
+        /// Publish no manifest at all — the shape of every launcher release cut before signing
+        /// existed, which self-update still has to be able to install from.
+        pub fn no_manifest(mut self) -> Self {
+            self.assets.remove("manifest.json");
+            self.assets.remove("manifest.json.minisig");
+            self
+        }
+
         /// Publish the manifest with no signature beside it. A release that says something and
         /// declines to sign it is what an attacker stripping the signature produces, so it is a
         /// distinct case from publishing nothing.
