@@ -501,7 +501,8 @@ pub struct CmdError {
 }
 
 /// Classify an anyhow chain: a `NetKind` from the transport edge wins, then the typed markers
-/// (`UnsupportedSchema`, `GameRunning`), then any io error; anything else is internal.
+/// (`UnsupportedSchema`, `TrustError`, `GameRunning`), then any io error; anything else is
+/// internal.
 fn wire_kind(e: &anyhow::Error) -> &'static str {
     for c in e.chain() {
         if let Some(n) = c.downcast_ref::<NetKind>() {

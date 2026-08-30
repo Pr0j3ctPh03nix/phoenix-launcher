@@ -253,7 +253,11 @@ fn legacy_sha(dl: &dyn Downloader, release: &Release, exe_name: &str) -> Result<
             release.tag_name
         )
     })?;
-    let bytes = dl.download(asset).context("downloading the launcher checksum")?;
+    // bounded for the same reason a signature file is: this decides which bytes get executed,
+    // and one line of hex is all it is ever allowed to be
+    let bytes = dl
+        .download_limited(asset, crate::trust::MAX_SIG_BYTES)
+        .context("downloading the launcher checksum")?;
     let text = String::from_utf8(bytes).context("the launcher checksum file is not valid UTF-8")?;
     // accepts a bare digest and `sha256sum` style ("<hex>  <name>") alike
     let hex = text.split_whitespace().next().unwrap_or_default().to_ascii_lowercase();
