@@ -38,7 +38,11 @@ window.addEventListener("load", () => {
 
     if (h.startsWith("settings")) {
       await openSettings();
-      setSettingsTab(h.split(":")[1] || "general"); // settings:general | :launch | :files
+      const tab = h.split(":")[1] || "general"; // settings:general | :launch | :mirrors | :files
+      setSettingsTab(tab === "probed" ? "mirrors" : tab);
+      // settings:probed — the mirrors pane AFTER a sweep, which is the state that actually carries
+      // measurements and verdict colours. The stub's sweep_mirrors resolves immediately.
+      if (tab === "probed") await sweepMirrors();
     } else if (h === "autoexec") {
       // the editor over the stub's cfg, which includes pinned-convar lines — the strikethrough
       // and the notice under the editor are the point of this screen

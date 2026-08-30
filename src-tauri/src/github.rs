@@ -49,6 +49,23 @@ impl Github {
             no_redirect: agent(0),
         }
     }
+
+    /// The first `bytes` of an asset, for the mirror probe: whether the range was honoured (206)
+    /// and the body reader.
+    ///
+    /// It goes through `asset_response` rather than fetching the URL directly so it takes the
+    /// exact path a real download takes — including the authenticated API request and the hop to
+    /// pre-signed storage. That hop is a different host from `api.github.com` and is where a
+    /// throttled or filtered link actually bites, so a probe that skipped it would measure a route
+    /// no download ever uses.
+    pub fn ranged_asset(
+        &self,
+        asset: &Asset,
+        bytes: u64,
+    ) -> Result<(bool, Box<dyn Read + Send + Sync + 'static>)> {
+        let resp = asset_response(self, asset, Some(format!("bytes=0-{}", bytes.saturating_sub(1))))?;
+        Ok((resp.status() == 206, resp.into_reader()))
+    }
 }
 
 fn agent(redirects: u32) -> ureq::Agent {
@@ -112,15 +129,13 @@ fn net_err_redacted(e: ureq::Error, what: &str) -> anyhow::Error {
 /// Private (token): the API asset URL with `Accept: application/octet-stream`, then follow the 302
 /// to storage WITHOUT forwarding the Authorization header — the storage URL is pre-signed and 403s
 /// if it sees one.
-/// `resume_from` > 0 adds a Range header; the answer is then 206, or 200 if the server declined
-/// to resume (the caller restarts from zero in that case).
-fn asset_response(gh: &Github, asset: &Asset, resume_from: u64) -> Result<ureq::Response> {
-    let range = |req: ureq::Request| {
-        if resume_from > 0 {
-            req.set("Range", &format!("bytes={resume_from}-"))
-        } else {
-            req
-        }
+/// `range` is a ready `Range` header value (`bytes=N-`, `bytes=0-N`) or None for the whole asset.
+/// With one set the answer is 206, or 200 if the server declined it (a resuming caller then
+/// restarts from zero).
+fn asset_response(gh: &Github, asset: &Asset, range: Option<String>) -> Result<ureq::Response> {
+    let range = |req: ureq::Request| match &range {
+        Some(v) => req.set("Range", v),
+        None => req,
     };
     let Some(t) = gh.token.as_deref() else {
         return range(gh.agent.get(&asset.browser_download_url).set("User-Agent", UA)).call().map_err(net_err);
@@ -186,7 +201,7 @@ impl Downloader for Github {
     /// Download an asset into memory (small files, e.g. manifest.json).
     fn download(&self, asset: &Asset) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        asset_response(self, asset, 0)?.into_reader().read_to_end(&mut buf)?;
+        asset_response(self, asset, None)?.into_reader().read_to_end(&mut buf)?;
         Ok(buf)
     }
 
@@ -204,7 +219,7 @@ impl Downloader for Github {
                 std::io::copy(&mut f.take(prefix), &mut hasher)?;
             }
         }
-        let resp = asset_response(self, asset, prefix)?;
+        let resp = asset_response(self, asset, (prefix > 0).then(|| format!("bytes={prefix}-")))?;
         if prefix > 0 && resp.status() != 206 {
             prefix = 0; // server declined the Range — restart from zero
             hasher = Sha256::new();

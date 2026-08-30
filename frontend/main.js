@@ -18,6 +18,10 @@ const state = {
   hasToken: false,
   renderer: "dx11",
   launchFlags: [],    // [{id, args, enabled}] as loaded from settings, toggled in place
+  sources: [],         // [{kind, url, enabled}] in priority order, from the backend. DISCOVERED,
+                       // not authored, and INSTANT-APPLY — absent from settingsSnapshot()
+  mirrorProbes: {},    // sourceKey -> last probe. Session-only; an unswept source has none
+  mirrorSweeping: false, // a sweep is in flight (double-start guard)
   afTarget: null,      // "setup" | "settings" — where an autofind pick lands
   afUnlisten: null,
   afBusy: false,       // a scan invoke is in flight (double-start guard)
@@ -1022,8 +1026,191 @@ function renderLaunchFlags() {
   }
 }
 
+// ---- download sources ----
+// Instant-apply, like language and animations: every edit here writes through immediately, so
+// sources never appear in settingsSnapshot() and Save has nothing to do with them.
+//
+// The list is discovered, not authored — mirrors arrive in the published mirrors.json and the only
+// choice a user makes about one is whether to use it. The primary has no switch at all.
+
+// Probes are keyed by this, not by url: the primary has none, and a sentinel URL would be a lie
+// waiting to collide with a real mirror.
+function sourceKey(s) {
+  return s.kind === "primary" ? "@primary" : s.url;
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+function fmtSpeed(bps) {
+  const mib = bps / (1024 * 1024);
+  return mib >= 1 ? `${mib.toFixed(1)} MiB/s` : `${Math.max(1, Math.round(bps / 1024))} KiB/s`;
+}
+
+// The second line of a row: the last sweep's verdict, or what the source is when never measured.
+// Speed leads because it is what a source is chosen on — a latency figure alone is exactly the
+// reassuring number that a throttled path still passes.
+function mirrorMeta(s) {
+  const p = state.mirrorProbes[sourceKey(s)];
+  if (!p) {
+    if (s.kind === "primary") return { text: t("mirror.primaryHint"), cls: "" };
+    // "acknowledged but not tested" — the state auto-pick leaves behind when it is switched off,
+    // and the reason the manual button exists
+    return { text: s.measured ? s.url : `${t("mirror.untested")} · ${s.url}`, cls: "" };
+  }
+  // Localized verdict + the backend's raw diagnosis, the same grammar onError() uses: the reason
+  // comes from Rust and is English, so on its own it would be the one untranslated line in the pane.
+  if (!p.healthy) {
+    const why = t("mirror.unusable");
+    return { text: p.error ? `${why} · ${p.error}` : why, cls: "bad" };
+  }
+  const bits = [p.bytesPerSec ? fmtSpeed(p.bytesPerSec) : "—", `${p.latencyMs} ms`];
+  if (p.tag) bits.push(p.tag);
+  // no resume means a dropped connection restarts the whole file — on a multi-GiB download that
+  // is the difference between finishing and not, so it is called out rather than folded into "ok"
+  if (!p.rangeOk) bits.push(t("mirror.noResume"));
+  return { text: bits.join(" · "), cls: p.rangeOk ? "good" : "" };
+}
+
+function renderMirrors() {
+  const list = $("mirror-list");
+  list.innerHTML = "";
+  $("mirror-empty").classList.toggle("hidden", state.sources.some((s) => s.kind === "mirror"));
+  for (const s of state.sources) {
+    const primary = s.kind === "primary";
+    const row = document.createElement("div");
+    // `active` is resolved by the BACKEND (config::active_index) — the same call the download path
+    // makes — so the pane can never disagree with it about which source is in use.
+    row.className = "mirror-row" + (s.enabled ? " on" : "") + (s.active ? " current" : "");
+    row.tabIndex = 0;
+    row.setAttribute("role", "button");
+    row.title = t("mirror.pickTip");
+
+    const text = document.createElement("div");
+    text.className = "mirror-text";
+    const host = document.createElement("span");
+    host.className = "mirror-host";
+    // the primary is deliberately nameless — which repo it is is not the user's concern here
+    host.textContent = primary ? t("mirror.primary") : hostOf(s.url);
+    if (!primary) host.title = s.url; // the full URL stays on hover
+    const info = mirrorMeta(s);
+    const meta = document.createElement("span");
+    meta.className = "mirror-meta" + (info.cls ? " " + info.cls : "");
+    meta.textContent = info.text;
+    text.append(host, meta);
+    row.append(text);
+
+    // Picking a source pins it; the pin outlives restarts and background refreshes, and only the
+    // test button clears it. Clicking a switched-off mirror turns it on — a click that visibly
+    // did nothing would be the alternative, since a disabled source can never be active.
+    const pick = () => {
+      if (s.active) return;
+      state.sources.forEach((o) => (o.active = o === s));
+      s.enabled = true;
+      renderMirrors();
+      const ref = primary ? { kind: "primary" } : { kind: "mirror", url: s.url };
+      invoke("set_selected_source", { selected: ref }).catch((e) => setSettingsMsg(errText(e)));
+    };
+    row.addEventListener("click", pick);
+    row.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        pick();
+      }
+    });
+
+    if (s.active) {
+      const tag = document.createElement("span");
+      tag.className = "tag current";
+      tag.textContent = t("mirror.inUse");
+      row.append(tag);
+    } else if (primary) {
+      // No switch: the main source cannot be turned off, and a tag says so rather than leaving a
+      // conspicuous gap where every other row has a control.
+      const tag = document.createElement("span");
+      tag.className = "tag";
+      tag.textContent = t("mirror.always");
+      row.append(tag);
+    }
+    if (!primary) {
+      const sw = document.createElement("button");
+      sw.type = "button";
+      sw.className = "switch" + (s.enabled ? " on" : "");
+      sw.setAttribute("role", "switch");
+      sw.setAttribute("aria-checked", String(s.enabled));
+      sw.setAttribute("aria-label", t("mirror.enable"));
+      sw.addEventListener("click", (e) => {
+        e.stopPropagation(); // the row itself picks; the switch only includes/excludes
+        s.enabled = !s.enabled;
+        renderMirrors();
+        invoke("set_mirror_enabled", { url: s.url, enabled: s.enabled })
+          // switching off the ACTIVE source hands the job to the next one, and the backend owns
+          // that resolution — so re-read rather than guessing at it here
+          .then(refreshSources)
+          .catch((e) => setSettingsMsg(errText(e)));
+      });
+      row.append(sw);
+    }
+    list.append(row);
+  }
+}
+
+function setMirrorAuto(on) {
+  const b = $("tgl-mirror-auto");
+  b.classList.toggle("on", on);
+  b.querySelector(".switch").classList.toggle("on", on);
+  b.setAttribute("aria-checked", String(on));
+}
+
+// Re-read the list after a change whose consequences the backend resolves (which source becomes
+// active once another is switched off). Cheap and local — get_settings touches no network.
+async function refreshSources() {
+  try {
+    const s = await invoke("get_settings");
+    state.sources = (s.sources || []).map((x) => ({ ...x }));
+    renderMirrors();
+  } catch (e) {
+    /* the row already shows the switch's new state; a repaint is not worth an error line */
+  }
+}
+
+// Refresh the published list and measure everything, in one trip. The backend owns the ordering
+// (it holds both the list and the measurements), so there is nothing to sort or persist here.
+async function sweepMirrors() {
+  if (state.mirrorSweeping) return;
+  state.mirrorSweeping = true;
+  const btn = $("btn-mirror-sweep");
+  btn.disabled = true;
+  btn.textContent = t("btn.mirrorSweeping");
+  setSettingsMsg(null);
+  try {
+    const r = await invoke("sweep_mirrors");
+    state.sources = r.sources;
+    state.mirrorProbes = Object.fromEntries(r.probes.map((p) => [p.primary ? "@primary" : p.url, p]));
+    // A list that could not be refreshed is not a failed sweep — the measurements below it are
+    // real. Say so on the message line and leave the results standing. Nothing usable ANYWHERE
+    // (main source included) outranks that: it is the one result the row colours alone understate.
+    if (!r.probes.some((p) => p.healthy)) setSettingsMsg(t("mirror.allDown"));
+    else if (r.refreshError) setSettingsMsg(`${t("mirror.refreshFailed")} · ${r.refreshError}`);
+  } catch (e) {
+    setSettingsMsg(errText(e));
+  } finally {
+    state.mirrorSweeping = false;
+    btn.textContent = t("btn.mirrorSweep");
+    btn.disabled = false;
+    renderMirrors();
+  }
+}
+
+
 // The form's current content, for the discard-changes guard. Language is excluded — it applies
-// (and persists) instantly on toggle, so it is never "unsaved".
+// (and persists) instantly on toggle, so it is never "unsaved". Mirrors are excluded for the same
+// reason: the whole pane writes through on every edit.
 function settingsSnapshot() {
   return JSON.stringify({
     repo: $("in-repo").value,
@@ -1053,6 +1240,11 @@ async function openSettings() {
   state.renderer = s.renderer || "dx11";
   state.launchFlags = (s.launchFlags || []).map((f) => ({ ...f }));
   renderLaunchFlags();
+  // sources are instant-apply, so this is a pure repaint — measurements from earlier in the
+  // session are deliberately kept, since nothing about them went stale by closing the view
+  state.sources = (s.sources || []).map((x) => ({ ...x }));
+  setMirrorAuto(s.autoPickBest !== false);
+  renderMirrors();
   updateTokenPlaceholder();
   $("btn-token-clear").classList.toggle("hidden", !state.hasToken);
   setSeg($("seg-renderer"), state.renderer);
@@ -3565,6 +3757,14 @@ wireSeg($("seg-anim"), (v) => {
   applyAnimations(v === "on");
   invoke("set_animations", { on: v === "on" }).catch(() => {});
 });
+$("btn-mirror-sweep").addEventListener("click", sweepMirrors);
+// instant-apply. Turning it ON does not test anything now — it arms the next launch that finds a
+// newly published mirror, which is the only moment it acts.
+$("tgl-mirror-auto").addEventListener("click", () => {
+  const on = $("tgl-mirror-auto").getAttribute("aria-checked") !== "true";
+  setMirrorAuto(on);
+  invoke("set_auto_pick_best", { on }).catch(() => {});
+});
 
 // Watch the modals' own class rather than calling syncModalLayer from all seven open/close
 // sites — this cannot be forgotten when a new dialog is added.
@@ -3686,6 +3886,13 @@ async function boot() {
   applyStatic();
   setIdleStatus();
   renderPrimary();
+
+  // Fire-and-forget: pull the published mirror list, and time the sources ONLY if that turned up
+  // a mirror nobody has measured yet. Deliberately NOT awaited — boot must not wait on the
+  // network, and nothing on screen depends on it. This is the only thing that keeps the list
+  // current for the vast majority of users, who will never open the mirrors pane. It does not
+  // re-rank on a schedule and does not touch a pinned choice; see cmd::mirrors.
+  invoke("auto_sweep_mirrors").catch(() => {});
 
   let firstRun = false;
   try {

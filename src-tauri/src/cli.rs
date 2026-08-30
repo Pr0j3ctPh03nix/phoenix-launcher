@@ -35,6 +35,77 @@ fn settings_from_flags(flags: &[String]) -> (Settings, Option<String>) {
     (s, tag)
 }
 
+/// `sweep [--save]` — refresh the published mirror list and measure every source, headless.
+///
+/// The only way to exercise the whole loop without the GUI, and the only way to seed a list at all
+/// now that mirrors are discovered rather than typed. `--save` persists the result, exactly as the
+/// settings pane does; without it nothing is written.
+pub fn run_sweep(flags: &[String]) -> Result<()> {
+    let (mut settings, _) = settings_from_flags(flags);
+    // `--mirror <url>` seeds one for this run only. Mirrors are normally discovered, and discovery
+    // bootstraps from the primary — so without this there is no way to exercise the mirror side of
+    // the loop on a box that cannot reach the primary, which is the very situation it is for.
+    let mut it = flags.iter();
+    while let Some(k) = it.next() {
+        if k == "--mirror" {
+            if let Some(url) = it.next().and_then(|u| crate::config::normalize_mirror_url(u)) {
+                settings.sources.push(crate::config::Source::Mirror { url, enabled: true, measured: false });
+            }
+        }
+    }
+    // `--no-measure` is the launch-time path: refresh the list only. Worth being able to run on
+    // its own, because its whole contract is that it must NOT disturb the speed ranking.
+    let measure = !flags.iter().any(|f| f == "--no-measure");
+    let sweep = crate::mirror::sweep(&settings, measure);
+
+    if let Some(e) = &sweep.refresh_error {
+        println!("mirror list not refreshed: {e}");
+    }
+    // Resolved through config::active_index — the same call the download path will make, so this
+    // marker is the real answer to "which source gets used", not a second guess at it.
+    let active = crate::config::active_index(&sweep.sources, settings.selected.as_ref());
+    let mark = |i: usize, s: &crate::config::Source| {
+        format!(
+            "{}{}{}",
+            s.url().unwrap_or("<primary>"),
+            if s.enabled() { "" } else { "  (off)" },
+            if active == Some(i) { "  <- IN USE" } else { "" }
+        )
+    };
+
+    if !measure {
+        for (i, s) in sweep.sources.iter().enumerate() {
+            println!("{}", mark(i, s));
+        }
+        return Ok(());
+    }
+    for (i, (s, p)) in sweep.sources.iter().zip(sweep.probes.iter()).enumerate() {
+        let speed = match p.bytes_per_sec {
+            Some(b) => format!("{:.2} MiB/s", b as f64 / (1024.0 * 1024.0)),
+            None => "—".to_string(),
+        };
+        println!(
+            "{}\n  {:<8} latency {:>7}  speed {:>12}  range {:<3}  tag {}",
+            mark(i, s),
+            if p.healthy() { "HEALTHY" } else { "UNUSABLE" },
+            p.latency_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "—".into()),
+            speed,
+            if p.range_ok { "ok" } else { "NO" },
+            p.tag.as_deref().unwrap_or("—"),
+        );
+        if let Some(e) = &p.error {
+            println!("  error: {e}");
+        }
+    }
+
+    if flags.iter().any(|f| f == "--save") {
+        let sources = sweep.sources.clone();
+        Settings::update(move |s| s.sources = sources)?;
+        println!("\nsaved {} source(s) to settings", sweep.sources.len());
+    }
+    Ok(())
+}
+
 pub fn run_check(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
     let dl = Github::new(settings.token());

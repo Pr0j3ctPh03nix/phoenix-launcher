@@ -5,6 +5,7 @@
 pub mod autofind;
 pub mod game;
 pub mod launch;
+pub mod mirrors;
 pub mod misc;
 pub mod notes;
 pub mod selfupdate;

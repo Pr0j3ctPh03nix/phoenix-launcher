@@ -24,6 +24,7 @@ mod install;
 mod keep;
 mod launch;
 mod manifest;
+mod mirror;
 mod selfupdate;
 mod state;
 mod steaminf;
@@ -56,6 +57,11 @@ fn run_gui() {
             cmd::settings::set_animations,
             cmd::settings::set_selection,
             cmd::settings::game_dir_status,
+            cmd::mirrors::set_mirror_enabled,
+            cmd::mirrors::set_selected_source,
+            cmd::mirrors::set_auto_pick_best,
+            cmd::mirrors::sweep_mirrors,
+            cmd::mirrors::auto_sweep_mirrors,
             cmd::update::check,
             cmd::update::local_check,
             cmd::update::replan,
@@ -113,6 +119,7 @@ fn cli_dispatch() -> Option<anyhow::Result<()>> {
         Some("uninstall") => cli::run_uninstall(&args[1..]),
         Some("game-install") => cli::run_game_install(&args[1..]),
         Some("game-verify") => cli::run_game_verify(&args[1..]),
+        Some("sweep") => cli::run_sweep(&args[1..]),
         _ => return None, // not a CLI invocation — the caller opens the window
     })
 }

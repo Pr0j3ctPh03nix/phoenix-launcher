@@ -25,6 +25,106 @@ pub struct SettingsView {
     /// The optional launch flags, in table order — the UI renders one switch per entry.
     pub launch_flags: Vec<LaunchFlagView>,
     pub selections: serde_json::Value,
+    /// Download sources in priority order. Unlike the fields above these are INSTANT-APPLY: the
+    /// mirrors pane writes through on every edit, so they are never unsaved form state and never
+    /// appear in the discard-changes snapshot.
+    pub sources: Vec<SourceView>,
+    pub auto_pick_best: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceView {
+    /// "primary" | "mirror". The primary has no `url` and no switch — it is the baked-in source,
+    /// and no published mirror list can remove it.
+    pub kind: &'static str,
+    pub url: Option<String>,
+    pub enabled: bool,
+    /// The one downloads will be attempted from. Resolved by `config::active_index` and sent
+    /// here rather than recomputed in JS, so the pane cannot come to disagree with the download
+    /// path about which source is in use.
+    pub active: bool,
+    /// Has it ever been timed? False is the visible half of "a new mirror was acknowledged but
+    /// not tested", which is the whole state the auto-pick setting leaves behind when it is off.
+    pub measured: bool,
+}
+
+/// The list as the pane should paint it, with the active entry already resolved.
+pub fn source_views(
+    sources: &[crate::config::Source],
+    pinned: Option<&crate::config::SourceRef>,
+) -> Vec<SourceView> {
+    let active = crate::config::active_index(sources, pinned);
+    sources
+        .iter()
+        .enumerate()
+        .map(|(i, s)| SourceView {
+            kind: if s.is_primary() { "primary" } else { "mirror" },
+            url: s.url().map(str::to_string),
+            enabled: s.enabled(),
+            active: active == Some(i),
+            // the primary is never "untested" in the sense that matters here — it is not
+            // something that newly appeared and might be better than what you are using
+            measured: !matches!(s, crate::config::Source::Mirror { measured: false, .. }),
+        })
+        .collect()
+}
+
+/// One source's probe result. Kept apart from `SourceView` because it is a measurement, not a
+/// setting: it is never persisted, and a source nobody has swept simply has none.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorProbeView {
+    /// None for the primary; the UI keys on `primary` instead of inventing a sentinel URL.
+    pub url: Option<String>,
+    pub primary: bool,
+    /// Index round-trip. All a plain reachability check would have told you.
+    pub latency_ms: Option<u64>,
+    /// Measured over a real asset chunk — the number worth sorting on.
+    pub bytes_per_sec: Option<u64>,
+    pub tag: Option<String>,
+    pub range_ok: bool,
+    pub error: Option<String>,
+    /// Delivered the whole chunk in budget. Derived here so the UI and any later source-picking
+    /// logic cannot disagree about what "usable" means.
+    pub healthy: bool,
+}
+
+impl From<crate::mirror::Probe> for MirrorProbeView {
+    fn from(p: crate::mirror::Probe) -> Self {
+        Self {
+            healthy: p.healthy(),
+            url: p.url,
+            primary: p.primary,
+            latency_ms: p.latency_ms,
+            bytes_per_sec: p.bytes_per_sec,
+            tag: p.tag,
+            range_ok: p.range_ok,
+            error: p.error,
+        }
+    }
+}
+
+/// One sweep: the list as it now stands, plus what each entry measured.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorSweepView {
+    pub sources: Vec<SourceView>,
+    pub probes: Vec<MirrorProbeView>,
+    /// Why the published list could not be read, if it could not. Never fatal.
+    pub refresh_error: Option<String>,
+}
+
+impl MirrorSweepView {
+    /// `pinned` is the selection AFTER the sweep applied its own policy, so the `active` flags
+    /// describe the state that was just persisted.
+    pub fn build(s: crate::mirror::Sweep, pinned: Option<&crate::config::SourceRef>) -> Self {
+        Self {
+            sources: source_views(&s.sources, pinned),
+            probes: s.probes.into_iter().map(MirrorProbeView::from).collect(),
+            refresh_error: s.refresh_error,
+        }
+    }
 }
 
 #[derive(Serialize)]

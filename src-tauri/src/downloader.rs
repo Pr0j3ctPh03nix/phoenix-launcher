@@ -14,6 +14,12 @@ pub struct Asset {
     pub url: String,
     /// Direct download URL (used for public downloads).
     pub browser_download_url: String,
+    /// Bytes, as the release index reports them. Used only to CHOOSE an asset — the mirror probe
+    /// needs the BIGGEST one, since a throttled path serves a small file perfectly and would
+    /// otherwise measure as healthy. Never used to size a transfer: `download_to` learns the real
+    /// length from the response. Defaulted, so an index that omits it still parses.
+    #[serde(default)]
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -136,6 +142,7 @@ pub mod fake {
                     .assets
                     .keys()
                     .map(|name| Asset {
+                        size: self.assets.get(name).map_or(0, |b| b.len() as u64),
                         name: name.clone(),
                         url: String::new(),
                         browser_download_url: String::new(),

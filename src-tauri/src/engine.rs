@@ -715,6 +715,7 @@ mod tests {
                         name: (*n).into(),
                         url: String::new(),
                         browser_download_url: String::new(),
+                        size: 0,
                     })
                     .collect(),
             }

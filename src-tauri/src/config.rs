@@ -33,6 +33,100 @@ pub const DEFAULT_GAME_REPO: &str = "Pr0j3ctPh03nix/game-dist";
 /// able to write the baked token to disk.
 const BAKED_TOKEN: Option<&str> = option_env!("PHOENIX_BAKED_TOKEN");
 
+/// One place releases can be downloaded from. Position in `Settings::sources` is priority order.
+///
+/// The two variants are deliberately asymmetric, and that asymmetry is the safety property:
+/// `Primary` has NO `enabled` field and NO url. Mirrors are discovered from a published
+/// `mirrors.json`, which is a list of mirror URLs — so there exists no value that document could
+/// carry, however malformed or hostile, that names, disables or removes the main source. Mirrors
+/// can only ever be a complement to it. `migrate` guarantees exactly one `Primary` survives.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum Source {
+    /// The baked-in GitHub source repo (`Settings::source_repo`). Always present, always used.
+    Primary,
+    Mirror {
+        /// Base URL, normalized (no trailing slash) — the entry's identity, and what the list is
+        /// deduplicated on.
+        url: String,
+        /// A disabled mirror stays in the list and is still PROBED, which is how one that has
+        /// come back gets noticed; it is simply never downloaded from.
+        #[serde(default = "default_true")]
+        enabled: bool,
+        /// Has this mirror ever been timed? A newly published one arrives `false`, and that — not
+        /// a clock — is the only thing that triggers an automatic measurement. Speeds are never
+        /// re-taken on a schedule: measuring costs a real download per source, and re-ordering the
+        /// list unprompted is exactly what would move a user off the source they chose.
+        #[serde(default)]
+        measured: bool,
+    },
+}
+
+impl Source {
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            Source::Primary => None,
+            Source::Mirror { url, .. } => Some(url),
+        }
+    }
+
+    pub fn is_primary(&self) -> bool {
+        matches!(self, Source::Primary)
+    }
+
+    /// The primary is unconditionally enabled — see the type's note.
+    pub fn enabled(&self) -> bool {
+        match self {
+            Source::Primary => true,
+            Source::Mirror { enabled, .. } => *enabled,
+        }
+    }
+}
+
+/// A reference to a source, for naming one the user pinned. Separate from `Source` because a
+/// pin stores an identity, not a state — carrying `enabled` here would be a second copy of a
+/// fact the list already holds, free to disagree with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SourceRef {
+    Primary,
+    Mirror { url: String },
+}
+
+impl Source {
+    pub fn is(&self, r: &SourceRef) -> bool {
+        match (self, r) {
+            (Source::Primary, SourceRef::Primary) => true,
+            (Source::Mirror { url, .. }, SourceRef::Mirror { url: pinned }) => url == pinned,
+            _ => false,
+        }
+    }
+}
+
+/// Which source will actually be used.
+///
+/// THE one definition — the settings pane, the CLI and any future downloader all resolve through
+/// here, so "in use" cannot come to mean different things in the UI and in the download path.
+///
+/// A pin wins while it is still in the list and still enabled; otherwise the head of the ranking
+/// does, which after a sweep is the fastest working source. A pin that has gone stale (its mirror
+/// unpublished, or switched off) is therefore ignored rather than obeyed into a dead end — and it
+/// is kept, not cleared, so re-enabling the mirror restores the user's choice.
+pub fn active_index(sources: &[Source], pinned: Option<&SourceRef>) -> Option<usize> {
+    pinned
+        .and_then(|r| sources.iter().position(|s| s.is(r) && s.enabled()))
+        .or_else(|| sources.iter().position(Source::enabled))
+}
+
+/// Canonical form of a published mirror base URL, or None if it is not one. Everything downstream
+/// appends a path to this string, so a trailing slash and a missing scheme are the two ways an
+/// entry that looks fine silently never resolves.
+pub fn normalize_mirror_url(url: &str) -> Option<String> {
+    let u = url.trim().trim_end_matches('/');
+    let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"))?;
+    (!rest.is_empty()).then(|| u.to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// Settings schema version (see SETTINGS_VERSION).
@@ -76,6 +170,36 @@ pub struct Settings {
     /// Manifest option selections: option id -> variant id (choice) or bool (toggle).
     #[serde(default)]
     pub selections: BTreeMap<String, serde_json::Value>,
+    /// Download sources in priority order. Always holds exactly one `Source::Primary` (enforced
+    /// by `migrate`). The `Mirror` entries are DISCOVERED, never user-authored: a sweep replaces
+    /// them wholesale from the published `mirrors.json`, so the only thing a user decides about a
+    /// mirror is whether to use it.
+    /// Always ordered fastest-first by the last sweep that measured, so the head of the list is
+    /// the source in use. There is no setting for this: a slower source ahead of a faster one is
+    /// not a preference anyone holds.
+    #[serde(default = "default_sources")]
+    pub sources: Vec<Source>,
+    /// The source the user pinned, if any. `None` means "follow the ranking" — use the fastest.
+    ///
+    /// A choice is never overridden quietly. Exactly two things clear it: the TEST BUTTON (asking
+    /// to be re-tested is asking for the answer the test gives), and a measurement finding the
+    /// pinned source unusable — which is the user's own rule, "unless their mirror goes offline".
+    /// Nothing else touches it: not a launch, not a list refresh, not a newly published mirror.
+    #[serde(default)]
+    pub selected: Option<SourceRef>,
+    /// When a newly published mirror turns up, test everything and switch to the best — pin and
+    /// all. On by default: a mirror is published because it is worth using, and the people this
+    /// exists for are the least likely to go looking for a settings pane.
+    ///
+    /// Off means a new mirror is only listed, marked untested, and left alone until the user runs
+    /// the test themselves. It does not merely defer the switch — with it off, NOTHING measures
+    /// automatically, so nothing reorders and nothing touches the pin.
+    #[serde(default = "default_true")]
+    pub auto_pick_best: bool,
+}
+
+fn default_sources() -> Vec<Source> {
+    vec![Source::Primary]
 }
 
 fn default_version() -> u32 {
@@ -109,6 +233,9 @@ impl Default for Settings {
             animations: true,
             launch_flags: BTreeMap::new(),
             selections: BTreeMap::new(),
+            sources: default_sources(),
+            selected: None,
+            auto_pick_best: true,
         }
     }
 }
@@ -134,11 +261,19 @@ impl Settings {
         s
     }
 
-    /// Bring an older on-disk schema up to SETTINGS_VERSION. No transformations yet — v1 is the
-    /// first schema; future bumps migrate fields here.
+    /// Bring an older on-disk schema up to SETTINGS_VERSION. No field transformations yet — v1 is
+    /// the first schema; future bumps migrate here.
     fn migrate(&mut self) {
         if self.version < SETTINGS_VERSION {
             self.version = SETTINGS_VERSION;
+        }
+        // Exactly one Primary, always. A file written before `sources` existed, or one hand-edited
+        // to drop it, must not leave the launcher with no main source — that is the state mirrors
+        // are never allowed to produce, so it cannot be reachable by accident either. Restored at
+        // the FRONT, since a list with no measurements has no better order to claim.
+        if self.sources.iter().filter(|s| s.is_primary()).count() != 1 {
+            self.sources.retain(|s| !s.is_primary());
+            self.sources.insert(0, Source::Primary);
         }
     }
 
@@ -220,5 +355,77 @@ impl Settings {
         }
         let exe = std::env::current_exe().context("locating the updater executable")?;
         Ok(exe.parent().context("updater executable has no parent dir")?.to_path_buf())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mirror(url: &str, enabled: bool) -> Source {
+        Source::Mirror { url: url.to_string(), enabled, measured: true }
+    }
+    fn pin(url: &str) -> SourceRef {
+        SourceRef::Mirror { url: url.to_string() }
+    }
+
+    /// No pin: the head of the ranking wins, which after a sweep is the fastest working source.
+    #[test]
+    fn unpinned_uses_the_head() {
+        let s = vec![mirror("https://a", true), Source::Primary];
+        assert_eq!(active_index(&s, None), Some(0));
+    }
+
+    #[test]
+    fn a_pin_wins_over_the_ranking() {
+        let s = vec![mirror("https://a", true), Source::Primary, mirror("https://b", true)];
+        assert_eq!(active_index(&s, Some(&pin("https://b"))), Some(2));
+        assert_eq!(active_index(&s, Some(&SourceRef::Primary)), Some(1));
+    }
+
+    /// Switching off the pinned mirror must hand the job to the ranking, not strand the user on a
+    /// source that is excluded — the pin itself is deliberately NOT cleared, so turning the mirror
+    /// back on restores the choice.
+    #[test]
+    fn a_disabled_pin_falls_back() {
+        let s = vec![mirror("https://a", true), mirror("https://b", false)];
+        assert_eq!(active_index(&s, Some(&pin("https://b"))), Some(0));
+    }
+
+    /// A mirror the publisher has dropped is gone from the list; a pin naming it is stale and must
+    /// not resolve to nothing.
+    #[test]
+    fn a_pin_to_a_vanished_mirror_falls_back() {
+        let s = vec![Source::Primary, mirror("https://a", true)];
+        assert_eq!(active_index(&s, Some(&pin("https://gone"))), Some(0));
+    }
+
+    /// Every mirror off is a reachable state; the primary has no switch, so there is always one
+    /// enabled source left and this can never resolve to None.
+    #[test]
+    fn primary_survives_everything_being_switched_off() {
+        let s = vec![mirror("https://a", false), Source::Primary, mirror("https://b", false)];
+        assert_eq!(active_index(&s, Some(&pin("https://a"))), Some(1));
+        assert_eq!(active_index(&s, None), Some(1));
+    }
+
+    /// `migrate` is the guarantee that no settings file — hand-edited, or written by a build that
+    /// predates `sources` — can leave the launcher without a main source.
+    #[test]
+    fn migrate_restores_a_missing_primary() {
+        let mut s = Settings { sources: vec![mirror("https://a", true)], ..Settings::default() };
+        s.migrate();
+        assert_eq!(s.sources.first(), Some(&Source::Primary));
+        assert_eq!(s.sources.len(), 2);
+    }
+
+    #[test]
+    fn migrate_dedupes_a_doubled_primary() {
+        let mut s = Settings {
+            sources: vec![Source::Primary, mirror("https://a", true), Source::Primary],
+            ..Settings::default()
+        };
+        s.migrate();
+        assert_eq!(s.sources.iter().filter(|x| x.is_primary()).count(), 1);
     }
 }

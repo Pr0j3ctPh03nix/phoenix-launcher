@@ -304,6 +304,7 @@ mod tests {
                     name: n.to_string(),
                     url: String::new(),
                     browser_download_url: String::new(),
+                    size: 0,
                 })
                 .collect(),
         }
