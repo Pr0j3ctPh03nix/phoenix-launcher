@@ -3239,6 +3239,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Interrupted after `cut` bytes, then resumed with the real impls' accounting: `written`
+    /// starts at the resumed prefix and grows by real chunks from there, exactly like github.rs.
+    /// `Overflowing` above always starts at zero (it exists to prove the abort), and `CutOnce`
+    /// never ticks progress at all on either attempt — neither exercises the cap guard on a
+    /// resumed transfer, which is the one case the task calls out as easy to get silently wrong
+    /// (counting from the prefix instead of from zero, or the reverse).
+    struct ResumingToCap {
+        inner: Fake,
+        body: Vec<u8>,
+        cut: usize,
+        chunk: usize,
+        calls: std::sync::atomic::AtomicU32,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::downloader::Downloader for ResumingToCap {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+            self.inner.fetch_release(r, t)
+        }
+        fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &crate::downloader::Asset) -> Result<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            _asset: &crate::downloader::Asset,
+            dest: &Path,
+            resume_from: u64,
+            progress: crate::downloader::ChunkProgress,
+        ) -> Result<(u64, String)> {
+            use std::io::{Seek, SeekFrom, Write};
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                assert_eq!(resume_from, 0, "first attempt must start fresh");
+                std::fs::write(dest, &self.body[..self.cut])?;
+                anyhow::bail!("simulated dropped connection");
+            }
+            assert_eq!(resume_from as usize, self.cut, "must resume from exactly what was written");
+            let mut file = std::fs::OpenOptions::new().write(true).open(dest)?;
+            file.seek(SeekFrom::Start(resume_from))?;
+            let mut written = resume_from; // the prefix counts — same as every real impl
+            for piece in self.body[self.cut..].chunks(self.chunk) {
+                file.write_all(piece)?;
+                written += piece.len() as u64;
+                if !progress(written, Some(self.body.len() as u64)) {
+                    anyhow::bail!("download aborted");
+                }
+            }
+            Ok((written, sha(&self.body)))
+        }
+    }
+
+    /// The companion the task explicitly asks for: a resume must not break under the new cap.
+    /// `written` is seeded from the resumed prefix (not from zero), so a transfer that finishes
+    /// EXACTLY at the signed size — however that size is split between the interrupted attempt
+    /// and the resumed one — must complete, never get capped for bytes it already had on disk.
+    #[test]
+    fn a_resumed_transfer_that_completes_exactly_at_the_signed_size_is_not_capped() {
+        use std::sync::atomic::Ordering;
+        let dir = tempdir("resume-exact-cap");
+        let content: Vec<u8> = (0..500u32).map(|i| (i % 251) as u8).collect();
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ { "name": "a.vpk", "dest": "game/dota/a.vpk",
+                         "sha256": sha(&content), "size": content.len() } ]
+        })
+        .to_string();
+        let dl = ResumingToCap {
+            inner: Fake::new("v1.0.0", &m, vec![("a.vpk", &content)]),
+            body: content.clone(),
+            cut: 200,
+            chunk: 37, // does not divide the remainder evenly, so the last tick lands off-grid
+            calls: 0.into(),
+            failed: false.into(),
+        };
+
+        // an abort with no NetKind is not retried within one run (same as `CutOnce`'s test), so
+        // the interruption and the resume are two separate `install()` calls, exactly as a real
+        // dropped connection and a later relaunch would be
+        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        assert!(!dir.join("game/dota/a.vpk").exists());
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        assert_eq!(r.written, vec!["game/dota/a.vpk".to_string()]);
+        assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), content);
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "attempt one drops, attempt two resumes and finishes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Fails `download_to` with a given error until `fail` runs out, then delegates to the Fake.
     struct Flaky {
         inner: Fake,
