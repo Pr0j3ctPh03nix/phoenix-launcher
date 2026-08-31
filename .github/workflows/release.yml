@@ -5,6 +5,16 @@
 # Manual run (workflow_dispatch) -> build only, exe uploaded as a workflow artifact.
 #
 # The Rust cache is WRITTEN by ci.yml (on main), not here — see the rust-cache step below.
+#
+# NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed BEFORE the
+# shell parses the script, so a tag name is executable code — and this job holds the signing key.
+# A git ref is not a safe literal: check-ref-format bars only space, ~ ^ : ? * [ \ and control
+# characters, so `$`, backtick, `(`, `)` and `;` are all legal in a tag name. Everything from the
+# event goes through `env:` and is read back as `$env:TAG`.
+#
+# In PowerShell use BRACES — `${env:TAG}` — wherever the next character could continue a variable
+# name. A `:` can, so `"refs/tags/$env:TAG:refs/tags/$env:TAG"` parses as the variable `env:TAG:refs`
+# (empty) and yields the garbage refspec `refs/tags//tags/v1.2.3` rather than failing.
 
 name: release
 
@@ -63,8 +73,10 @@ jobs:
       - name: Check version agreement (tag pushes)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          $tag = "${{ github.ref_name }}" -replace '^v',''
+          $tag = $env:TAG -replace '^v',''
           $cargo = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
           $conf  = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
           $pkg   = (Get-Content package.json -Raw | ConvertFrom-Json).version
@@ -77,6 +89,22 @@ jobs:
             Write-Error "tag $tag does not match: $($bad -join ', ')"
             exit 1
           }
+
+      # The signer's ONE non-stdlib dependency: phoenix_minisign imports Ed25519 from `cryptography`
+      # at module scope, so `seal.py` cannot even be imported without it — and the Windows runner
+      # image does not ship it. Without this step every run of this workflow, tag or manual, dies at
+      # "Sign the launcher payload" with ModuleNotFoundError.
+      #
+      # Installed HERE rather than beside that step so a broken install costs seconds instead of
+      # landing after the multi-minute Tauri build — the same reason the version check above runs
+      # this early.
+      #
+      # NOT `zstandard`: that is the `.phxb` writer's dependency, and only the mod and the base game
+      # build bundles. This payload's manifest indexes one loose exe, so nothing on the path
+      # gen_launcher_manifest -> build_manifest -> manifest_schema -> seal -> phoenix_minisign
+      # imports phxb at all.
+      - name: Install the signer's dependency
+        run: python -m pip install --disable-pip-version-check cryptography
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
 
@@ -138,9 +166,11 @@ jobs:
       - name: Extract tag message as the release body (tag pushes)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          git fetch --force origin "refs/tags/${{ github.ref_name }}:refs/tags/${{ github.ref_name }}"
-          git tag -l --format='%(contents:body)' "${{ github.ref_name }}" | Out-File -Encoding utf8 release_body.md
+          git fetch --force origin "refs/tags/${env:TAG}:refs/tags/${env:TAG}"
+          git tag -l --format='%(contents:body)' "$env:TAG" | Out-File -Encoding utf8 release_body.md
           Get-Content release_body.md
 
       # WHY THE LAUNCHER IS SIGNED AT ALL. selfupdate.rs prefers a signed manifest and falls back to
