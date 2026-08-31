@@ -125,8 +125,10 @@ jobs:
       # The sidecar is still published, deliberately: already-installed launchers know nothing but
       # the sidecar, and self-update is the one path that has to keep working for builds older than
       # every change made to it. Clients move onto the signed path as they update through this one.
-      - name: Sign the launcher payload (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
+      # NOT tag-gated, on purpose. A manual run seals but publishes nothing, so the signing secret
+      # and the vendored tooling can be proven WITHOUT cutting a release — otherwise the first time
+      # either is exercised is the one-way cutover itself.
+      - name: Sign the launcher payload
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
@@ -146,12 +148,16 @@ jobs:
           # mirrored from the dev superset by its sync.py, whose --check fails if these have
           # drifted from the copies that sign the mod and the game. See tools/README.md.
           tools=tools
+          # The notes come from the annotated tag, so a manual run has none — the field is optional
+          # and its absence is the only difference between a dry run and the real thing.
+          notes=()
+          [ -f release_body.md ] && notes=(--notes-file release_body.md)
           python "$tools/gen_launcher_manifest.py" \
             --version  "$TAG" \
             --serial   "$PHOENIX_SERIAL" \
             --exe      phoenix-launcher.exe \
             --exe-path "$out/phoenix-launcher.exe" \
-            --notes-file release_body.md \
+            "${notes[@]}" \
             --out      "$out/manifest.json"
           # The same seal every other payload goes through — validate, sign, prove — rather than a
           # second hand-written copy of those three steps in a second repo. The key is read from
