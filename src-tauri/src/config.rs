@@ -153,9 +153,9 @@ pub struct Settings {
     /// Folder that CONTAINS `game/`. None = resolve to the updater exe's own directory.
     #[serde(default)]
     pub game_dir: Option<PathBuf>,
-    /// GitHub token, only needed when `source_repo` is private.
-    #[serde(default)]
-    pub token: Option<String>,
+    // NO `token` field, deliberately. The launcher authenticates with the credential baked in at
+    // build time and nothing else — see `token()`. A key left in an existing settings.json is
+    // ignored by serde and disappears on the next save.
     /// UI language, "en" / "ru". None = auto-detect in the frontend.
     #[serde(default)]
     pub language: Option<String>,
@@ -241,7 +241,6 @@ impl Default for Settings {
             launcher_repo: None,
             game_repo: None,
             game_dir: None,
-            token: None,
             language: None,
             launch_extra: String::new(),
             renderer: default_renderer(),
@@ -326,9 +325,16 @@ impl Settings {
         s.save()
     }
 
-    /// The token to authenticate with: a user-saved token wins, else the build-time baked one.
+    /// The token to authenticate with: ALWAYS the build-time baked credential.
+    ///
+    /// There is deliberately no stored alternative. A saved token used to outrank this one, while
+    /// the only UI that could set or clear it went unrendered (frontend/main.js, SHOW_ADVANCED) —
+    /// so a value left behind by an older build won forever, unreachable and unfixable: every call
+    /// 401'd, and neither rebuilding the launcher nor rotating the credential helped, because the
+    /// baked one was never consulted. A credential the user cannot see, change or remove must not
+    /// be able to outvote the one compiled in.
     pub fn token(&self) -> Option<&str> {
-        self.token.as_deref().or(DIST_STAGING_REPO_ACCESS)
+        DIST_STAGING_REPO_ACCESS
     }
 
     /// The repo the launcher self-updates from. No token FIELD of its own: this repo is meant to
@@ -488,6 +494,25 @@ mod tests {
         // and a file written before the field existed simply has no history
         let old: Settings = serde_json::from_str(r#"{"version":1}"#).unwrap();
         assert!(old.max_serial_seen.is_empty());
+    }
+
+    /// A token in an existing settings.json must not authenticate anything. It once outranked the
+    /// baked credential while the UI that could clear it went unrendered, so a stale value 401'd
+    /// forever and no rebuild or rotation could reach it. The field is gone: the key parses
+    /// harmlessly (serde ignores what it does not know) and `token()` is the baked one, always.
+    #[test]
+    fn a_token_left_in_settings_json_is_ignored() {
+        let s: Settings =
+            serde_json::from_str(r#"{"version":1,"token":"ghp_stale_and_revoked"}"#).unwrap();
+        assert_eq!(
+            s.token(),
+            DIST_STAGING_REPO_ACCESS,
+            "a persisted token must never outvote the baked credential"
+        );
+        // and it does not survive a save, so the dead key retires itself
+        let round: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(round.get("token").is_none(), "no token may be written back to disk");
     }
 
     #[test]

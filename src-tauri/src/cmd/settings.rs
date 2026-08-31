@@ -12,10 +12,14 @@ use crate::views::{CmdError, GameDirStatus, LaunchFlagView, SettingsView};
 #[tauri::command]
 pub fn get_settings() -> SettingsView {
     let s = Settings::load();
+    // Read before the fields below are moved out of `s`.
+    let has_token = s.token().is_some();
     SettingsView {
         source_repo: s.source_repo,
         game_dir: s.game_dir.map(|p| p.display().to_string()).unwrap_or_default(),
-        has_token: s.token.is_some(),
+        // Whether the launcher has ANY credential at all — now solely the baked one. Read by the
+        // (unrendered) Advanced pane for its placeholder text; nothing is stored per-user.
+        has_token,
         language: s.language,
         launch_extra: s.launch_extra,
         renderer: s.renderer,
@@ -54,13 +58,11 @@ pub fn save_settings(
             source_repo
         };
         s.game_dir = if game_dir.trim().is_empty() { None } else { Some(PathBuf::from(game_dir)) };
-        // blank token field => keep whatever was saved (we never send the token to the UI);
-        // the explicit clear flag is the only way to remove a saved token
-        if clear_token {
-            s.token = None;
-        } else if !token.is_empty() {
-            s.token = Some(token);
-        }
+        // `token` / `clear_token` are accepted and IGNORED. The parameters stay so the existing
+        // frontend call keeps type-checking, but no token is ever stored: authentication is the
+        // baked credential alone (see Settings::token). Drop these two once the Advanced pane's
+        // token input goes with them.
+        let _ = (&token, clear_token);
         s.language = language;
         s.launch_extra = launch_extra;
         s.renderer = if renderer == "dx9" { renderer } else { "dx11".to_string() };

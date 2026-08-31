@@ -145,13 +145,36 @@ struct Candidate<'a> {
 /// primary alone and every rule below degenerates to what it always was — and only for a repo whose
 /// PAYLOAD this build can name: a mirror is addressed `<base>/<payload>/…`, so a repo that maps to
 /// no payload (the debug CLI's `--repo`) has no mirror path to build at all.
+/// Should the very first request carry the credential, instead of earning it after a refusal?
+///
+/// Only for the SOURCE repo. That is the one the baked credential is scoped to and the one that is
+/// private, so anonymous there is a round trip that exists only to be refused. Everything else is
+/// public, and a repo-scoped credential can be REFUSED where anonymous access succeeds — so those
+/// keep asking anonymously first. Split out from `candidates` so the rule is testable without a
+/// credential baked into the test binary.
+fn authenticate_first(token: Option<&str>, repo: &str, source_repo: &str) -> bool {
+    token.is_some() && repo == source_repo
+}
+
 fn candidates<'a>(settings: &'a Settings, repo: &str) -> Vec<Candidate<'a>> {
+    let token = settings.token();
+    // AUTHENTICATED FIRST, but only for the SOURCE repo. That is the one the baked credential is
+    // scoped to and the one that is private, so an anonymous attempt there cannot succeed — it is
+    // a guaranteed round trip spent to be refused, on every check, before the retry that was always
+    // going to be the answer. Every other repo (launcher, game) is public and keeps anonymous
+    // first, because a repo-scoped credential can be REFUSED where anonymous access works.
+    let authed_first = authenticate_first(token, repo, &settings.source_repo);
+    let with_token = |t: &'a str| {
+        Box::new(move || Box::new(Github::new(Some(t))) as Box<dyn Downloader>)
+            as Box<dyn Fn() -> Box<dyn Downloader> + 'a>
+    };
     let primary = Candidate {
-        open: Box::new(|| Box::new(Github::new(None))),
-        credentials: settings.token().map(|t| {
-            Box::new(move || Box::new(Github::new(Some(t))) as Box<dyn Downloader>)
-                as Box<dyn Fn() -> Box<dyn Downloader> + 'a>
-        }),
+        open: match (authed_first, token) {
+            (true, Some(t)) => with_token(t),
+            _ => Box::new(|| Box::new(Github::new(None)) as Box<dyn Downloader>),
+        },
+        // Already authenticated => nothing left to retry with.
+        credentials: if authed_first { None } else { token.map(with_token) },
         authoritative: true,
     };
     let Some(payload) = payload_of(settings, repo).filter(|_| mirror::MIRROR_DOWNLOADS_ENABLED)
@@ -472,6 +495,24 @@ mod tests {
         let (offline, unused) = (Peer::failing(NetKind::Transport), Peer::serving());
         assert!(walk(&[link(&offline, true, Some(&unused))]).is_err());
         assert_eq!(unused.calls(), 0, "an unreachable host is not a credentials problem");
+    }
+
+    /// The private source repo cannot answer anonymously, so asking it that way first is a round
+    /// trip spent to be refused on every check. It gets the credential immediately — and nothing
+    /// else does, because the launcher and game repos are public and a repo-scoped credential can
+    /// be refused where anonymous access works.
+    #[test]
+    fn only_the_source_repo_is_asked_with_credentials_first() {
+        let (tok, src) = (Some("t"), "Pr0j3ctPh03nix/client-dist-staging");
+        assert!(authenticate_first(tok, src, src), "the private source repo leads with the token");
+        assert!(
+            !authenticate_first(tok, "Pr0j3ctPh03nix/phoenix-launcher", src),
+            "a public repo must still be asked anonymously first"
+        );
+        assert!(
+            !authenticate_first(None, src, src),
+            "with no credential there is nothing to lead with"
+        );
     }
 
     /// The deployment gate. `MIRROR_DOWNLOADS_ENABLED` is false, so no configured mirror may enter

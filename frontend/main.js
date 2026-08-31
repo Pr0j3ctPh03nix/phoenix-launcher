@@ -4,6 +4,12 @@ const $ = (id) => document.getElementById(id);
 
 // Internal knob: the Advanced settings block (source repo / access token). Off = not rendered at
 // all; the baked-in defaults apply. Flip to true for maintainer builds.
+//
+// While this is false the token input is unreachable, so a token can be SAVED but never seen or
+// cleared. That combination once shipped a launcher whose stale saved token outranked the baked
+// credential and 401'd forever. config.rs's `migrate` now drops any persisted token for that
+// reason — if this is ever flipped back on, make that decision again on purpose rather than by
+// deleting a line.
 const SHOW_ADVANCED = false;
 
 const state = {

@@ -24,14 +24,13 @@ fn settings_from_flags(flags: &[String]) -> (Settings, Option<String>) {
                 }
             }
             "--game-repo" => s.game_repo = it.next().cloned(),
-            "--token" => s.token = it.next().cloned(),
             "--tag" => tag = it.next().cloned(),
             _ => {}
         }
     }
-    if s.token.is_none() {
-        s.token = std::env::var("PHOENIX_GITHUB_TOKEN").ok().filter(|v| !v.is_empty());
-    }
+    // No `--token` and no PHOENIX_GITHUB_TOKEN: the launcher authenticates with the credential
+    // baked in at build time and nothing else (see Settings::token). A second source of one is
+    // what let a stale value outrank the baked credential and 401 forever.
     (s, tag)
 }
 
