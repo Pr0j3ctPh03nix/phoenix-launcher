@@ -9,11 +9,12 @@ use std::sync::Arc;
 
 use tauri::Emitter;
 
-use crate::cmd::{open_repo, AppState, CachedManifest};
+use crate::cmd::{open_all, open_repo, AppState, CachedManifest, Opened};
 use crate::config::Settings;
 use crate::engine;
 use crate::github::Github;
 use crate::install::{self, BaseAction};
+use crate::manifest::Manifest;
 use crate::trust::Payload;
 use crate::views::{
     CmdError, FileStateView, GameInstallView, GamePlanView, GameTargetView, GameVerifyView,
@@ -127,21 +128,15 @@ pub async fn game_install(
         let _op = st.begin_op("game download")?;
         let settings = Settings::load();
         let dir = PathBuf::from(&target);
-        let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest =
-            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
-                .map_err(CmdError::from)?;
-        // the file assets live sharded across prereleases (GitHub caps 1000 assets/release)
-        let release = engine::merged_game_release(dl.as_ref(), settings.game_repo(), release)
-            .map_err(CmdError::from)?;
+        let (chain, manifest) = open_game(&settings)?;
+        let origins: Vec<install::Origin> = chain.iter().map(Opened::origin).collect();
 
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
         };
         let report = install::install_base(
             &dir,
-            dl.as_ref(),
-            &release,
+            &origins,
             &manifest,
             Some(&emit),
             Some(&st.game_cancel),
@@ -214,10 +209,7 @@ pub async fn game_repair(
         let _op = st.begin_op("game repair")?;
         let settings = Settings::load();
         let dir = settings.resolve_game_dir().map_err(CmdError::from)?;
-        let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest =
-            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
-                .map_err(CmdError::from)?;
+        let (chain, manifest) = open_game(&settings)?;
 
         // Pins FIRST, and only then the writes. If the order were reversed a failure mid-download
         // would lose the "leave these alone" half of the answer, and the retry would open with the
@@ -246,15 +238,13 @@ pub async fn game_repair(
             });
         }
 
-        let release = engine::merged_game_release(dl.as_ref(), settings.game_repo(), release)
-            .map_err(CmdError::from)?;
+        let origins: Vec<install::Origin> = chain.iter().map(Opened::origin).collect();
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
         };
         let report = install::install_base(
             &dir,
-            dl.as_ref(),
-            &release,
+            &origins,
             &manifest,
             Some(&emit),
             Some(&st.game_cancel),
@@ -660,6 +650,43 @@ pub async fn game_verify(
     })
     .await
     .map_err(CmdError::task)?
+}
+
+/// The base game's whole DOWNLOAD chain, plus the manifest.
+///
+/// Every source that answered, in priority order, each carrying its OWN asset list — an asset one
+/// source will not serve advances to the next (`install::Origin`), and a release index published by
+/// one host can never be used to address another. The manifest is read from the first, which is the
+/// source `open_repo` would have picked on its own.
+///
+/// The read-only commands (plan, verify, your_files, delete_extras) deliberately do NOT use this:
+/// they need one manifest and no bytes, so they stay on `open_repo` and pay one round trip.
+fn open_game(settings: &Settings) -> Result<(Vec<Opened>, Manifest), CmdError> {
+    let mut chain = open_all(settings.game_repo(), settings).map_err(CmdError::from)?;
+    let manifest = {
+        let head = &chain[0]; // open_all never returns an empty chain
+        engine::manifest_of(settings, head.dl.as_ref(), &head.release, Payload::Game)
+            .map_err(CmdError::from)?
+    };
+    // The file assets may live sharded across prereleases (GitHub caps 1000 assets/release), so
+    // each source's list is folded into itself — per source, because the shards are that source's.
+    for (i, opened) in chain.iter_mut().enumerate() {
+        let merged = engine::merged_game_release(
+            opened.dl.as_ref(),
+            settings.game_repo(),
+            opened.release.clone(),
+        );
+        match merged {
+            Ok(m) => opened.release = m,
+            // The source the manifest came from must be able to list its own assets — that failure
+            // is the user's answer, exactly as it was before there was a chain. A FALLBACK that
+            // cannot simply keeps the release it already answered with, and the asset preflight
+            // decides what it can still address.
+            Err(e) if i == 0 => return Err(CmdError::from(e)),
+            Err(_) => {}
+        }
+    }
+    Ok((chain, manifest))
 }
 
 /// The shim's own differences, as files-view rows, plus every dest it accounts for.

@@ -81,6 +81,28 @@ pub fn fetch(
     Err(FetchError::TooManyRedirects)
 }
 
+/// A response, as `downloader::stream_to_file` needs to see it. The ONE place `Content-Range` is
+/// parsed: every backend that resumes a transfer reads the same header the same way, and this
+/// module is where ureq stops — `downloader.rs` is the engine's HTTP-free seam and must not see a
+/// `ureq::Response`.
+///
+/// `range_start` is filled only for a 206. A 200 is the peer DECLINING the range, and a 206 whose
+/// `Content-Range` cannot be read is unverifiable, which is not the same as correct — both land as
+/// `None`, and the caller restarts from zero.
+pub fn body_of(resp: ureq::Response) -> crate::downloader::Body {
+    let range_start = (resp.status() == 206)
+        .then(|| {
+            // "bytes 1234-5678/9999" — the offset is the first number after the unit
+            resp.header("Content-Range")
+                .and_then(|v| v.split_whitespace().nth(1))
+                .and_then(|v| v.split('-').next())
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .flatten();
+    let content_length = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok());
+    crate::downloader::Body { range_start, content_length, reader: resp.into_reader() }
+}
+
 /// (scheme, host) — an origin is what deciding whether to keep a header like `Authorization` has
 /// to compare, not just the host: `https://api.github.com` -> `http://api.github.com` is a
 /// same-HOST redirect that downgraded transport security, and a token must not ride along onto a

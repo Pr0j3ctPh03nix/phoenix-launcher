@@ -7,7 +7,7 @@
 //! `NetKind` in the anyhow chain so the command layer can classify them for the UI.
 
 use anyhow::{bail, Context, Result};
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
@@ -258,67 +258,19 @@ impl Downloader for Github {
     /// buffers the body. `resume_from` > 0 continues an interrupted attempt: the existing prefix
     /// is hashed (so the returned sha covers everything) and the rest fetched with a Range
     /// request; a 200 answer means the server declined to resume and we start over.
+    ///
+    /// The resume/hash/write half lives in `downloader::stream_to_file`, shared with the mirror
+    /// backend — the only thing that differs between them is the request this closure issues.
     fn download_to(&self, asset: &Asset, dest: &Path, resume_from: u64, progress: ChunkProgress) -> Result<(u64, String)> {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        let mut prefix: u64 = 0;
-        if resume_from > 0 {
-            if let Ok(f) = std::fs::File::open(dest) {
-                prefix = f.metadata()?.len().min(resume_from);
-                std::io::copy(&mut f.take(prefix), &mut hasher)?;
-            }
-        }
-        let resp = asset_response(self, asset, (prefix > 0).then(|| format!("bytes={prefix}-")))?;
-        // A 206 is only usable if it is the range we ASKED for. The status alone says "partial",
-        // not "partial from `prefix`" — a peer answering 206 with a different offset would have
-        // its bytes appended at `prefix`, producing a plausibly-sized file that fails only at the
-        // final hash, and burning the one clean restart a resume gets. Absent Content-Range is
-        // treated as a decline for the same reason: unverifiable is not the same as correct.
-        let range_ok = prefix == 0
-            || (resp.status() == 206
-                && resp
-                    .header("Content-Range")
-                    .and_then(|v| v.split_whitespace().nth(1))
-                    .and_then(|v| v.split('-').next())
-                    .and_then(|v| v.parse::<u64>().ok())
-                    == Some(prefix));
-        if !range_ok {
-            prefix = 0; // server declined the Range, or answered a different one — restart at zero
-            hasher = Sha256::new();
-        }
-        let total: Option<u64> = resp
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok())
-            .map(|l| l + prefix);
-        let mut reader = resp.into_reader();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false) // length is fixed explicitly via set_len below (resume keeps the prefix)
-            .open(dest)
-            .with_context(|| format!("creating {}", dest.display()))?;
-        // drop any stale tail beyond the prefix we just hashed, then append
-        file.set_len(prefix)?;
-        file.seek(std::io::SeekFrom::Start(prefix))?;
-        // 256 KiB reads, matching verify.rs's file hashing: the payload includes multi-hundred-MB
-        // VPKs, and 64 KiB quadrupled the read syscalls per file for nothing
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut written = prefix;
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            std::io::Write::write_all(&mut file, &buf[..n])?;
-            hasher.update(&buf[..n]);
-            written += n as u64;
-            if !progress(written, total) {
-                // caller aborted (a sibling download failed, a warm was cancelled) — the
-                // partial file stays behind as the resume source
-                bail!("download aborted");
-            }
-        }
-        Ok((written, hex::encode(hasher.finalize())))
+        crate::downloader::stream_to_file(
+            dest,
+            resume_from,
+            |prefix| {
+                let range = prefix.map(|p| format!("bytes={p}-"));
+                Ok(transport::body_of(asset_response(self, asset, range)?))
+            },
+            progress,
+        )
     }
 }
 

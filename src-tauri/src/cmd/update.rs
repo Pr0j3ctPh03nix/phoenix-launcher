@@ -6,15 +6,22 @@ use std::sync::Arc;
 
 use tauri::Emitter;
 
-use crate::cmd::{AppState, CachedManifest};
+use crate::cmd::{open_repo, open_repo_tagged, AppState, CachedManifest};
 use crate::config::Settings;
 use crate::downloader::Downloader;
-use crate::github::Github;
+use crate::trust::Payload;
 use crate::views::{build_check_view, CheckView, CmdError, InstallView, UninstallView};
 use crate::{engine, install};
 
-fn downloader(s: &Settings) -> impl Downloader + '_ {
-    Github::new(s.token())
+/// The backend for a shim operation: whichever source `open_repo` found could serve the dist repo.
+///
+/// It used to build `Github::new(s.token())` directly, which bypassed not just source failover but
+/// the ANONYMOUS-FIRST credential rule every other command goes through — so this one path sent the
+/// baked token to a repo that may not want it, and could not fall back at all. Callers that also
+/// need the release should use `open_repo` itself and keep both; this is for the ones that only
+/// need somewhere to fetch from.
+fn downloader(s: &Settings) -> anyhow::Result<Box<dyn Downloader>> {
+    open_repo(&s.source_repo, s).map(|(dl, _)| dl)
 }
 
 #[tauri::command]
@@ -22,8 +29,11 @@ pub async fn check(state: tauri::State<'_, Arc<AppState>>) -> Result<CheckView, 
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let settings = Settings::load();
-        let dl = downloader(&settings);
-        let (release, manifest) = engine::fetch(&settings, &dl, None).map_err(CmdError::from)?;
+        // `open_repo` + `manifest_of`, not `engine::fetch`: fetch would resolve the release a
+        // second time, and this runs on every launch. Same two steps, one round trip each.
+        let (dl, release) = open_repo(&settings.source_repo, &settings).map_err(CmdError::from)?;
+        let manifest = engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Mod)
+            .map_err(CmdError::from)?;
         // cache before evaluating: even if the local diff fails, the fetched manifest is kept
         *st.manifest_cache.lock().unwrap() = Some(CachedManifest {
             repo: settings.source_repo.clone(),
@@ -108,7 +118,13 @@ pub async fn apply(
                 game_dir.display()
             )));
         }
-        let dl = downloader(&settings);
+        // Pinned to the tag the UI showed, and opened through the source chain — the release itself
+        // is re-resolved inside `install` (it fetches its own manifest), so only the SOURCE choice
+        // is carried across.
+        let (dl, _release) =
+            open_repo_tagged(&settings.source_repo, &settings, tag.as_deref())
+                .map_err(CmdError::from)?;
+        let dl = dl.as_ref();
         // the engine's progress ticks go straight to the webview
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
@@ -119,7 +135,7 @@ pub async fn apply(
         // after the run rather than left to re-hide the file on the next check.
         let only: Option<HashSet<String>> = restore.map(|v| v.into_iter().collect());
         let report =
-            install::install(&settings, &dl, tag.as_deref(), Some(&emit), None, only.as_ref());
+            install::install(&settings, dl, tag.as_deref(), Some(&emit), None, only.as_ref());
         if let (Ok(_), Some(sel)) = (&report, &only) {
             let _ = crate::keep::unpin_all(&game_dir, sel);
         }
@@ -137,8 +153,11 @@ pub async fn apply(
             // Best-effort by design; uninstall cancels it via install::cancel_warm.
             tauri::async_runtime::spawn_blocking(|| {
                 let settings = Settings::load();
-                let dl = downloader(&settings);
-                install::warm_cache(&settings, &dl);
+                // best-effort like the warm itself: a source that cannot be opened just means the
+                // optional content downloads on demand later
+                if let Ok(dl) = downloader(&settings) {
+                    install::warm_cache(&settings, dl.as_ref());
+                }
             });
         }
         report

@@ -161,7 +161,10 @@ pub fn run_game_install(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let game_dir = settings.resolve_game_dir()?;
     let (dl, release, manifest) = game_repo_manifest(&settings)?;
-    let r = install::install_base(&game_dir, &dl, &release, &manifest, None, None, None)?;
+    // one source: the headless path keeps auth and sources simple on purpose (see
+    // `game_repo_manifest`) — the source chain is the GUI's business
+    let origins = [install::Origin::new(&dl, &release)];
+    let r = install::install_base(&game_dir, &origins, &manifest, None, None, None)?;
     println!(
         "Base game {} ({}): wrote {} ({} MB), up-to-date {}, skipped {}",
         r.version,

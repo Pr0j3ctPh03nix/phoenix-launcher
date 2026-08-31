@@ -3,8 +3,9 @@
 //! GitHub backend (github.rs), tests use the in-memory fake below. New transports (a CDN
 //! mirror, resumable downloads) slot in without touching engine/install logic.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +91,24 @@ pub type ChunkProgress<'a> = &'a mut dyn FnMut(u64, Option<u64>) -> bool;
 /// Send + Sync: install's phase 1 downloads several files at once from a worker pool, sharing
 /// one Downloader reference across threads.
 pub trait Downloader: Send + Sync {
+    /// Does this backend address a payload entry by its CONTENT HASH rather than by the opaque
+    /// release-asset `name` the manifest carries?
+    ///
+    /// One question, asked at two places in install.rs, and the reason it is a trait method rather
+    /// than a downcast: both sites need the same fact and neither may know which concrete backend
+    /// it holds.
+    ///   - asset resolution: a name-addressed backend looks `name` up in the release's asset list
+    ///     to learn the URL; a content-addressed one derives the URL from the hash and needs no
+    ///     list at all.
+    ///   - the release-index preflight: it refuses a run whose asset names the release does not
+    ///     carry. A content-addressed backend HAS no release index, so there is nothing to check
+    ///     against and the preflight can only ever say "addressable" — existence is learned when
+    ///     the blob is fetched.
+    /// Default false: a release-hosted backend is the ordinary case, and an impl that says nothing
+    /// is that case.
+    fn content_addressed(&self) -> bool {
+        false
+    }
     /// A release by tag (or the latest).
     fn fetch_release(&self, repo: &str, tag: Option<&str>) -> Result<Release>;
     /// All releases, newest first.
@@ -115,6 +134,85 @@ pub trait Downloader: Send + Sync {
     /// of `dest` is hashed (so the returned sha covers everything) and only the remainder is
     /// fetched; an impl that can't resume simply restarts from zero.
     fn download_to(&self, asset: &Asset, dest: &Path, resume_from: u64, progress: ChunkProgress) -> Result<(u64, String)>;
+}
+
+/// A response body as `stream_to_file` has to see it — deliberately not a `ureq::Response`, so the
+/// resumable writer stays on this side of the engine's HTTP-free seam. Each HTTP backend builds one
+/// through `transport::body_of`, which is the single place `Content-Range` is parsed.
+pub struct Body {
+    /// Byte offset the peer says this body starts at, from a 206's `Content-Range`. `None` when it
+    /// answered 200 (declined the range) or sent nothing usable — see `stream_to_file` for why the
+    /// two are treated alike.
+    pub range_start: Option<u64>,
+    /// The peer's claim about how many bytes follow, from `Content-Length`. Progress only.
+    pub content_length: Option<u64>,
+    pub reader: Box<dyn Read + Send + Sync + 'static>,
+}
+
+/// The resumable streaming download, shared by every HTTP backend: hash the prefix already on
+/// disk, ask for the rest, append it, and return (bytes written, sha256 of the WHOLE file). Never
+/// buffers the body.
+///
+/// `open` issues the request for one attempt and is handed the offset to resume from (`None` =
+/// start over). It is a callback rather than a response because that request is the ONLY thing the
+/// backends differ in: GitHub's carries auth and a hop to pre-signed storage, a mirror's is a plain
+/// GET at a content-addressed URL. Everything after it — the range check, the truncate, the hash —
+/// is identical, and one copy is what stops the two drifting into two sets of resume rules.
+pub fn stream_to_file(
+    dest: &Path,
+    resume_from: u64,
+    open: impl FnOnce(Option<u64>) -> Result<Body>,
+    progress: ChunkProgress,
+) -> Result<(u64, String)> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut prefix: u64 = 0;
+    if resume_from > 0 {
+        if let Ok(f) = std::fs::File::open(dest) {
+            prefix = f.metadata()?.len().min(resume_from);
+            std::io::copy(&mut f.take(prefix), &mut hasher)?;
+        }
+    }
+    let body = open((prefix > 0).then_some(prefix))?;
+    // A 206 is only usable if it is the range we ASKED for. The status alone says "partial", not
+    // "partial from `prefix`" — a peer answering 206 with a different offset would have its bytes
+    // appended at `prefix`, producing a plausibly-sized file that fails only at the final hash, and
+    // burning the one clean restart a resume gets. Absent Content-Range is treated as a decline for
+    // the same reason: unverifiable is not the same as correct.
+    if prefix > 0 && body.range_start != Some(prefix) {
+        prefix = 0; // server declined the Range, or answered a different one — restart at zero
+        hasher = Sha256::new();
+    }
+    let total: Option<u64> = body.content_length.map(|l| l + prefix);
+    let mut reader = body.reader;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false) // length is fixed explicitly via set_len below (resume keeps the prefix)
+        .open(dest)
+        .with_context(|| format!("creating {}", dest.display()))?;
+    // drop any stale tail beyond the prefix we just hashed, then append
+    file.set_len(prefix)?;
+    file.seek(std::io::SeekFrom::Start(prefix))?;
+    // 256 KiB reads, matching verify.rs's file hashing: the payload includes multi-hundred-MB
+    // VPKs, and 64 KiB quadrupled the read syscalls per file for nothing
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut written = prefix;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        std::io::Write::write_all(&mut file, &buf[..n])?;
+        hasher.update(&buf[..n]);
+        written += n as u64;
+        if !progress(written, total) {
+            // caller aborted (a sibling download failed, a warm was cancelled) — the
+            // partial file stays behind as the resume source
+            anyhow::bail!("download aborted");
+        }
+    }
+    Ok((written, hex::encode(hasher.finalize())))
 }
 
 #[cfg(test)]

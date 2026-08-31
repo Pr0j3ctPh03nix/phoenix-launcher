@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::config::Settings;
-use crate::downloader::{Downloader, NetKind, Release};
+use crate::downloader::{Asset, Downloader, NetKind, Release};
 use crate::manifest::{Bundle, FileEntry, Manifest};
 use crate::state::{InstalledFile, InstalledState};
 use crate::{engine, fslock, verify};
@@ -246,7 +246,12 @@ pub fn install(
     let staging = game_dir.join(STAGING_DIR);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).context("creating the staging directory")?;
-    obtain_all(&cache, dl, &release, &to_write, &manifest, progress, cancel)?;
+    // One source: the shim payload is a handful of assets (one bundle), and which source serves it
+    // was already decided by `cmd::open_repo`'s own failover — a second release fetch per remaining
+    // source, on every apply, would buy per-asset failover for a download that is over in seconds.
+    // The base game, where a run is ~136 bundles and hours long, is the case that needs it and
+    // `install_base` takes the whole chain.
+    obtain_all(&cache, &[Origin::new(dl, &release)], &to_write, &manifest, progress, cancel)?;
 
     // --- phase 1b: stage locally (same volume, so the phase-2 move is atomic) ---
     let mut staged: Vec<(&FileEntry, PathBuf)> = Vec::new();
@@ -500,6 +505,97 @@ fn transient_net_failure(e: &anyhow::Error) -> bool {
     })
 }
 
+/// One place a payload can be fetched from: a backend, plus the release whose asset list its
+/// entry NAMES resolve against.
+///
+/// Callers hand a SLICE of these, in priority order, and an asset that a source cannot deliver
+/// advances to the next one (see `obtain_to_cache`). A single-source run is the one-element case
+/// and pays nothing for the machinery. The two are paired in one value because they must not drift:
+/// resolving an entry against a release some OTHER source published would hand this source a URL
+/// it never advertised.
+///
+/// A content-addressed backend (`Downloader::content_addressed`) ignores the release entirely — its
+/// entries are addressed by hash — but still carries one, because it is what names the release
+/// (`tag_name`) that was opened.
+pub struct Origin<'a> {
+    pub dl: &'a dyn Downloader,
+    pub release: &'a Release,
+}
+
+impl<'a> Origin<'a> {
+    pub fn new(dl: &'a dyn Downloader, release: &'a Release) -> Self {
+        Self { dl, release }
+    }
+}
+
+/// An `Origin` with its asset lookup table built — the form the download pool uses. The index is
+/// built once for the whole pool rather than per job: thousands of jobs against a release carrying
+/// thousands of assets would otherwise be a linear scan each.
+struct Resolved<'a> {
+    dl: &'a dyn Downloader,
+    /// Empty for a content-addressed backend, which has no release index to build one from.
+    index: HashMap<&'a str, &'a Asset>,
+    by_hash: bool,
+}
+
+impl<'a> Resolved<'a> {
+    fn of(origin: &Origin<'a>) -> Self {
+        let by_hash = origin.dl.content_addressed();
+        Self {
+            dl: origin.dl,
+            index: if by_hash { HashMap::new() } else { origin.release.asset_index() },
+            by_hash,
+        }
+    }
+
+    /// The fetchable asset for a payload entry, or None when this source cannot address it at all.
+    ///
+    /// A content-addressed backend has no list to look in: the entry's HASH is its address, so the
+    /// asset is SYNTHESIZED with `name` set to that hash. That is the contract
+    /// `Downloader::content_addressed` documents, and the backend reads `name` back as the hash.
+    /// A name-addressed one looks the manifest's `name` up in its own release.
+    ///
+    /// Owned rather than borrowed because the two arms cannot return the same thing; an `Asset` is
+    /// three strings and this happens once per download attempt, not per chunk.
+    fn asset_for(&self, name: &str, sha256: &str, size: u64) -> Option<Asset> {
+        if self.by_hash {
+            return Some(Asset {
+                name: sha256.to_string(),
+                url: String::new(),
+                browser_download_url: String::new(),
+                size,
+            });
+        }
+        self.index.get(name).map(|a| (*a).clone())
+    }
+
+    /// Could this source deliver `name` at all? The preflight's question — see `install_base`.
+    fn carries(&self, name: &str) -> bool {
+        self.by_hash || self.index.contains_key(name)
+    }
+}
+
+/// How one source's attempt at an asset ended.
+///
+/// `Rejected` and `Unreachable` both advance to the next source and differ in exactly one thing:
+/// what happens to the `.part`. That distinction is the whole reason this is an enum rather than a
+/// `Result` — see `obtain_to_cache`.
+enum SourceEnd {
+    /// Fetched and verified: the `.part` holds the asset.
+    Done,
+    /// The source CONTRADICTED the signed manifest — wrong bytes, or more bytes than the manifest
+    /// promised. A fact about the source, so advance; and the prefix it wrote is poison, never a
+    /// resume source for the next one.
+    Rejected(anyhow::Error),
+    /// The exchange never completed: transport drops, a refusal, an asset this source does not
+    /// carry. Says nothing about bytes already on disk, so the `.part` survives.
+    Unreachable(anyhow::Error),
+    /// The CALLER told us to stop — a user cancel, or a sibling worker's failure. Not a source
+    /// failure at all: an instruction. It must never advance, or cancelling a 7.9 GiB install
+    /// would restart it against the next mirror.
+    Aborted(anyhow::Error),
+}
+
 /// One unit of network acquisition — an ASSET, not a file. Since manifest schema 3 the two are
 /// no longer the same thing: a raw entry maps 1:1, but a bundle is one asset carrying up to
 /// thousands of members. Jobs are what the download pool schedules, so members needed from one
@@ -674,14 +770,13 @@ impl<'a> WireIndex<'a> {
 /// COMPLETED jobs while `item`/`bytes` track whichever asset ticked most recently.
 fn obtain_all(
     cache: &Path,
-    dl: &dyn Downloader,
-    release: &Release,
+    origins: &[Origin],
     to_write: &[&FileEntry],
     manifest: &Manifest,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    obtain_all_tagged(cache, dl, release, to_write, manifest, progress, "install", cancel)
+    obtain_all_tagged(cache, origins, to_write, manifest, progress, "install", cancel)
 }
 
 /// `obtain_all` with the progress `op` tag and an external cancel flag injected — the base-game
@@ -691,8 +786,7 @@ fn obtain_all(
 #[allow(clippy::too_many_arguments)]
 fn obtain_all_tagged(
     cache: &Path,
-    dl: &dyn Downloader,
-    release: &Release,
+    origins: &[Origin],
     to_write: &[&FileEntry],
     manifest: &Manifest,
     progress: engine::Progress,
@@ -721,9 +815,9 @@ fn obtain_all_tagged(
     // members of a bundle whose other two thousand still have to be sized to be skipped over
     let sizes: HashMap<&str, u64> = manifest.payload_entries().map(|(_, s, z)| (s, z)).collect();
 
-    // one lookup table for the whole pool: thousands of jobs against a release carrying
+    // one lookup table PER SOURCE for the whole pool: thousands of jobs against a release carrying
     // thousands of assets would otherwise be a linear scan each
-    let index = release.asset_index();
+    let sources: Vec<Resolved> = origins.iter().map(Resolved::of).collect();
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
     let abort = AtomicBool::new(false); // cheap flag mirrored from first_err, checked per chunk
@@ -791,7 +885,7 @@ fn obtain_all_tagged(
                     true
                 };
                 let mut keep_going = || !(abort.load(Ordering::Relaxed) || cancelled());
-                match obtain_acq(cache, dl, &index, job, &sizes, &mut chunk, &mut keep_going) {
+                match obtain_acq(cache, &sources, job, &sizes, &mut chunk, &mut keep_going) {
                     Ok(()) => {
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                         match job {
@@ -868,8 +962,7 @@ fn obtain_all_tagged(
 /// decode (which must stay off the byte accounting — its progress is not wire progress).
 fn obtain_acq(
     cache: &Path,
-    dl: &dyn Downloader,
-    index: &HashMap<&str, &crate::downloader::Asset>,
+    sources: &[Resolved],
     acq: &Acq,
     sizes: &HashMap<&str, u64>,
     chunk: crate::downloader::ChunkProgress,
@@ -878,7 +971,7 @@ fn obtain_acq(
     match acq {
         Acq::Empty { sha256 } => materialize_empty(cache, sha256).map(drop),
         Acq::Raw { name, sha256, size } => {
-            obtain_to_cache(cache, dl, index, name, sha256, *size, chunk).map(drop)
+            obtain_to_cache(cache, sources, name, sha256, *size, chunk, keep_going).map(drop)
         }
         Acq::Bundle { bundle, wanted } => {
             // One flow decodes a given bundle at a time, process-wide: obtain_to_cache guards
@@ -898,8 +991,15 @@ fn obtain_acq(
             }
             // R3 rides on the existing verify: obtain_to_cache renames the packed asset into
             // the cache only after psize + psha256 check out — nothing unverified is decoded
-            let packed =
-                obtain_to_cache(cache, dl, index, &bundle.name, &bundle.psha256, bundle.psize, chunk)?;
+            let packed = obtain_to_cache(
+                cache,
+                sources,
+                &bundle.name,
+                &bundle.psha256,
+                bundle.psize,
+                chunk,
+                keep_going,
+            )?;
             extract_members(cache, &packed, bundle, &missing, sizes, keep_going)?;
             let _ = std::fs::remove_file(&packed);
             Ok(())
@@ -1072,12 +1172,12 @@ impl Drop for Inflight {
 /// Path to a verified cache entry for an asset: cache hit, else streaming download + verify.
 fn obtain_to_cache(
     cache: &Path,
-    dl: &dyn Downloader,
-    index: &HashMap<&str, &crate::downloader::Asset>,
+    sources: &[Resolved],
     name: &str,
     sha256: &str,
     size: u64,
     chunk: crate::downloader::ChunkProgress,
+    keep_going: &mut dyn FnMut() -> bool,
 ) -> Result<PathBuf> {
     let cpath = cache.join(sha256);
     if cache_ok(&cpath, sha256, size) {
@@ -1100,14 +1200,76 @@ fn obtain_to_cache(
     if cache_ok(&cpath, sha256, size) {
         return Ok(cpath);
     }
-    let asset = index
-        .get(name)
-        .copied()
-        .with_context(|| format!("the release has no asset named {name}"))?;
     let tmp = cache.join(format!("{sha256}.part"));
+
+    // Walk the sources. An asset that one source cannot deliver moves to the next; only when every
+    // source is spent does the run fail. Which is the difference between a 7.9 GiB base install
+    // dying on one bad asset and finishing from a mirror.
+    let mut last: Option<anyhow::Error> = None;
+    for source in sources {
+        // An abort landing between sources is still an abort: advancing here would restart a
+        // cancelled install against the next mirror.
+        if !keep_going() {
+            return Err(anyhow!("download aborted"));
+        }
+        match attempt_source(source, &tmp, name, sha256, size, chunk, keep_going) {
+            SourceEnd::Done => {
+                return std::fs::rename(&tmp, &cpath)
+                    .map(|()| cpath)
+                    .with_context(|| format!("caching {name}"));
+            }
+            // An instruction, not a failure — nothing to fall through to.
+            SourceEnd::Aborted(e) => return Err(e),
+            SourceEnd::Rejected(e) => {
+                // These bytes came from a source that has just been shown to contradict the signed
+                // manifest. Resume is per-ASSET, so leaving them would hand the next source a
+                // prefix written by a broken (or hostile) one and let that corruption survive the
+                // failover — the whole-file hash would catch it, but only after the next source
+                // had re-fetched the entire remainder to reach the same wall.
+                let _ = std::fs::remove_file(&tmp);
+                last = Some(e);
+            }
+            SourceEnd::Unreachable(e) => {
+                // The opposite case, and the reason the two are distinguished at all: a transport
+                // failure says nothing about the bytes already written, and on the links this
+                // feature exists for those bytes can be gigabytes. They are kept as the next
+                // source's resume prefix — safely, because the final whole-file hash still covers
+                // them, and `attempt_source`'s clean-restart budget (reset per source) spends one
+                // from-zero retry before an inherited prefix is allowed to indict the source that
+                // merely finished it.
+                last = Some(e);
+            }
+        }
+    }
+    Err(match (last, sources.len()) {
+        (Some(e), n) if n > 1 => e.context(format!("downloading {name} from all {n} sources")),
+        (Some(e), _) => e,
+        (None, _) => anyhow!("no download source is configured"),
+    })
+}
+
+/// One source's whole attempt at one asset: resume, retry with backoff, verify. Returns HOW it
+/// ended, because the caller's next move — advance, stop, or keep the `.part` — depends on which.
+fn attempt_source(
+    source: &Resolved,
+    tmp: &Path,
+    name: &str,
+    sha256: &str,
+    size: u64,
+    chunk: crate::downloader::ChunkProgress,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> SourceEnd {
+    let dl = source.dl;
+    let Some(asset) = source.asset_for(name, sha256, size) else {
+        // Nothing this source can even address — a permanent fact about IT, not about the release.
+        return SourceEnd::Unreachable(anyhow!("the release has no asset named {name}"));
+    };
     let mut attempt = 0u32;
     // A verification failure that followed a RESUME indicts the prefix we inherited, not the
     // source — spend one clean restart before calling the release broken. See the bail below.
+    // PER SOURCE, deliberately: the prefix a failover inherits was written by the PREVIOUS source,
+    // so a budget already spent elsewhere would let one source's corruption condemn the next one
+    // that is merely finishing its file.
     let mut may_restart_clean = true;
     loop {
         // an interrupted attempt (an earlier run's, or this loop's previous try) left a .part —
@@ -1137,15 +1299,15 @@ fn obtain_to_cache(
                 }
                 chunk(written, total)
             };
-            dl.download_to(asset, &tmp, resume_from, &mut guarded)
+            dl.download_to(&asset, tmp, resume_from, &mut guarded)
         };
         match result {
             Ok((got_size, got_sha)) => {
                 if got_size == size && got_sha == sha256 {
-                    break;
+                    return SourceEnd::Done;
                 }
                 // Wrong bytes. Resume cannot help either way, so the .part goes.
-                let _ = std::fs::remove_file(&tmp);
+                let _ = std::fs::remove_file(tmp);
                 // Whose fault is it? If this attempt RESUMED, the hash covers a prefix we did not
                 // fetch and did not verify — and that prefix has a mundane way of being wrong that
                 // has nothing to do with the release: NTFS journals metadata, not data, so a
@@ -1161,17 +1323,27 @@ fn obtain_to_cache(
                     continue;
                 }
                 // Fetched whole and still wrong: that is a fact about the source, not about us.
-                // Not retried — `transient_net_failure` deliberately excludes verification, and
-                // re-asking a settled question just burns the link.
-                bail!(
+                // Not retried against THIS source — `transient_net_failure` deliberately excludes
+                // verification, and re-asking a settled question just burns the link. The next
+                // source is asked instead, from zero.
+                return SourceEnd::Rejected(anyhow!(
                     "verification failed for {name}: manifest {size}b/{sha256} got {got_size}b/{got_sha}"
-                );
+                ));
             }
             Err(e) => {
+                // An abort is an INSTRUCTION (Stop, or a sibling worker's failure), not a
+                // transport problem, and it can land mid-attempt — inside `download_to`, which
+                // fails the transfer the moment the chunk callback says stop. Asked of the abort
+                // line itself rather than sniffed out of the error, so no impl's wording can
+                // silently turn a cancel into a failover. `capped` is checked first: it rides the
+                // same callback but is a fact about the SOURCE, not an instruction from us.
+                if !capped && !keep_going() {
+                    return SourceEnd::Aborted(e);
+                }
                 // keep the .part — the next attempt (or run) resumes from it — unless it is now
                 // full-length or longer, which no future Range request could extend
-                if std::fs::metadata(&tmp).map(|m| m.len() >= size).unwrap_or(false) {
-                    let _ = std::fs::remove_file(&tmp);
+                if std::fs::metadata(tmp).map(|m| m.len() >= size).unwrap_or(false) {
+                    let _ = std::fs::remove_file(tmp);
                 }
                 // A cap violation is not an ordinary abort even though it rides the same
                 // callback (Stop, a sibling's failure) — it is a distinct fact, "the source sent
@@ -1180,30 +1352,32 @@ fn obtain_to_cache(
                 // (it isn't: no `NetKind` is in this chain, so `transient_net_failure` already
                 // says no — this bails explicitly so the reason is not left to fall out of that).
                 if capped {
-                    bail!(
+                    return SourceEnd::Rejected(anyhow!(
                         "{name}: the source sent more than the signed {size} bytes — refusing \
                          (the host is misbehaving or hostile)"
-                    );
+                    ));
                 }
                 attempt += 1;
                 if attempt > DL_RETRIES || !transient_net_failure(&e) {
-                    return Err(e).with_context(|| {
-                        if attempt > 1 {
-                            format!("downloading {name} (after {attempt} attempts)")
-                        } else {
-                            format!("downloading {name}")
-                        }
-                    });
+                    // Spent, or a failure no retry can fix (a 4xx, an unreadable release). Either
+                    // way the next SOURCE may still have it, and the bytes on disk are untouched
+                    // by this verdict — `Unreachable` keeps them.
+                    let n = attempt;
+                    return SourceEnd::Unreachable(e.context(if n > 1 {
+                        format!("downloading {name} (after {n} attempts)")
+                    } else {
+                        format!("downloading {name}")
+                    }));
                 }
                 // Exponential backoff, slept in slices with the chunk callback polled between
                 // them: the callback is the cancel line (Stop, a sibling's failure), and a
                 // cancel during a multi-second nap must land now — the sleeper reports the
                 // bytes it already has, which the grain check keeps out of the UI.
-                let written = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+                let written = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
                 let delay = RETRY_BACKOFF_MS << (attempt - 1);
                 for _ in 0..delay.div_ceil(RETRY_SLICE_MS) {
                     if !chunk(written, None) {
-                        return Err(anyhow!("download aborted"));
+                        return SourceEnd::Aborted(anyhow!("download aborted"));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(
                         RETRY_SLICE_MS.min(delay),
@@ -1212,8 +1386,6 @@ fn obtain_to_cache(
             }
         }
     }
-    std::fs::rename(&tmp, &cpath).with_context(|| format!("caching {name}"))?;
-    Ok(cpath)
 }
 
 /// Installed files already matching their manifest hash are verified byte sources — copy them into
@@ -1288,7 +1460,9 @@ fn prefetch_all(
     manifest: &Manifest,
     cancelled: &dyn Fn() -> bool,
 ) {
-    let index = release.asset_index();
+    // One source: a warm is optional content fetched in the background, so the source the caller
+    // already opened is the only one worth spending a round trip on.
+    let sources = [Resolved::of(&Origin::new(dl, release))];
     let sizes: HashMap<&str, u64> = manifest.payload_entries().map(|(_, s, z)| (s, z)).collect();
     let Ok(acqs) = build_acqs(&manifest.bundles, manifest.payload_entries()) else { return };
     for acq in acqs {
@@ -1301,8 +1475,7 @@ fn prefetch_all(
         // huge optional asset finish downloading first.
         let _ = obtain_acq(
             cache,
-            dl,
-            &index,
+            &sources,
             &acq,
             &sizes,
             &mut |_, _| !cancelled(),
@@ -2500,15 +2673,25 @@ fn ensure_disk_space(need: u64, free: Option<u64>) -> Result<()> {
 ///   * it is the ONLY way a `Kept` file gets written. Pins are an instruction, so the default
 ///     (`None`) write set skips them; naming one explicitly is the user checking it back on, and
 ///     the caller is expected to drop the pin afterwards.
+/// `origins` are the download sources in priority order — see `Origin`. The first is the one the
+/// manifest was opened from (it names the release); the rest are fallbacks an individual asset
+/// advances to when it cannot be had from an earlier one. This is where per-asset failover earns
+/// its keep: the base game is ~136 bundles and 7.9 GiB, so one asset a source will not serve used
+/// to end the whole run.
 pub fn install_base(
     game_dir: &Path,
-    dl: &dyn Downloader,
-    release: &Release,
+    origins: &[Origin],
     manifest: &Manifest,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
     only: Option<&HashSet<String>>,
 ) -> Result<BaseReport> {
+    // The first origin is the one the caller opened the manifest from, so it is what NAMES this
+    // release; the others are fallbacks for bytes, never for identity.
+    let release = origins
+        .first()
+        .map(|o| o.release)
+        .context("no download source was opened for the base game")?;
     // cancellable from the first file: repairing a live folder hashes it before a byte is
     // downloaded, and a Cancel that only took effect once the download started sat inert for
     // minutes on exactly the screen that shows a Stop button
@@ -2551,16 +2734,23 @@ pub fn install_base(
         to_write.iter().map(|(fe, _)| (fe.name.as_deref(), fe.sha256.as_str(), fe.size)),
     )?;
 
-    // Preflight the asset index. A name the release does not carry is a permanent condition no
-    // retry can fix, and the lookup otherwise happens inside the download worker — so a
-    // truncated asset array surfaced only after thousands of files and gigabytes, dressed up as
-    // a transient download failure. Milliseconds here, hours saved there.
+    // Preflight the asset index. A name NO source carries is a permanent condition no retry can
+    // fix, and the lookup otherwise happens inside the download worker — so a truncated asset
+    // array surfaced only after thousands of files and gigabytes, dressed up as a transient
+    // download failure. Milliseconds here, hours saved there.
+    //
+    // "No source", not "not the first source": with a chain, an asset one release omits is exactly
+    // what failover exists to survive. And a CONTENT-ADDRESSED source (`content_addressed`) has no
+    // release index at all, so it can only ever answer "addressable" — with one in the chain this
+    // check weakens to that, and whether the blob is really there is learned when it is fetched.
+    // That is the honest limit of a preflight against a backend that publishes no index.
+    let addressable: Vec<Resolved> = origins.iter().map(Resolved::of).collect();
     let missing: Vec<&str> = {
         let mut seen = HashSet::new();
         acqs.iter()
             .filter_map(Acq::asset_name)
             .filter(|name| seen.insert(*name))
-            .filter(|name| release.asset(name).is_none())
+            .filter(|name| !addressable.iter().any(|s| s.carries(name)))
             .collect()
     };
     if !missing.is_empty() {
@@ -2598,7 +2788,7 @@ pub fn install_base(
     let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
     std::fs::create_dir_all(&cache).context("creating the asset cache")?;
     let fe_only: Vec<&FileEntry> = to_write.iter().map(|(fe, _)| *fe).collect();
-    obtain_all_tagged(&cache, dl, release, &fe_only, manifest, progress, "game", cancel)?;
+    obtain_all_tagged(&cache, origins, &fe_only, manifest, progress, "game", cancel)?;
 
     // the game may have started during a multi-GB download — re-probe before touching anything
     probe_writable(game_dir, rels.iter())?;
@@ -3729,14 +3919,14 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         // two differences: one the user picks, one they spare
         std::fs::write(dir.join("game/dota/cfg/a.cfg"), b"MOD").unwrap();
         std::fs::write(dir.join("game/core/cfg/b.cfg"), b"BAD").unwrap();
 
         let only: HashSet<String> = ["game/core/cfg/b.cfg".to_string()].into_iter().collect();
-        let r = install_base(&dir, &dl, &release, &manifest, None, None, Some(&only)).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, Some(&only)).unwrap();
         assert_eq!(r.written, 1);
         assert_eq!(std::fs::read(dir.join("game/core/cfg/b.cfg")).unwrap(), b"CFG", "restored");
         assert_eq!(
@@ -3755,7 +3945,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MY MOD").unwrap();
@@ -3770,12 +3960,12 @@ mod tests {
         assert!(!st.action.writes(), "a pin is not a difference to be fixed");
 
         // the sweeping repair leaves it alone
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"MY MOD");
 
         // ...but naming it does not
         let only: HashSet<String> = [dest.to_string()].into_iter().collect();
-        install_base(&dir, &dl, &release, &manifest, None, None, Some(&only)).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, Some(&only)).unwrap();
         assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"CFG");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3793,7 +3983,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MY MOD").unwrap();
@@ -3812,7 +4002,7 @@ mod tests {
             }
         };
         let only: HashSet<String> = [dest.to_string()].into_iter().collect();
-        let r = install_base(&dir, &dl, &release, &manifest, Some(&emit), None, Some(&only)).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, Some(&emit), None, Some(&only)).unwrap();
 
         assert_eq!(r.written, 1, "the one file the user picked is restored");
         assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"CFG");
@@ -3834,7 +4024,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MY MOD").unwrap();
@@ -3867,7 +4057,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MOD v1").unwrap();
@@ -3894,7 +4084,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         std::fs::write(dir.join("game/dota/cfg/a.cfg"), b"much longer than three").unwrap();
         std::fs::remove_file(dir.join("game/core/cfg/b.cfg")).unwrap();
 
@@ -3918,7 +4108,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         // a mod dropping a loose file among stock ones
         std::fs::write(dir.join("game/dota/cfg/mymod.cfg"), b"hello").unwrap();
@@ -3968,7 +4158,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
 
         let claimed: HashSet<String> = manifest.files.iter().map(|f| f.dest.clone()).collect();
@@ -3997,7 +4187,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         // the shim's payload: its own top-level tree, plus a file among the game's own
         std::fs::create_dir_all(dir.join("game/dota_phoenix/pak01")).unwrap();
@@ -4113,7 +4303,7 @@ mod tests {
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 4);
         assert_eq!((r.up_to_date, r.skipped), (0, 0));
         assert_eq!(r.bytes, 12); // 4 files × 3 bytes — shared content still counts per placed file
@@ -4153,7 +4343,7 @@ mod tests {
         let dl = base_fake("v1805", &m, vec![("real", b"DATA")]);
         let (release, manifest) = base_fetch(&dl);
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2);
         let empty = dir.join("game/core/scripts/vscripts/game/gameinit.lua");
         assert!(empty.exists(), "the empty file must exist");
@@ -4177,7 +4367,7 @@ mod tests {
         .to_string();
         let dl = base_fake("v1805", &m, vec![]);
         let (release, manifest) = base_fetch(&dl);
-        let err = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap_err();
+        let err = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("not the empty hash"), "got: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4196,7 +4386,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 4);
         assert_eq!(std::fs::read(dir.join("game/dota/pak01_dir.vpk")).unwrap(), b"PAK");
         assert!(game_present(&dir), "and it is a game folder afterwards");
@@ -4211,13 +4401,13 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         // corrupt one file, delete another, leave the rest alone
         std::fs::write(dir.join("game/dota/pak01_dir.vpk"), b"CORRUPT").unwrap();
         std::fs::remove_file(dir.join("game/dota/cfg/a.cfg")).unwrap();
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2, "only the corrupt + missing files");
         assert_eq!(r.up_to_date, 2);
         assert_eq!(std::fs::read(dir.join("game/dota/pak01_dir.vpk")).unwrap(), b"PAK");
@@ -4236,7 +4426,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         // held open with no sharing at all — what an antivirus or a second process produces
         let lock = std::fs::OpenOptions::new()
@@ -4270,7 +4460,7 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
 
         let victim = dir.join("game/dota/pak01_dir.vpk");
         std::fs::write(&victim, b"PAK plus a great deal more").unwrap(); // manifest says 3 bytes
@@ -4367,7 +4557,7 @@ mod tests {
         let (mm, assets) = base_release();
         let dl = base_fake("v1805", &mm, assets);
         let (release, manifest) = base_fetch(&dl);
-        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 1);
         assert_eq!(r.skipped, 1);
         assert_eq!(std::fs::read(dir.join(".phoenix-vanilla/game/dota/cfg/a.cfg")).unwrap(), b"CFG");
@@ -4757,12 +4947,12 @@ mod tests {
         let release = dl.fetch_release("r", None).unwrap();
 
         // a full install, then damage BOTH files of bundle A; bundle B's file stays intact
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         std::fs::write(dir.join("game/dota/a1.txt"), b"corrupt").unwrap();
         std::fs::write(dir.join("game/dota/a2.txt"), b"corrupt").unwrap();
         dl.calls.lock().unwrap().clear();
 
-        let r = install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2);
         assert_eq!(std::fs::read(dir.join("game/dota/a1.txt")).unwrap(), a1);
         assert_eq!(std::fs::read(dir.join("game/dota/a2.txt")).unwrap(), a2);
@@ -4826,14 +5016,14 @@ mod tests {
         let (m, assets) = base_release();
         let dl = base_fake("v1805", &m, assets);
         let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         let leftover = std::fs::read_dir(&cache).map(|rd| rd.count()).unwrap_or(0);
         assert_eq!(leftover, 0, "stale cache entries must be reclaimed on success");
 
         // and the nothing-to-do path (everything intact) reclaims too
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join(sha(b"junk2")), b"junk2").unwrap();
-        install_base(&dir, &dl, &release, &manifest, None, None, None).unwrap();
+        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
         let leftover = std::fs::read_dir(&cache).map(|rd| rd.count()).unwrap_or(0);
         assert_eq!(leftover, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -4867,7 +5057,7 @@ mod tests {
         let (release, manifest) = base_fetch(&dl);
 
         let cancel = AtomicBool::new(true); // cancelled before the first chunk lands
-        let err = install_base(&dir, &dl, &release, &manifest, None, Some(&cancel), None).unwrap_err();
+        let err = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, Some(&cancel), None).unwrap_err();
         assert!(
             err.chain().any(|c| c.downcast_ref::<engine::Cancelled>().is_some()),
             "expected the Cancelled marker, got: {err:#}"

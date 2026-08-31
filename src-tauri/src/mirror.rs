@@ -25,12 +25,13 @@ const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 /// The published mirror list, as a release asset and at every mirror's root.
 pub const MIRRORS_ASSET: &str = "mirrors.json";
 
-/// Whether a mirror can serve an INSTALL yet. False until a `Downloader` implementation for
-/// mirrors exists — today the only one is `Github` (`github.rs`), so ranking mirrors by throughput
-/// orders a list that no download consults. Flip this in the same change that adds that impl; it
-/// exists so the boot-time sweep's cost (a 512 KiB transfer and up to `PROBE_BUDGET` per source,
-/// every launch) is not paid for a result nothing can act on. A user-initiated sweep still
-/// measures, because there the cost is asked for.
+/// Whether a mirror can serve an INSTALL yet. The `Downloader` implementation now exists (see
+/// `Mirror` below), so this is no longer a statement about missing code: it is the DEPLOYMENT
+/// switch, and it stays false until the `mirrors.json` published for these hosts is signed and the
+/// payload trees are actually mirrored. Nothing routes a byte through a mirror while it is false —
+/// `cmd::download_sources` builds a chain of the primary alone — so the boot-time sweep's cost (a
+/// 512 KiB transfer and up to `PROBE_BUDGET` per source, every launch) is not paid for a result
+/// nothing can act on. A user-initiated sweep still measures, because there the cost is asked for.
 pub const MIRROR_DOWNLOADS_ENABLED: bool = false;
 
 /// How much of a real asset to pull. Comfortably past the ~16 KiB that throttling middleboxes have
@@ -502,6 +503,287 @@ fn short(e: ureq::Error) -> String {
     match e {
         ureq::Error::Status(code, _) => format!("HTTP {code}"),
         ureq::Error::Transport(t) => t.kind().to_string(),
+    }
+}
+
+// ---- the download backend ----
+
+/// Connect/IO timeouts for the DOWNLOAD path, deliberately not the probe's. A probe's job is to
+/// fail fast and be re-run (`CONNECT_TIMEOUT`/`IO_TIMEOUT` above are 5 s); a download's is to
+/// survive a slow link, so these match github.rs's — 10 s to connect, 30 s per socket op, which
+/// detects a stall without capping the total transfer time of a multi-GB asset.
+const DL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DL_IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Idle connections kept per host, sized past install.rs's 8-worker pool plus slack — same
+/// reasoning (and the same number) as github.rs's `POOL_PER_HOST`: below the worker count, every
+/// moment two workers are between files the pool closes a connection and the next file pays a full
+/// DNS+TCP+TLS handshake again.
+const DL_POOL_PER_HOST: usize = 12;
+
+/// A mirror as a `Downloader`: a plain static file host, addressed by CONTENT.
+///
+/// The layout is rooted at the host and split by payload:
+/// ```text
+/// <base>/<payload>/manifest.json          and manifest.json.minisig beside it
+/// <base>/<payload>/blobs/<sha256>         no extension, no tag directory
+/// ```
+/// There is no tag directory on purpose. A tag path is a SECOND, unsigned name for a release, and
+/// the signed manifest already carries `version` — so a client never needs a release index to
+/// update, and a mirror can never advertise a release whose own manifest does not name it.
+///
+/// **This type cannot carry a token, structurally.** It has no such field, and that is the point
+/// rather than an omission: the authenticated GitHub path keys on `token.is_some()` and then waits
+/// for a 302 to pre-signed storage, which a static file host never sends — so a mirror holding a
+/// token could only ever hang or fail obscurely. A field "for symmetry" would make that state
+/// merely unlikely; having none makes it unrepresentable. Nothing here ever sets `Authorization`.
+///
+/// Every request goes through `transport::fetch`, so ureq's own auto-follow is never handed a
+/// `Location` header this process did not write — see that module's doc for why. A mirror's index
+/// and every URL it names are the least trusted input the launcher reads.
+pub struct Mirror {
+    /// Base URL, normalized (no trailing slash) — `config::normalize_mirror_url`'s output, which
+    /// is the only shape that ever reaches settings.
+    base: String,
+    /// The payload directory: `trust::Payload::id()`.
+    payload: &'static str,
+    agent: ureq::Agent,
+    /// The `manifest.json` bytes `fetch_release` read to learn the version, kept so the immediately
+    /// following `manifest_of` download is not a second transfer of the same document.
+    ///
+    /// More than a saving: it is what makes the reported `tag_name` HONEST. The tag is derived from
+    /// this document, and this document is the one that then gets signature-checked and parsed — so
+    /// there is no window in which a mirror could name one release and serve another.
+    manifest: std::sync::Mutex<Option<Vec<u8>>>,
+}
+
+impl Mirror {
+    pub fn new(base: &str, payload: crate::trust::Payload) -> Self {
+        Self {
+            base: base.trim_end_matches('/').to_string(),
+            payload: payload.id(),
+            agent: download_agent(),
+            manifest: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// A release DOCUMENT beside the payload: `<base>/<payload>/<name>`.
+    fn doc_url(&self, name: &str) -> String {
+        format!("{}/{}/{name}", self.base, self.payload)
+    }
+
+    /// A payload entry's bytes: `<base>/<payload>/blobs/<sha256>` — no extension, because the name
+    /// IS the hash and an extension would be a second, unsigned claim about the content.
+    fn blob_url(&self, sha256: &str) -> String {
+        format!("{}/{}/blobs/{sha256}", self.base, self.payload)
+    }
+
+    /// Where an `Asset` this backend is handed actually lives.
+    ///
+    /// The rule is the whole of content addressing: a 64-lowercase-hex name is an entry's CONTENT
+    /// HASH (which is what `Downloader::content_addressed` promises a caller synthesized), so it
+    /// resolves to a blob; anything else is one of the release documents at the payload root. An
+    /// asset belonging to some OTHER backend's release — a GitHub asset name, say — matches neither
+    /// shape as a hash and would be looked for as a document, so it is refused by the fetch itself
+    /// rather than silently mis-addressed. `Asset::url`/`browser_download_url` are ignored
+    /// entirely: a mirror derives its own URLs and never follows one a release index named.
+    fn url_of(&self, name: &str) -> String {
+        if is_content_hash(name) {
+            self.blob_url(name)
+        } else {
+            self.doc_url(name)
+        }
+    }
+
+    /// One GET, redirects driven by `transport::fetch`, never carrying credentials.
+    fn get(&self, url: &str, range: Option<&str>) -> Result<ureq::Response> {
+        transport::fetch(&self.agent, url, |req, _same_origin| {
+            let req = req.set("User-Agent", UA);
+            match range {
+                Some(v) => req.set("Range", v),
+                None => req,
+            }
+        })
+        .map_err(net_err_fetch)
+    }
+
+    /// The payload's manifest bytes, fetched once and remembered — see the `manifest` field.
+    fn manifest_bytes(&self) -> Result<Vec<u8>> {
+        if let Some(b) = self.manifest.lock().unwrap().as_ref() {
+            return Ok(b.clone());
+        }
+        let mut buf = Vec::new();
+        // `take(max + 1)` rather than trusting Content-Length, exactly as github.rs does: the
+        // length header is the peer's claim, and a host that intends to exhaust this process's
+        // memory is not going to declare it.
+        self.get(&self.doc_url(crate::engine::MANIFEST_ASSET), None)?
+            .into_reader()
+            .take(crate::trust::MAX_DOC_BYTES + 1)
+            .read_to_end(&mut buf)?;
+        if buf.len() as u64 > crate::trust::MAX_DOC_BYTES {
+            anyhow::bail!(
+                "{} is larger than the {} bytes allowed for it",
+                crate::engine::MANIFEST_ASSET,
+                crate::trust::MAX_DOC_BYTES
+            );
+        }
+        *self.manifest.lock().unwrap() = Some(buf.clone());
+        Ok(buf)
+    }
+}
+
+/// The download agent. Same redirect and scheme policy as the probe's (`probe_agent`) and for the
+/// same reasons — read its comments — with the download path's own timeouts and connection pool.
+fn download_agent() -> ureq::Agent {
+    ureq::builder()
+        .timeout_connect(DL_CONNECT_TIMEOUT)
+        .timeout_read(DL_IO_TIMEOUT)
+        .timeout_write(DL_IO_TIMEOUT)
+        .max_idle_connections_per_host(DL_POOL_PER_HOST)
+        .redirects(0)
+        .https_only(true)
+        .build()
+}
+
+/// 64 lowercase hex — the one shape a payload entry's `sha256` may take. The authority on the rule
+/// is `manifest::Manifest::validate_hashes`, which REFUSES a manifest that breaks it; this is the
+/// same test applied to decide which of two URL shapes a name belongs to.
+fn is_content_hash(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// A mirror's fetch failure as an anyhow chain rooted at a typed `NetKind`.
+///
+/// Rooting it is load-bearing twice over: source failover advances on `NetKind::Transport`, and
+/// `install::transient_net_failure` decides retries on the same type — a bare string error would
+/// silently disable both. A sibling of github.rs's `net_err_fetch` rather than a shared copy,
+/// because what may be SAID differs: no response-body snippet (a mirror's error body is arbitrary
+/// content from the least trusted host the launcher talks to) and no URL (ureq's transport errors
+/// carry the one they were fetching, which would put a full asset URL in the UI's detail line).
+fn net_err_fetch(e: FetchError) -> anyhow::Error {
+    match e {
+        FetchError::Http(ureq::Error::Status(code, _)) => {
+            anyhow::Error::new(NetKind::Status(code)).context(format!("HTTP {code} from the mirror"))
+        }
+        FetchError::Http(ureq::Error::Transport(t)) => anyhow::Error::new(NetKind::Transport)
+            .context(format!("transport error from the mirror: {}", t.kind())),
+        FetchError::TooManyRedirects => anyhow::Error::new(NetKind::Transport)
+            .context(format!("too many redirects (max {})", transport::MAX_REDIRECTS)),
+        FetchError::BadRedirect(reason) => anyhow::Error::new(NetKind::Transport).context(reason),
+    }
+}
+
+impl Downloader for Mirror {
+    /// Yes: this backend has no release index at all, and an entry's hash is its address.
+    fn content_addressed(&self) -> bool {
+        true
+    }
+
+    /// The one release a mirror serves for this payload, as a synthetic `Release` carrying the two
+    /// documents the trust gate reads. It is a REAL request — the manifest is fetched here — which
+    /// is exactly what makes this the probe that source failover needs: a mirror that is
+    /// unreachable, or does not carry this payload, says so before anything downstream believes it
+    /// was opened.
+    ///
+    /// `repo` is ignored: the base URL already names the host and the payload directory already
+    /// names what is served, so there is no owner/name to resolve. `tag` is not ignored, but it
+    /// cannot be RESOLVED either — there is no tag directory to look in (see the type's doc). It is
+    /// instead CHECKED against the version the served manifest names, so "install the release the
+    /// UI showed me" gets a truthful answer from a mirror that has since moved on, rather than
+    /// quietly installing a different one.
+    fn fetch_release(&self, _repo: &str, tag: Option<&str>) -> Result<Release> {
+        let bytes = self.manifest_bytes()?;
+        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()
+            .and_then(|v| v.get("version")?.as_str().map(str::to_string))
+            .context("the mirror's manifest.json names no version")?;
+        let tag_name = format!("v{version}");
+        if let Some(want) = tag {
+            if want != tag_name {
+                // A refusal about THIS source, not about the release: rooted at a status so the
+                // chain falls through to one that does serve it.
+                return Err(anyhow::Error::new(NetKind::Status(404)).context(format!(
+                    "the mirror serves {tag_name}, not {want}"
+                )));
+            }
+        }
+        let sig = format!("{}{}", crate::engine::MANIFEST_ASSET, crate::trust::SIG_SUFFIX);
+        let doc = |name: &str, size: u64| Asset {
+            name: name.to_string(),
+            // Both empty, and never read: `url_of` derives every URL from the name. An asset this
+            // backend produced must not carry a second address that could disagree with it.
+            url: String::new(),
+            browser_download_url: String::new(),
+            size,
+        };
+        Ok(Release {
+            tag_name,
+            assets: vec![doc(crate::engine::MANIFEST_ASSET, bytes.len() as u64), doc(&sig, 0)],
+            body: None,
+            draft: false,
+            prerelease: false,
+        })
+    }
+
+    /// A mirror publishes exactly one current release per payload — there is no history to list,
+    /// because there is no tag directory to list it from. Reported as the one-element list that is,
+    /// rather than as an error: it is a true answer, and a manufactured failure would make a
+    /// perfectly healthy mirror look broken.
+    fn fetch_releases(&self, repo: &str) -> Result<Vec<Release>> {
+        Ok(vec![self.fetch_release(repo, None)?])
+    }
+
+    fn download(&self, asset: &Asset) -> Result<Vec<u8>> {
+        if asset.name == crate::engine::MANIFEST_ASSET {
+            return self.manifest_bytes();
+        }
+        let mut buf = Vec::new();
+        self.get(&self.url_of(&asset.name), None)?.into_reader().read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// `download` with a hard ceiling, for bytes whose size is a trust input. Overridden rather
+    /// than left to the trait's read-then-check default: that default is honest for an in-memory
+    /// double, and a mirror is the most distrusted peer in the system — the ceiling has to bound
+    /// the READ, not describe it afterwards.
+    fn download_limited(&self, asset: &Asset, max: u64) -> Result<Vec<u8>> {
+        // The manifest is already in hand and already bounded (MAX_DOC_BYTES) — but the caller's
+        // own ceiling still applies, since it may be tighter than the one it was fetched under.
+        let buf = if asset.name == crate::engine::MANIFEST_ASSET {
+            self.manifest_bytes()?
+        } else {
+            let mut buf = Vec::new();
+            self.get(&self.url_of(&asset.name), None)?
+                .into_reader()
+                .take(max + 1)
+                .read_to_end(&mut buf)?;
+            buf
+        };
+        if buf.len() as u64 > max {
+            anyhow::bail!("{} is larger than the {max} bytes allowed for it", asset.name);
+        }
+        Ok(buf)
+    }
+
+    /// Stream to `dest`, resuming from `resume_from`. The resume/hash/write half is
+    /// `downloader::stream_to_file`, shared with the GitHub backend so the two cannot drift into
+    /// two sets of resume rules; all that differs is the request below.
+    fn download_to(
+        &self,
+        asset: &Asset,
+        dest: &std::path::Path,
+        resume_from: u64,
+        progress: crate::downloader::ChunkProgress,
+    ) -> Result<(u64, String)> {
+        let url = self.url_of(&asset.name);
+        crate::downloader::stream_to_file(
+            dest,
+            resume_from,
+            |prefix| {
+                let range = prefix.map(|p| format!("bytes={p}-"));
+                Ok(transport::body_of(self.get(&url, range.as_deref())?))
+            },
+            progress,
+        )
     }
 }
 
