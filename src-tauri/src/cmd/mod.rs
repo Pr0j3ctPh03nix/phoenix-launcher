@@ -89,8 +89,15 @@ pub fn open_all(repo: &str, settings: &Settings) -> AnyResult<Vec<Opened>> {
         match try_candidate(&candidate, |dl| dl.fetch_release(repo, None)) {
             Ok((dl, release)) => opened.push(Opened { dl, release }),
             Err(e) => {
+                // The same rule `walk_sources` follows, and for the same reason: a definite answer
+                // from the authoritative source ends everything, whatever a mirror would have
+                // said. This chain's HEAD is where the manifest is read from, and reading one from
+                // a mirror past "there is no such release" is exactly what that rule prevents.
+                if candidate.authoritative && !unreachable(&e) {
+                    return Err(e.context(format!("opening {repo}")));
+                }
                 if err.is_none() || candidate.authoritative {
-                    err = Some(e); // the authoritative source's answer outranks a mirror's
+                    err = Some(e); // the authoritative source's failure outranks a mirror's
                 }
             }
         }
@@ -205,10 +212,19 @@ fn try_candidate<T>(
                 return Err(e);
             };
             let auth = with_creds();
-            let v = call(auth.as_ref()).context("anonymously and with a token")?;
+            let v = call(auth.as_ref()).context("tried anonymously and with a token")?;
             Ok((auth, v))
         }
     }
+}
+
+/// Is this failure a source being DARK rather than a source ANSWERING?
+///
+/// The one predicate both walks branch on. Unreachable (or hostile) is never an answer about the
+/// release, so it always falls through to the next source — which is the point of having a chain on
+/// a network where one host being dark is the ordinary state.
+fn unreachable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Transport)))
 }
 
 /// The source walk itself, over any single repo read. It lives in ONE place on purpose: the rules
@@ -236,13 +252,9 @@ fn walk_sources<T>(
             Ok(v) => return Ok(v),
             Err(e) => e,
         };
-        // Unreachable (or hostile) is never a source's ANSWER, so it always falls through to the
-        // next one — which is the whole point of having a chain on a network where one host being
-        // dark is the ordinary state. Anything else is an answer, and an answer from the
+        // Anything that is not the source being dark IS an answer, and an answer from the
         // authoritative source ends the walk.
-        let unreachable =
-            err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Transport)));
-        if candidate.authoritative && !unreachable {
+        if candidate.authoritative && !unreachable(&err) {
             return Err(err.context(format!("fetching {}", what())));
         }
         if candidate.authoritative {
