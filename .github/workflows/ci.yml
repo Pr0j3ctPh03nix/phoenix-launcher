@@ -1,5 +1,5 @@
-# Build validation for the default branch — and the only thing that populates the Rust build
-# cache the release builds live on.
+# Build validation for the default branch, on a schedule or on demand — and the only thing that
+# populates the Rust build cache the release builds live on.
 #
 # WHY THIS EXISTS: GitHub Actions caches are REF-SCOPED. A workflow run can restore caches created
 # on its own ref or on the default branch, and nothing else — sibling refs, including two
@@ -15,19 +15,17 @@
 name: ci
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "src-tauri/**"
-      - "frontend/**"
-      - "dev/check_i18n.js"
-      - "package.json"
-      - "bun.lock"
-      - ".github/workflows/*.yml"
+  # Deliberately NOT on push. A full Tauri build on every commit to main is not worth its minutes,
+  # and the cache argument above does not require one: both triggers below also run on the default
+  # branch, which is the ref every tag run restores from. The trade accepted is that main gets no
+  # automatic build validation — a break lands silently and surfaces at the next run below, or at
+  # the next tag.
+  #
   # GitHub evicts cache entries untouched for 7 days; releases are usually further apart than
   # that. A weekly build keeps the entry alive and surfaces toolchain drift before a tag needs it.
   schedule:
     - cron: "17 4 * * 1"
+  # Also the way to warm the cache on demand — run this before tagging if main has moved a lot.
   workflow_dispatch:
 
 concurrency:
