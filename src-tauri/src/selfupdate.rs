@@ -143,17 +143,51 @@ fn apply_at(
     ensure_dir_writable(dir)?;
 
     let asset = exe_asset(release)?;
-    let expected = expected_sha(settings, dl, release, &asset.name)?;
+    let (expected, expected_size) = expected_sha(settings, dl, release, &asset.name)?;
 
     let new = sibling(exe, ".new.exe");
     // Deliberately never resumed. A `.part` left by an earlier attempt at a DIFFERENT version
     // would be stitched onto the new bytes and produce a corrupt file of entirely plausible
     // length; the launcher is a few MB, so a clean re-fetch costs nothing worth that risk.
     let _ = std::fs::remove_file(&new);
-    if let Err(e) = dl.download_to(asset, &new, 0, progress) {
+    // The signed manifest's `size` is a trust input exactly like its hash: in the target state
+    // where mirrors serve this payload too, a third-party host must be cut off DURING the
+    // transfer if it sends past it, not merely caught once an unbounded exe has already filled
+    // the disk — hash-verification-before-swap runs on bytes that already landed, so it cannot
+    // help here. Same idea as `install::obtain_to_cache`'s asset cap, reused rather than shared:
+    // this path never retries or resumes, so it has no backoff loop to thread the guard through.
+    // Only wired when `expected_size` came from the SIGNED manifest — the legacy `.sha256`
+    // sidecar path has no trustworthy size at all (see `expected_sha`) and stays uncapped.
+    let mut capped = false;
+    let result = match expected_size {
+        Some(size) => {
+            let mut guarded = |written: u64, total: Option<u64>| -> bool {
+                if written > size {
+                    capped = true;
+                    return false;
+                }
+                progress(written, total)
+            };
+            dl.download_to(asset, &new, 0, &mut guarded)
+        }
+        None => dl.download_to(asset, &new, 0, progress),
+    };
+    if let Err(e) = result {
         // a partial exe next to the launcher is AV bait and cleanup_old deliberately ignores
         // `.new` names, so it would sit there forever
         let _ = std::fs::remove_file(&new);
+        // Distinct from an ordinary abort even though it rides the same callback — say so rather
+        // than let it read as a cancel, and never retry it (there is no retry loop here to do
+        // that by accident, unlike `obtain_to_cache`, but the explicit message keeps the two
+        // call sites' refusals reading as one idea).
+        if capped {
+            let size = expected_size.expect("capped can only be set inside the Some(size) arm above");
+            bail!(
+                "{}: the source sent more than the signed {size} bytes — refusing (the host is \
+                 misbehaving or hostile)",
+                asset.name
+            );
+        }
         return Err(e).with_context(|| format!("downloading {}", asset.name));
     }
     if let Err(e) = verify(&new, &expected) {
@@ -210,9 +244,10 @@ fn exe_asset(release: &Release) -> Result<&Asset> {
     Ok(first)
 }
 
-/// The hash the release commits to for the CHOSEN exe asset. Never optional: a release that
+/// The hash the release commits to for the CHOSEN exe asset, and — only when it comes from the
+/// SIGNED manifest — the size to cap its download at. The hash is never optional: a release that
 /// commits to nothing fails loudly (the user can still download it by hand) instead of swapping in
-/// an unchecked binary.
+/// an unchecked binary. The size IS optional, and that is deliberate — see below.
 ///
 /// TWO sources, and the SIGNED one wins. A `.minisig` over the launcher's manifest is a statement
 /// by a key we pinned; the `.sha256` sidecar is a statement by whoever served the release, which
@@ -231,20 +266,26 @@ fn exe_asset(release: &Release) -> Result<&Asset> {
 /// Closing it takes a deliberate switch, once every release in the wild carries a manifest. A
 /// release that publishes a manifest WITHOUT a signature is a different matter and is refused
 /// outright — that shape is only ever tampering.
+///
+/// The SAME gap is why the returned size is `Option`, not a fallback ceiling: the sidecar is one
+/// line of hex with no size anywhere in it, so a value invented for that branch would not be a
+/// trust input, it would be a made-up number dressed as one. `apply_at` leaves that branch's
+/// download uncapped rather than pretend otherwise — the known gap stays exactly the shape it
+/// already is, not silently narrowed by a number nobody signed.
 fn expected_sha(
     settings: &Settings,
     dl: &dyn Downloader,
     release: &Release,
     exe_name: &str,
-) -> Result<String> {
-    if let Some(sha) = signed_sha(settings, dl, release, exe_name)? {
-        return Ok(sha);
+) -> Result<(String, Option<u64>)> {
+    if let Some((sha, size)) = signed_sha(settings, dl, release, exe_name)? {
+        return Ok((sha, Some(size)));
     }
-    legacy_sha(dl, release, exe_name)
+    Ok((legacy_sha(dl, release, exe_name)?, None))
 }
 
-/// The exe's hash out of the launcher payload's signed manifest, or `None` when this release
-/// publishes no manifest to read.
+/// The exe's hash AND size out of the launcher payload's signed manifest, or `None` when this
+/// release publishes no manifest to read.
 ///
 /// Everything else — a signature that is missing, bad, from an unknown key, or over a document
 /// that names a different payload — is an ERROR, not a fallback. Silently dropping to the sidecar
@@ -252,14 +293,15 @@ fn expected_sha(
 /// deleted file.
 ///
 /// The entry's `dest` is deliberately not consulted. A launcher payload installs nothing into a
-/// game folder; the producer still emits a legal `dest` because the format demands one, and the
-/// only thing this reads is the hash beside the asset name it already chose.
+/// game folder; the producer still emits a legal `dest` because the format demands one. `size`,
+/// unlike `dest`, IS read now — it is the same trust input as `sha256`, just enforced during the
+/// transfer instead of after it (see `apply_at`).
 fn signed_sha(
     settings: &Settings,
     dl: &dyn Downloader,
     release: &Release,
     exe_name: &str,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, u64)>> {
     if release.asset(engine::MANIFEST_ASSET).is_none() {
         return Ok(None);
     }
@@ -271,7 +313,7 @@ fn signed_sha(
         .with_context(|| {
             format!("the signed manifest of {} does not name {exe_name}", release.tag_name)
         })?;
-    Ok(Some(entry.sha256.clone()))
+    Ok(Some((entry.sha256.clone(), entry.size)))
 }
 
 /// The release's published sha256 sidecar. `<chosen>.sha256` first, so the renamed-exe fallback of
@@ -867,6 +909,133 @@ mod tests {
         apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
             .unwrap();
         assert_eq!(std::fs::read(&exe).unwrap(), b"MZ\x90\x00NEW LAUNCHER");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- the signed size as a streaming cap on the exe download ----
+
+    /// Streams real, small chunks — `Fake` writes a whole body in one call, which can't show a
+    /// mid-transfer abort. Mirrors `install::tests::Overflowing`; wraps a `Fake` for everything
+    /// except `download_to`, which serves `body` (not the Fake's own registered asset bytes) in
+    /// pieces of `chunk`.
+    struct OverflowingExe {
+        inner: crate::downloader::fake::Fake,
+        /// What the "host" actually sends — independent of whatever `inner` has registered.
+        body: Vec<u8>,
+        chunk: usize,
+        calls: std::sync::atomic::AtomicU32,
+        /// The last `written` value handed to the progress callback — the mid-transfer proof,
+        /// read back after the call fails (the `.new.exe` it left is deleted by `apply_at`'s own
+        /// cleanup and can't be inspected afterward).
+        last_written: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::downloader::Downloader for OverflowingExe {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+            self.inner.fetch_release(r, t)
+        }
+        fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &Asset) -> Result<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            _asset: &Asset,
+            dest: &Path,
+            resume_from: u64,
+            progress: ChunkProgress,
+        ) -> Result<(u64, String)> {
+            use sha2::Digest;
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(resume_from, 0, "self-update never resumes");
+            let mut file = std::fs::File::create(dest)?;
+            let mut written = 0u64;
+            for piece in self.body.chunks(self.chunk) {
+                std::io::Write::write_all(&mut file, piece)?;
+                written += piece.len() as u64;
+                self.last_written.store(written, Ordering::SeqCst);
+                if !progress(written, Some(self.body.len() as u64)) {
+                    anyhow::bail!("download aborted");
+                }
+            }
+            Ok((written, hex::encode(sha2::Sha256::digest(&self.body))))
+        }
+    }
+
+    /// Item 2 in a second code path: `apply_at`'s exe download must be cut off mid-stream when the
+    /// host sends past the SIGNED size, exactly like `obtain_to_cache`'s asset cap. Hash-
+    /// verification-before-swap does not cover this — it runs on bytes already on disk.
+    #[test]
+    fn an_exe_stream_longer_than_its_signed_size_is_aborted_mid_transfer() {
+        use sha2::Digest;
+        use std::sync::atomic::Ordering;
+        let declared: Vec<u8> = b"MZ\x90\x00HONEST LAUNCHER BUILD".to_vec(); // what the manifest signs for
+        let hostile: Vec<u8> =
+            declared.iter().copied().chain(std::iter::repeat(b'X').take(100_000)).collect();
+        let (dir, fake) = stage_signed(
+            "phoenix-selfupdate-exe-overcap",
+            &declared,
+            &hex::encode(sha2::Sha256::digest(&declared)),
+            "launcher",
+        );
+        let dl = OverflowingExe {
+            inner: fake,
+            body: hostile,
+            chunk: 16,
+            calls: 0.into(),
+            last_written: 0.into(),
+        };
+        let exe = dir.join("phoenix-launcher.exe");
+        let release = dl.inner.fetch_release("r", None).unwrap();
+
+        let err = apply_at(&exe, &settings(), &dl, &release, &mut |_, _| true).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("more than the signed"), "expected the size-cap refusal, got: {msg}");
+        assert!(!msg.contains("aborted"), "must not read as an ordinary cancel: {msg}");
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 1, "no retry loop here to (mis)fire");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER", "the working launcher is untouched");
+        assert!(!sibling(&exe, ".new.exe").exists(), "the oversized stream is not left behind");
+        // the mid-transfer proof: writing stopped within one chunk of the signed size, nowhere
+        // near the ~100,024-byte hostile body it would reach if the whole thing streamed through
+        let last = dl.last_written.load(Ordering::SeqCst);
+        assert!(
+            (declared.len() as u64..declared.len() as u64 + dl.chunk as u64).contains(&last),
+            "expected the abort within one chunk past the {}-byte signed size, got {last}",
+            declared.len()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The companion the cap must not break: an update whose body is EXACTLY the signed size has
+    /// to keep applying — streamed in real chunks (not `Fake`'s one-shot write) so the guard is
+    /// actually exercised across several ticks, not just the size check that already ran before.
+    #[test]
+    fn an_exe_that_completes_exactly_at_the_signed_size_still_applies() {
+        use sha2::Digest;
+        let body: Vec<u8> = b"MZ\x90\x00A LAUNCHER BUILD OF A GIVEN LENGTH".to_vec();
+        let (dir, fake) = stage_signed(
+            "phoenix-selfupdate-exe-exact-cap",
+            &body,
+            &hex::encode(sha2::Sha256::digest(&body)),
+            "launcher",
+        );
+        let dl = OverflowingExe {
+            inner: fake,
+            body: body.clone(),
+            chunk: 7, // does not divide the body evenly — the last tick lands off-grid
+            calls: 0.into(),
+            last_written: 0.into(),
+        };
+        let exe = dir.join("phoenix-launcher.exe");
+        let release = dl.inner.fetch_release("r", None).unwrap();
+
+        let out = apply_at(&exe, &settings(), &dl, &release, &mut |_, _| true).unwrap();
+        assert_eq!(out, exe, "the returned path is the one to restart");
+        assert_eq!(std::fs::read(&exe).unwrap(), body);
+        assert!(!sibling(&exe, ".new.exe").exists(), "staging is consumed");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

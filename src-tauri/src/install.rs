@@ -1122,7 +1122,24 @@ fn obtain_to_cache(
             let _ = std::fs::remove_file(&tmp);
             resume_from = 0;
         }
-        match dl.download_to(asset, &tmp, resume_from, chunk) {
+        // The signed size is a trust input like the hash: a source that keeps sending past it is
+        // lying about what this asset is, and an endless body has to be cut off DURING the
+        // transfer — not discovered after it has already filled the disk. Piggybacks on the
+        // existing abort line rather than growing the `Downloader` trait: `written` already
+        // includes any resumed prefix (every impl counts it that way), so this needs no extra
+        // bookkeeping to stay correct across a resume.
+        let mut capped = false;
+        let result = {
+            let mut guarded = |written: u64, total: Option<u64>| -> bool {
+                if written > size {
+                    capped = true;
+                    return false;
+                }
+                chunk(written, total)
+            };
+            dl.download_to(asset, &tmp, resume_from, &mut guarded)
+        };
+        match result {
             Ok((got_size, got_sha)) => {
                 if got_size == size && got_sha == sha256 {
                     break;
@@ -1155,6 +1172,18 @@ fn obtain_to_cache(
                 // full-length or longer, which no future Range request could extend
                 if std::fs::metadata(&tmp).map(|m| m.len() >= size).unwrap_or(false) {
                     let _ = std::fs::remove_file(&tmp);
+                }
+                // A cap violation is not an ordinary abort even though it rides the same
+                // callback (Stop, a sibling's failure) — it is a distinct fact, "the source sent
+                // more bytes than the signed manifest promised", and must say so rather than
+                // read as a cancel, and must never be retried as though it were a network hiccup
+                // (it isn't: no `NetKind` is in this chain, so `transient_net_failure` already
+                // says no — this bails explicitly so the reason is not left to fall out of that).
+                if capped {
+                    bail!(
+                        "{name}: the source sent more than the signed {size} bytes — refusing \
+                         (the host is misbehaving or hostile)"
+                    );
                 }
                 attempt += 1;
                 if attempt > DL_RETRIES || !transient_net_failure(&e) {
@@ -3115,6 +3144,192 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Streams real, small chunks — unlike `Fake` and `CutOnce`, which each write a whole body in
+    /// one call before the caller ever sees a progress tick. That is exactly the double this cap
+    /// needs: a host that keeps sending well past the manifest's declared `size`, so the only way
+    /// to prove the abort is MID-transfer (not a check that runs after the whole body already
+    /// landed) is a downloader that can be caught in the act.
+    struct Overflowing {
+        inner: Fake,
+        /// What the "host" actually sends — deliberately longer than the manifest's `size`.
+        body: Vec<u8>,
+        chunk: usize,
+        calls: std::sync::atomic::AtomicU32,
+        /// The last `written` value handed to the progress callback — read back after the call
+        /// fails, since the resulting `.part` is swept by the existing over-long cleanup and can't
+        /// be inspected afterward. This is the mid-transfer proof.
+        last_written: std::sync::atomic::AtomicU64,
+    }
+
+    impl crate::downloader::Downloader for Overflowing {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+            self.inner.fetch_release(r, t)
+        }
+        fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &crate::downloader::Asset) -> Result<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            _asset: &crate::downloader::Asset,
+            dest: &Path,
+            resume_from: u64,
+            progress: crate::downloader::ChunkProgress,
+        ) -> Result<(u64, String)> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(resume_from, 0, "the cap must fire on the first attempt, never a retry");
+            let mut file = std::fs::File::create(dest)?;
+            let mut written = 0u64;
+            for piece in self.body.chunks(self.chunk) {
+                std::io::Write::write_all(&mut file, piece)?;
+                written += piece.len() as u64;
+                self.last_written.store(written, Ordering::SeqCst);
+                if !progress(written, Some(self.body.len() as u64)) {
+                    anyhow::bail!("download aborted");
+                }
+            }
+            Ok((written, sha(&self.body)))
+        }
+    }
+
+    /// The signed `size` is a STREAMING ceiling, not a check that only runs once an unbounded
+    /// body is already fully on disk — `obtain_to_cache` must cut a source off as soon as it
+    /// sends more than the manifest promised.
+    #[test]
+    fn a_stream_longer_than_its_signed_size_is_aborted_mid_transfer() {
+        use std::sync::atomic::Ordering;
+        let dir = tempdir("overcap");
+        let declared: Vec<u8> = (0..40u8).collect(); // what the manifest signs for
+        let hostile: Vec<u8> =
+            declared.iter().copied().chain(std::iter::repeat(b'X').take(100_000)).collect();
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ { "name": "a.vpk", "dest": "game/dota/a.vpk",
+                         "sha256": sha(&declared), "size": declared.len() } ]
+        })
+        .to_string();
+        let dl = Overflowing {
+            inner: Fake::new("v1.0.0", &m, vec![("a.vpk", &declared)]),
+            body: hostile,
+            chunk: 16,
+            calls: 0.into(),
+            last_written: 0.into(),
+        };
+
+        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("more than the signed"), "expected the size-cap refusal, got: {msg}");
+        assert!(!msg.contains("aborted"), "must not read as an ordinary cancel: {msg}");
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 1, "a signed-size violation must not be retried");
+        assert!(!dir.join("game/dota/a.vpk").exists());
+        // the mid-transfer proof: writing stopped within one chunk of the signed size, nowhere
+        // near the ~100,040-byte hostile body it would reach if the whole thing streamed through
+        // before anything checked it
+        let last = dl.last_written.load(Ordering::SeqCst);
+        assert!(
+            (declared.len() as u64..declared.len() as u64 + dl.chunk as u64).contains(&last),
+            "expected the abort within one chunk past the {}-byte signed size, got {last} bytes written",
+            declared.len()
+        );
+        // and the oversized .part left behind is swept, not kept holding hostile bytes
+        assert!(!dir.join(CACHE_DIR).join(format!("{}.part", sha(&declared))).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Interrupted after `cut` bytes, then resumed with the real impls' accounting: `written`
+    /// starts at the resumed prefix and grows by real chunks from there, exactly like github.rs.
+    /// `Overflowing` above always starts at zero (it exists to prove the abort), and `CutOnce`
+    /// never ticks progress at all on either attempt — neither exercises the cap guard on a
+    /// resumed transfer, which is the one case the task calls out as easy to get silently wrong
+    /// (counting from the prefix instead of from zero, or the reverse).
+    struct ResumingToCap {
+        inner: Fake,
+        body: Vec<u8>,
+        cut: usize,
+        chunk: usize,
+        calls: std::sync::atomic::AtomicU32,
+        failed: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::downloader::Downloader for ResumingToCap {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+            self.inner.fetch_release(r, t)
+        }
+        fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &crate::downloader::Asset) -> Result<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            _asset: &crate::downloader::Asset,
+            dest: &Path,
+            resume_from: u64,
+            progress: crate::downloader::ChunkProgress,
+        ) -> Result<(u64, String)> {
+            use std::io::{Seek, SeekFrom, Write};
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.failed.swap(true, Ordering::SeqCst) {
+                assert_eq!(resume_from, 0, "first attempt must start fresh");
+                std::fs::write(dest, &self.body[..self.cut])?;
+                anyhow::bail!("simulated dropped connection");
+            }
+            assert_eq!(resume_from as usize, self.cut, "must resume from exactly what was written");
+            let mut file = std::fs::OpenOptions::new().write(true).open(dest)?;
+            file.seek(SeekFrom::Start(resume_from))?;
+            let mut written = resume_from; // the prefix counts — same as every real impl
+            for piece in self.body[self.cut..].chunks(self.chunk) {
+                file.write_all(piece)?;
+                written += piece.len() as u64;
+                if !progress(written, Some(self.body.len() as u64)) {
+                    anyhow::bail!("download aborted");
+                }
+            }
+            Ok((written, sha(&self.body)))
+        }
+    }
+
+    /// The companion the task explicitly asks for: a resume must not break under the new cap.
+    /// `written` is seeded from the resumed prefix (not from zero), so a transfer that finishes
+    /// EXACTLY at the signed size — however that size is split between the interrupted attempt
+    /// and the resumed one — must complete, never get capped for bytes it already had on disk.
+    #[test]
+    fn a_resumed_transfer_that_completes_exactly_at_the_signed_size_is_not_capped() {
+        use std::sync::atomic::Ordering;
+        let dir = tempdir("resume-exact-cap");
+        let content: Vec<u8> = (0..500u32).map(|i| (i % 251) as u8).collect();
+        let m = serde_json::json!({
+            "version": "1.0.0",
+            "files": [ { "name": "a.vpk", "dest": "game/dota/a.vpk",
+                         "sha256": sha(&content), "size": content.len() } ]
+        })
+        .to_string();
+        let dl = ResumingToCap {
+            inner: Fake::new("v1.0.0", &m, vec![("a.vpk", &content)]),
+            body: content.clone(),
+            cut: 200,
+            chunk: 37, // does not divide the remainder evenly, so the last tick lands off-grid
+            calls: 0.into(),
+            failed: false.into(),
+        };
+
+        // an abort with no NetKind is not retried within one run (same as `CutOnce`'s test), so
+        // the interruption and the resume are two separate `install()` calls, exactly as a real
+        // dropped connection and a later relaunch would be
+        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        assert!(!dir.join("game/dota/a.vpk").exists());
+        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        assert_eq!(r.written, vec!["game/dota/a.vpk".to_string()]);
+        assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), content);
+        assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "attempt one drops, attempt two resumes and finishes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Fails `download_to` with a given error until `fail` runs out, then delegates to the Fake.
     struct Flaky {
         inner: Fake,
@@ -4442,6 +4657,34 @@ mod tests {
         let dl = Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]);
         let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("past its declared members"), "got: {e:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The decompression-bomb shape, sized up: a compressed frame that would inflate to tens of
+    /// megabytes behind a member the manifest says is 4 bytes long. Those 4 bytes check out —
+    /// what follows never does, and `extract_members` never asks the decoder for it (see its doc
+    /// comment: it only ever requests `sum(declared sizes) + 1` probe byte). An extreme ratio
+    /// here, rather than a few bytes of trailing garbage, is what makes that property read as
+    /// "however much a bomb offers, we never ask for it" instead of "one byte over".
+    #[test]
+    fn a_bundle_whose_real_content_dwarfs_its_declared_size_is_refused_not_exhausted() {
+        let dir = tempdir("bundle-bomb");
+        let a = b"AAAA" as &[u8]; // the declared member — matches exactly, so ITS check passes
+        let bomb: Vec<u8> = a.iter().copied().chain(std::iter::repeat(0u8).take(50_000_000)).collect();
+        let (packed, psha, _) = pack(&[&bomb]); // the real stream: 4 honest bytes, then ~50 MB more
+        assert!(packed.len() < 200_000, "the packed frame must stay tiny for this to be a bomb");
+        let m = serde_json::json!({
+            "schema": 3, "version": "1.0.0",
+            "bundles": [{ "name": "b0.phxb", "codec": "zstd",
+                          "psize": packed.len(), "psha256": psha, "size": a.len() as u64,
+                          "members": [sha(a)] }],
+            "files": [ bundled_json("game/dota/a.txt", a) ],
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]);
+        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        assert!(format!("{e:#}").contains("past its declared members"), "got: {e:#}");
+        assert!(!dir.join("game/dota/a.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

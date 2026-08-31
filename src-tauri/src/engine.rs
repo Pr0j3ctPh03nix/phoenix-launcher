@@ -896,6 +896,21 @@ mod tests {
         assert!(dl.download_limited(asset, 1023).is_err(), "one byte over");
     }
 
+    /// The wiring, not just `download_limited` in isolation: `manifest_of` itself has to refuse a
+    /// `manifest.json` past the REAL 16 MiB ceiling, cleanly — this is the call every check, every
+    /// self-update offer, and every install goes through.
+    #[test]
+    fn manifest_of_refuses_a_manifest_over_the_real_cap() {
+        // valid, parseable JSON so the Fake signs it exactly as it would any other document — what
+        // is under test is the size gate, not the parser.
+        let padding = "x".repeat((trust::MAX_DOC_BYTES + 1) as usize);
+        let doc = format!(r#"{{"version":"1.0.0","files":[],"padding":"{padding}"}}"#);
+        let dl = Fake::new("v1.0.0", &doc, vec![]);
+        let release = dl.fetch_release("r", None).unwrap();
+        let e = manifest_of(&Settings::default(), &dl, &release, Payload::Mod).unwrap_err();
+        assert!(format!("{e:#}").contains("larger than"), "expected the size-cap refusal, got: {e:#}");
+    }
+
     #[test]
     fn merged_game_release_folds_shards_into_the_main_release() {
         use crate::downloader::{Asset, ChunkProgress};
