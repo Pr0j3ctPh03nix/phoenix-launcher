@@ -577,6 +577,14 @@ const ERR_HINTS = { network: "err.network", auth: "err.auth", tooOld: "err.tooOl
 function onError(e) {
   const kind = e && typeof e === "object" ? e.kind : null;
   const word = t(ERR_WORDS[kind] || "status.error");
+  // `tooOld` ships the two format numbers as data, so this line can be fully localized — and the
+  // raw engine message is DROPPED rather than appended, because it says the same thing a second
+  // time in English. Naming both numbers is the point: "update the launcher" alone does not say
+  // whether you are one release behind or looking at something that has not shipped yet.
+  if (kind === "tooOld" && e.schema) {
+    setStatus(word, "error", t("err.tooOldSchema", e.schema));
+    return;
+  }
   const hint = ERR_HINTS[kind] ? t(ERR_HINTS[kind]) + " · " : "";
   setStatus(word, "error", hint + errText(e));
 }

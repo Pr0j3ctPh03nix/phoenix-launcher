@@ -498,6 +498,26 @@ pub struct GameDirStatus {
 pub struct CmdError {
     pub kind: String,
     pub message: String,
+    /// Present only on `tooOld`: WHICH two format versions disagree, as numbers.
+    ///
+    /// On the wire as data, not baked into `message`, because the shell owns no language (see
+    /// main.rs). `UnsupportedSchema`'s Display carries the same two numbers in an English
+    /// sentence, which is right for a log and wrong for the one screen a Russian user reads when
+    /// their launcher has stopped being able to install anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<SchemaMismatch>,
+}
+
+/// The reader's ceiling against the document's declared format. Both numbers, because "update the
+/// launcher" is unactionable without them: it does not say whether you are one release behind or
+/// looking at something that has not shipped yet.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaMismatch {
+    /// What the manifest declares it is written in.
+    pub found: u32,
+    /// The highest this build knows how to read.
+    pub supported: u32,
 }
 
 /// Classify an anyhow chain: a `NetKind` from the transport edge wins, then the typed markers
@@ -551,19 +571,26 @@ impl CmdError {
     /// the new build IS installed and the only thing missing is a relaunch. Telling the user the
     /// update failed would be false, and would send them round the same loop again.
     pub fn restart_failed(message: String) -> Self {
-        Self { kind: "restartFailed".to_string(), message }
+        Self { kind: "restartFailed".to_string(), message, schema: None }
     }
 }
 
 impl From<anyhow::Error> for CmdError {
     fn from(e: anyhow::Error) -> Self {
-        Self { kind: wire_kind(&e).to_string(), message: format!("{e:#}") }
+        // Same walk `wire_kind` does, for the one marker that carries numbers worth showing. Read
+        // from the chain rather than re-derived, so the kind and the numbers can never disagree
+        // about which error this is.
+        let schema = e.chain().find_map(|c| {
+            c.downcast_ref::<UnsupportedSchema>()
+                .map(|u| SchemaMismatch { found: u.found, supported: u.supported })
+        });
+        Self { kind: wire_kind(&e).to_string(), message: format!("{e:#}"), schema }
     }
 }
 
 impl From<String> for CmdError {
     fn from(message: String) -> Self {
-        Self { kind: "internal".to_string(), message }
+        Self { kind: "internal".to_string(), message, schema: None }
     }
 }
 
@@ -884,6 +911,27 @@ pub fn build_local_check_view(game_dir: &std::path::Path, st: &state::InstalledS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one error the user is expected to ACT on has to arrive as numbers, not as English.
+    ///
+    /// A launcher that cannot read a release is the end of the line for that install until someone
+    /// updates it, so the message has to say which formats disagree — and it has to say it in the
+    /// reader's language, which only the frontend knows. If `schema` ever stops being populated the
+    /// UI silently falls back to appending the raw engine string, which is English-only: the
+    /// screen still says something, so nothing else here would fail.
+    #[test]
+    fn an_unreadable_release_reports_both_format_numbers_as_data() {
+        let e: CmdError = anyhow::Error::new(UnsupportedSchema { found: 4, supported: 3 })
+            .context("reading manifest.json")
+            .into();
+        assert_eq!(e.kind, "tooOld");
+        let s = e.schema.expect("tooOld must carry the numbers the UI interpolates");
+        assert_eq!((s.found, s.supported), (4, 3));
+
+        // And nothing else does: a different failure must not grow a schema field to explain.
+        let other: CmdError = anyhow::Error::msg("disk on fire").into();
+        assert!(other.schema.is_none());
+    }
 
     /// A pin the shim does not manage has to REACH the managed-files list — a "Your files"
     /// category with nothing in it is exactly the invisibility this was added to fix. And a pin it

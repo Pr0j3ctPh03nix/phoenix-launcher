@@ -21,6 +21,10 @@ const I18N = {
     "err.network": "Could not reach the update server — check your connection.",
     "err.auth": "The update server refused access.",
     "err.tooOld": "This release needs a newer launcher.",
+    // Used when the engine could say WHICH two formats disagree. Both numbers, so the line is
+    // actionable rather than merely discouraging; "update format" rather than "schema", which
+    // names an implementation detail the reader has no way to interpret.
+    "err.tooOldSchema": "This release uses update format {found}; this launcher reads up to {supported}. Update the launcher to keep installing updates.",
     "err.gameRunning": "Close Dota 2 and try again.",
     "status.launched": "Launched",
     "status.ingame": "In game",
@@ -374,6 +378,7 @@ const I18N = {
     "err.network": "Не удалось связаться с сервером обновлений — проверьте подключение.",
     "err.auth": "Сервер обновлений отказал в доступе.",
     "err.tooOld": "Для этого релиза нужен более новый лаунчер.",
+    "err.tooOldSchema": "Этот релиз использует формат обновлений {found}; лаунчер читает до {supported}. Обновите лаунчер, чтобы обновления продолжали устанавливаться.",
     "err.gameRunning": "Закройте Dota 2 и попробуйте снова.",
     "status.launched": "Запущено",
     "status.ingame": "В игре",
