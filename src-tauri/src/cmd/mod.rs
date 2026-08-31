@@ -312,3 +312,185 @@ impl AppState {
             .map_err(|_| CmdError::from(format!("another operation is already running — {what} refused")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The source WALK, over injected backends. `candidates` builds https-only agents that no
+    //! loopback test can reach, which is exactly why the walk is a separate function from the
+    //! construction: the rules below are the part worth proving, and they are transport-free.
+    use super::*;
+    use crate::config::{Source, SourceRef};
+    use crate::downloader::fake::Fake;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    const DOC: &str = r#"{"version":"1.0.0","files":[]}"#;
+
+    /// A backend that answers the release lookup with a canned failure, counting the asks. `None`
+    /// = it serves.
+    struct Peer {
+        inner: Fake,
+        fails: Option<NetKind>,
+        calls: AtomicU32,
+    }
+
+    impl Peer {
+        fn serving() -> Arc<Self> {
+            Arc::new(Self {
+                inner: Fake::new("v1.0.0", DOC, vec![]),
+                fails: None,
+                calls: AtomicU32::new(0),
+            })
+        }
+        fn failing(kind: NetKind) -> Arc<Self> {
+            Arc::new(Self {
+                inner: Fake::new("v1.0.0", DOC, vec![]),
+                fails: Some(kind),
+                calls: AtomicU32::new(0),
+            })
+        }
+        fn calls(&self) -> u32 {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    // On the `Arc`, not on `Peer`: the walk takes OWNERSHIP of the downloader a candidate opens,
+    // and the test still has to read the peer's call count afterwards. Sharing the peer is the
+    // whole point, so the shared handle is what the trait is implemented for.
+    impl Downloader for Arc<Peer> {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> AnyResult<Release> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            match self.fails {
+                Some(k) => Err(anyhow::Error::new(k).context("scripted failure")),
+                None => self.inner.fetch_release(r, t),
+            }
+        }
+        fn fetch_releases(&self, r: &str) -> AnyResult<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &crate::downloader::Asset) -> AnyResult<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            a: &crate::downloader::Asset,
+            d: &std::path::Path,
+            r: u64,
+            p: crate::downloader::ChunkProgress,
+        ) -> AnyResult<(u64, String)> {
+            self.inner.download_to(a, d, r, p)
+        }
+    }
+
+    /// One link of a test chain. The `Arc` is what lets the test still read the peer's call count
+    /// after the walk has taken ownership of the box it handed out.
+    fn link(peer: &Arc<Peer>, authoritative: bool, creds: Option<&Arc<Peer>>) -> Candidate<'static> {
+        let open = peer.clone();
+        Candidate {
+            open: Box::new(move || Box::new(open.clone())),
+            credentials: creds.map(|c| {
+                let c = c.clone();
+                Box::new(move || Box::new(c.clone()) as Box<dyn Downloader>)
+                    as Box<dyn Fn() -> Box<dyn Downloader>>
+            }),
+            authoritative,
+        }
+    }
+
+    fn walk(chain: &[Candidate]) -> AnyResult<Release> {
+        walk_sources(chain, || "the release".into(), |dl| dl.fetch_release("r", None)).map(|(_, v)| v)
+    }
+
+    /// An unreachable source is not an ANSWER — it is a host being dark, which on the networks
+    /// this feature exists for is the ordinary state. The walk moves on and the run completes.
+    #[test]
+    fn a_source_that_cannot_be_reached_falls_through_to_the_next() {
+        let (down, up) = (Peer::failing(NetKind::Transport), Peer::serving());
+        let chain = [link(&down, true, None), link(&up, false, None)];
+        assert_eq!(walk(&chain).expect("the second source serves it").tag_name, "v1.0.0");
+        assert_eq!(down.calls(), 1);
+        assert_eq!(up.calls(), 1);
+    }
+
+    /// A REFUSAL from the primary is a real answer about the release — "there is no such release",
+    /// "you may not have it" — and falling past it to a mirror, which might serve some other
+    /// release entirely, would be worse than reporting it. So the walk stops there.
+    #[test]
+    fn a_refusal_from_the_authoritative_source_ends_the_walk() {
+        let (refused, mirror) = (Peer::failing(NetKind::Status(404)), Peer::serving());
+        let chain = [link(&refused, true, None), link(&mirror, false, None)];
+        assert!(walk(&chain).is_err());
+        assert_eq!(mirror.calls(), 0, "a mirror must not be asked past a definite answer");
+    }
+
+    /// A mirror is never authoritative in either direction: its 404 says only that THIS host does
+    /// not carry the payload, which is precisely what the next source is for.
+    #[test]
+    fn a_mirrors_refusal_is_only_about_that_mirror() {
+        let (stale, primary) = (Peer::failing(NetKind::Status(404)), Peer::serving());
+        let chain = [link(&stale, false, None), link(&primary, true, None)];
+        assert!(walk(&chain).is_ok(), "a stale mirror ranked first must not brick the check");
+        assert_eq!(primary.calls(), 1);
+    }
+
+    /// Nothing served it. The authoritative source's failure is the one worth showing — a mirror's
+    /// is a fact about a host the user never chose.
+    #[test]
+    fn an_exhausted_chain_reports_the_authoritative_failure() {
+        let (mirror, primary) =
+            (Peer::failing(NetKind::Status(503)), Peer::failing(NetKind::Transport));
+        let chain = [link(&mirror, false, None), link(&primary, true, None)];
+        let err = walk(&chain).unwrap_err();
+        assert!(
+            err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Transport))),
+            "expected the primary's transport failure, got: {err:#}"
+        );
+        assert!(format!("{err:#}").contains("the release"));
+    }
+
+    /// The credential rule, which the chain must not have dissolved: a private repo answers 404,
+    /// indistinguishable from missing, so an HTTP REFUSAL earns a second try with a token — and
+    /// nothing else does, because credentials can turn a 404 into a 200 but cannot fix DNS, and an
+    /// offline launcher must not pay two connect timeouts.
+    #[test]
+    fn a_refusal_earns_the_token_retry_and_being_offline_does_not() {
+        let (anon, auth) = (Peer::failing(NetKind::Status(404)), Peer::serving());
+        assert!(walk(&[link(&anon, true, Some(&auth))]).is_ok());
+        assert_eq!(auth.calls(), 1, "a refusal is retried with credentials");
+
+        let (offline, unused) = (Peer::failing(NetKind::Transport), Peer::serving());
+        assert!(walk(&[link(&offline, true, Some(&unused))]).is_err());
+        assert_eq!(unused.calls(), 0, "an unreachable host is not a credentials problem");
+    }
+
+    /// The deployment gate. `MIRROR_DOWNLOADS_ENABLED` is false, so no configured mirror may enter
+    /// a chain however the list is ranked or pinned — the primary alone, and every rule above
+    /// degenerates to what it always was.
+    #[test]
+    fn no_mirror_enters_a_chain_while_downloads_are_disabled() {
+        let url = "https://mirror.example".to_string();
+        let settings = Settings {
+            sources: vec![
+                Source::Mirror { url: url.clone(), enabled: true, measured: true },
+                Source::Primary,
+            ],
+            selected: Some(SourceRef::Mirror { url }),
+            ..Default::default()
+        };
+        let chain = candidates(&settings, &settings.source_repo);
+        assert!(!mirror::MIRROR_DOWNLOADS_ENABLED, "this test describes the flag being OFF");
+        assert_eq!(chain.len(), 1, "only the primary may be reachable while the flag is off");
+        assert!(chain[0].authoritative);
+    }
+
+    /// A mirror is addressed `<base>/<payload>/…`, so which payload a repo names is what decides
+    /// whether it can have a mirror at all. A repo this build knows nothing about — only the debug
+    /// CLI's `--repo` can produce one — has no mirror path to build.
+    #[test]
+    fn a_repo_maps_to_the_payload_directory_a_mirror_serves_it_from() {
+        let s = Settings::default();
+        assert_eq!(payload_of(&s, &s.source_repo).map(Payload::id), Some("mod"));
+        assert_eq!(payload_of(&s, s.game_repo()).map(Payload::id), Some("game"));
+        assert_eq!(payload_of(&s, s.launcher_repo()).map(Payload::id), Some("launcher"));
+        assert!(payload_of(&s, "somebody/else").is_none());
+    }
+}
