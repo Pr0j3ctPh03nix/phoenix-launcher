@@ -130,8 +130,32 @@ def _two_line(comment, payload):
     return f"{UNTRUSTED_PREFIX}{comment}\n{_b64e(payload)}\n"
 
 
+def _key_line(text, what):
+    """The base64 payload line of a key file — tolerantly, unlike a signature.
+
+    NOTHING in a key file is signed. The comment is `untrusted` in the literal sense: it is never
+    read, never covered by anything, and exists to label a file for a human. The key is the base64
+    on the last line, and its own length, algorithm prefix and base64 validity are all checked
+    below. So the CRLF and exact-line-count rules `_lines` enforces for signatures — where the
+    trusted comment IS signed bytes and a line ending genuinely changes the message — protect
+    nothing here, while costing a real failure: the release key lives in a CI secret box, arrives
+    with whatever line endings a browser chose, and a key refused for CRLF fails a release AFTER
+    the build, citing a format the operator never picked.
+
+    So: CRLF or LF, trailing newline or not, and the comment line optional — pasting just the
+    base64 is a complete key. More than those two lines is refused, because that is not a key file
+    and guessing which line to read would be worse than saying so.
+    """
+    lines = [ln.rstrip("\r") for ln in text.split("\n")]
+    lines = [ln for ln in lines if ln.strip()]
+    if len(lines) not in (1, 2):
+        raise MinisignError(f"{what}: {len(lines)} non-blank lines, expected the base64 payload "
+                            f"line, optionally preceded by a comment line")
+    return lines[-1]
+
+
 def _key_payload(text, what):
-    _comment, b64 = _lines(text, 2, what)
+    b64 = _key_line(text, what)
     raw = _b64d(b64, 2 + KEY_ID_LEN + KEY_LEN, what)
     if raw[:2] != ALGO:
         raise MinisignError(f"{what}: algorithm {raw[:2]!r}, expected {ALGO!r}")
@@ -286,6 +310,21 @@ def _selftest():
     ok("the public key file round-trips",
        lambda: assert_(parse_public_key(public_key_text(sec_text, "x")).key_id == key_id,
                        "pub derived from the secret disagrees"))
+
+    # A key file is not signed content, so it is read tolerantly — see _key_line. These three are
+    # exactly what a secret pasted into a CI secret box can arrive as, and each of them failing
+    # would surface as a broken release rather than as a bad paste.
+    ok("a key file with CRLF line endings",
+       lambda: assert_(parse_secret_key(sec_text.replace("\n", "\r\n")).key_id == key_id,
+                       "CRLF key rejected"))
+    ok("a key file with no comment line — just the base64",
+       lambda: assert_(parse_secret_key(sec_text.split("\n")[1]).key_id == key_id,
+                       "bare payload line rejected"))
+    ok("a key file with no trailing newline",
+       lambda: assert_(parse_secret_key(sec_text.rstrip("\n")).key_id == key_id,
+                       "missing trailing newline rejected"))
+    refused("a key file with a smuggled extra line",
+            lambda: parse_secret_key(sec_text + "AAAA\n"))
     ok("a signature verifies under the key that made it",
        lambda: verify(data, other_sig, [other_pub]))
 
