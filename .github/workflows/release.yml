@@ -117,19 +117,6 @@ jobs:
           git tag -l --format='%(contents:body)' "${{ github.ref_name }}" | Out-File -Encoding utf8 release_body.md
           Get-Content release_body.md
 
-      # The producer tooling lives in ONE place — the dist repo, which is the only repo every CI box
-      # can clone. Checked out here rather than vendored so this workflow signs with exactly the
-      # implementation the mod and game payloads are signed with; a fourth copy of the signer is the
-      # thing that eventually disagrees with the other three.
-      - name: Fetch the release tooling (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-        with:
-          repository: Pr0j3ctPh03nix/client-dist-staging
-          token: ${{ secrets.PHOENIX_BAKED_TOKEN }}
-          path: .phoenix-tools
-          sparse-checkout: tools
-
       # WHY THE LAUNCHER IS SIGNED AT ALL. selfupdate.rs prefers a signed manifest and falls back to
       # the .sha256 sidecar when a release publishes none — and until this step existed, none ever
       # did, so every self-update was decided by a bare hash published by whoever served the
@@ -154,7 +141,11 @@ jobs:
           # No secret check here: phx_release refuses an unset key by itself, with the reason, and
           # a second copy of that rule is a second place for it to go stale.
           out=src-tauri/target/release
-          tools=.phoenix-tools/tools
+          # Vendored, not fetched: a release of the READER must not depend on the producer's repo
+          # being reachable, on a private repo, or on a token scoped for something else. tools/ is
+          # mirrored from the dev superset by its sync.py, whose --check fails if these have
+          # drifted from the copies that sign the mod and the game. See tools/README.md.
+          tools=tools
           python "$tools/gen_launcher_manifest.py" \
             --version  "$TAG" \
             --serial   "$PHOENIX_SERIAL" \
