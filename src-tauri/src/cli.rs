@@ -1,12 +1,14 @@
 //! Headless CLI (debug builds keep a console) — exercises the engine without the webview.
-//! Reuses saved settings; flags override them. A token may also come from PHOENIX_GITHUB_TOKEN.
+//! Reuses saved settings; flags override them. Authentication is the build-time baked credential
+//! and nothing else (see `Settings::token`) — there is no `--token` flag and no environment
+//! variable, because a second source of one is what let a stale value outrank the baked one.
 
 use std::path::PathBuf;
 
 use anyhow::Result;
 
 use crate::config::Settings;
-use crate::downloader::Downloader as _;
+use crate::downloader::Downloader;
 use crate::engine::{self, Action};
 use crate::github::Github;
 use crate::install;
@@ -145,14 +147,18 @@ pub fn run_uninstall(flags: &[String]) -> Result<()> {
 
 fn game_repo_manifest(
     settings: &Settings,
-) -> Result<(Github, crate::downloader::Release, crate::manifest::Manifest)> {
-    // headless keeps auth simple: the game repo is public by design, and the CLI's token flag /
-    // env var is available for testing against a private one
-    let dl = Github::new(settings.token());
-    let release = dl.fetch_release(settings.game_repo(), None)?;
-    let manifest = engine::manifest_of(settings, &dl, &release, crate::trust::Payload::Game)?;
+) -> Result<(Box<dyn Downloader>, crate::downloader::Release, crate::manifest::Manifest)> {
+    // Through `open_repo`, because the game repo is PUBLIC and the credential rule is not the GUI's
+    // private business: anonymous first, the baked token only once the server has actually refused.
+    // This used to build `Github::new(settings.token())` and so sent the token on every request —
+    // and the baked credential is scoped to the DIST repo, which a fine-grained PAT may be refused
+    // for here, failing `game-install` against a repo that would have served it anonymously.
+    // "Headless keeps auth simple" was the old justification; simple and wrong is not simpler.
+    let (dl, release) = crate::cmd::open_repo(settings.game_repo(), settings)?;
+    let manifest =
+        engine::manifest_of(settings, dl.as_ref(), &release, crate::trust::Payload::Game)?;
     // file assets are sharded across prereleases (GitHub caps 1000 assets per release)
-    let release = engine::merged_game_release(&dl, settings.game_repo(), release)?;
+    let release = engine::merged_game_release(dl.as_ref(), settings.game_repo(), release)?;
     Ok((dl, release, manifest))
 }
 
@@ -160,9 +166,10 @@ pub fn run_game_install(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let game_dir = settings.resolve_game_dir()?;
     let (dl, release, manifest) = game_repo_manifest(&settings)?;
-    // one source: the headless path keeps auth and sources simple on purpose (see
-    // `game_repo_manifest`) — the source chain is the GUI's business
-    let origins = [install::Origin::new(&dl, &release)];
+    // ONE origin for the file downloads: `game_repo_manifest` walks the source chain to RESOLVE the
+    // release, and whichever source answered then serves every asset. Per-asset failover ACROSS
+    // sources mid-download is the GUI's business.
+    let origins = [install::Origin::new(dl.as_ref(), &release)];
     let r = install::install_base(&game_dir, &origins, &manifest, None, None, None)?;
     println!(
         "Base game {} ({}): wrote {} ({} MB), up-to-date {}, skipped {}",
