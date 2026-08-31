@@ -1169,7 +1169,8 @@ impl Drop for Inflight {
     }
 }
 
-/// Path to a verified cache entry for an asset: cache hit, else streaming download + verify.
+/// Path to a verified cache entry for an asset: cache hit, else streaming download + verify, from
+/// the first of `sources` that can deliver it.
 fn obtain_to_cache(
     cache: &Path,
     sources: &[Resolved],
@@ -2660,6 +2661,12 @@ fn ensure_disk_space(need: u64, free: Option<u64>) -> Result<()> {
 /// them the same operation. Interruption at ANY point is recoverable by running again: completed
 /// files hash-match and skip, interrupted downloads resume from their .part, the cache survives.
 ///
+/// `origins` are the download sources in priority order — see `Origin`. The first is the one the
+/// manifest was opened from (it names the release); the rest are fallbacks an individual asset
+/// advances to when it cannot be had from an earlier one. This is where per-asset failover earns
+/// its keep: the base game is ~136 bundles and 7.9 GiB, so one asset a source will not serve used
+/// to end the whole run.
+///
 /// `only` restricts the write set to those dests — a PARTIAL repair, which is what the files view
 /// sends when the user has spared some files. Two things about it are load-bearing:
 ///
@@ -2673,11 +2680,6 @@ fn ensure_disk_space(need: u64, free: Option<u64>) -> Result<()> {
 ///   * it is the ONLY way a `Kept` file gets written. Pins are an instruction, so the default
 ///     (`None`) write set skips them; naming one explicitly is the user checking it back on, and
 ///     the caller is expected to drop the pin afterwards.
-/// `origins` are the download sources in priority order — see `Origin`. The first is the one the
-/// manifest was opened from (it names the release); the rest are fallbacks an individual asset
-/// advances to when it cannot be had from an earlier one. This is where per-asset failover earns
-/// its keep: the base game is ~136 bundles and 7.9 GiB, so one asset a source will not serve used
-/// to end the whole run.
 pub fn install_base(
     game_dir: &Path,
     origins: &[Origin],
