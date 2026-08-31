@@ -921,6 +921,190 @@ mod tests {
         assert!(matches!(err, FetchError::TooManyRedirects), "expected TooManyRedirects, got {err:?}");
     }
 
+    // ---- the download backend ----
+
+    /// A `Mirror` over a plain-HTTP loopback server. `download_agent()` is https-only (proven
+    /// separately by `mirror_fetch_refuses_non_https_urls_cleanly`, over the same builder settings)
+    /// and a local listener cannot speak TLS, so the tests below swap the agent — every other field
+    /// is the real thing, including the fact that there is nowhere to put a token.
+    fn test_mirror(base: &str, payload: crate::trust::Payload) -> Mirror {
+        Mirror {
+            base: base.trim_end_matches('/').to_string(),
+            payload: payload.id(),
+            agent: ureq::builder()
+                .timeout_connect(CONNECT_TIMEOUT)
+                .timeout_read(IO_TIMEOUT)
+                .timeout_write(IO_TIMEOUT)
+                .redirects(0) // transport::fetch drives the loop; matches download_agent()
+                .build(),
+            manifest: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// The layout, stated as URLs. Two things it pins that nothing else can: a payload entry is
+    /// addressed by its CONTENT HASH with no extension, and there is NO TAG DIRECTORY anywhere —
+    /// a tag path would be a second, unsigned name for a release, and the signed manifest already
+    /// carries `version`.
+    #[test]
+    fn a_mirror_addresses_a_payload_by_hash_under_its_own_directory() {
+        let hash = "a".repeat(64);
+        let m = test_mirror("https://mirror.example/phx/", crate::trust::Payload::Mod);
+        // the trailing slash is normalized away, so nothing downstream doubles a separator
+        assert_eq!(m.doc_url("manifest.json"), "https://mirror.example/phx/mod/manifest.json");
+        assert_eq!(
+            m.doc_url("manifest.json.minisig"),
+            "https://mirror.example/phx/mod/manifest.json.minisig"
+        );
+        assert_eq!(m.blob_url(&hash), format!("https://mirror.example/phx/mod/blobs/{hash}"));
+
+        // and the resolution rule: a hash is a blob, anything else is a document beside it
+        assert_eq!(m.url_of(&hash), m.blob_url(&hash));
+        assert_eq!(m.url_of("manifest.json"), m.doc_url("manifest.json"));
+        // a name from some OTHER backend's release index is not a hash, so it is never
+        // mis-addressed as a blob — it is looked for where it plainly is not, and refused there
+        assert_eq!(m.url_of("winmm.dll"), m.doc_url("winmm.dll"));
+        assert!(!is_content_hash(&"A".repeat(64)), "uppercase is not the manifest's hash form");
+        assert!(!is_content_hash(&"a".repeat(63)));
+
+        // every payload gets its own directory off the same base
+        let g = test_mirror("https://mirror.example/phx", crate::trust::Payload::Game);
+        assert_eq!(g.blob_url(&hash), format!("https://mirror.example/phx/game/blobs/{hash}"));
+    }
+
+    /// The blob path, over a real socket — and the property the type exists to make impossible:
+    /// no request it issues can carry credentials, because there is nowhere to keep them.
+    #[test]
+    fn a_mirror_fetches_a_blob_by_hash_and_never_authenticates() {
+        use crate::downloader::{Asset, Downloader};
+        use crate::test_http::{Canned, TestServer};
+        let content = b"the payload bytes".to_vec();
+        let hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&content));
+        let path: &'static str =
+            Box::leak(format!("/game/blobs/{hash}").into_boxed_str()); // routes are &'static
+        let body = content.clone();
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert(path, Canned::body(body));
+            routes
+        });
+
+        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Game);
+        let dest = std::env::temp_dir().join("phoenix-mirror-blob.bin");
+        let _ = std::fs::remove_file(&dest);
+        // exactly the asset install.rs synthesizes for a content-addressed source: the NAME is the
+        // entry's hash, and both URL fields are empty
+        let asset = Asset {
+            name: hash.clone(),
+            url: String::new(),
+            browser_download_url: String::new(),
+            size: content.len() as u64,
+        };
+        let (n, got) = m.download_to(&asset, &dest, 0, &mut |_, _| true).expect("blob download");
+        assert_eq!(n, content.len() as u64);
+        assert_eq!(got, hash, "the whole-file hash is what the caller verifies against");
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        assert_eq!(server.hits(path), 1);
+        assert!(!server.saw_authorization(path), "a mirror has no credentials to send");
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// A resume asks for exactly the bytes it is missing, and the hash it returns still covers the
+    /// WHOLE file — the prefix it inherited included. Proven over a real 206, because that is the
+    /// half of `stream_to_file` a mock cannot exercise.
+    #[test]
+    fn a_mirror_resumes_from_the_prefix_it_is_handed() {
+        use crate::downloader::{Asset, Downloader};
+        use crate::test_http::{Canned, TestServer};
+        let content: Vec<u8> = (0..200u8).collect();
+        let hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&content));
+        let path: &'static str = Box::leak(format!("/mod/blobs/{hash}").into_boxed_str());
+        let body = content.clone();
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert(path, Canned::body(body));
+            routes
+        });
+
+        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let dest = std::env::temp_dir().join("phoenix-mirror-resume.bin");
+        std::fs::write(&dest, &content[..80]).unwrap();
+        let asset = Asset {
+            name: hash.clone(),
+            url: String::new(),
+            browser_download_url: String::new(),
+            size: content.len() as u64,
+        };
+        let (n, got) = m.download_to(&asset, &dest, 80, &mut |_, _| true).expect("resumed download");
+        assert_eq!(server.saw_range(path).as_deref(), Some("bytes=80-"));
+        assert_eq!(n, content.len() as u64);
+        assert_eq!(got, hash);
+        assert_eq!(std::fs::read(&dest).unwrap(), content);
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// A mirror has no release index to read a tag out of, so the release it reports is NAMED by
+    /// the manifest it serves — and by the very bytes that are then signature-checked, which is why
+    /// they are fetched once and kept rather than fetched twice. A tag it does not serve is refused
+    /// as a fact about this host (a status), so the chain moves on instead of installing something
+    /// the user never saw.
+    #[test]
+    fn a_mirror_names_its_release_from_the_manifest_it_will_be_verified_by() {
+        use crate::downloader::Downloader;
+        use crate::test_http::{Canned, TestServer};
+        let doc = br#"{"schema":2,"payload_id":"mod","version":"1.4.2","files":[]}"#.to_vec();
+        let expect = doc.clone();
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/mod/manifest.json", Canned::body(expect));
+            routes
+        });
+        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+
+        let release = m.fetch_release("ignored/repo", None).expect("the mirror's one release");
+        assert_eq!(release.tag_name, "v1.4.2");
+        let names: Vec<&str> = release.assets.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["manifest.json", "manifest.json.minisig"]);
+
+        // the document the trust gate downloads is the same one the tag was read from, and it did
+        // not cross the wire twice
+        let asset = release.asset("manifest.json").unwrap();
+        assert_eq!(m.download_limited(asset, crate::trust::MAX_DOC_BYTES).unwrap(), doc);
+        assert_eq!(server.hits("/mod/manifest.json"), 1, "the manifest is fetched once");
+
+        // a tag this mirror does not serve is a refusal ABOUT THIS SOURCE, not about the release
+        let err = m.fetch_release("ignored/repo", Some("v9.9.9")).unwrap_err();
+        assert!(
+            err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(404)))),
+            "expected a status in the chain so the source walk falls through, got: {err:#}"
+        );
+        // …and the tag it DOES serve resolves
+        assert!(m.fetch_release("ignored/repo", Some("v1.4.2")).is_ok());
+    }
+
+    /// Every failure a mirror reports has to root a `NetKind`: source failover advances on
+    /// `Transport`, and `install::transient_net_failure` decides retries on the same type. A bare
+    /// string error would silently disable both, and nothing else would look wrong.
+    #[test]
+    fn a_mirror_failure_is_typed_so_failover_and_retries_can_read_it() {
+        use crate::downloader::Downloader;
+        use crate::test_http::TestServer;
+        let server = TestServer::start(|_port| std::collections::HashMap::new()); // 404s everything
+        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let err = m.fetch_release("r", None).unwrap_err();
+        assert!(
+            err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(404)))),
+            "a refusal must carry its status: {err:#}"
+        );
+
+        // nothing listening at all is the Transport case — the one the source walk falls through on
+        let dead = test_mirror("http://127.0.0.1:1", crate::trust::Payload::Mod);
+        let err = dead.fetch_release("r", None).unwrap_err();
+        assert!(
+            err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Transport))),
+            "an unreachable host must be Transport: {err:#}"
+        );
+    }
+
     /// The scheme check runs on every hop, not just the URL a caller starts with: a mirror can
     /// answer its INDEX fine and then redirect an asset somewhere else entirely. This is also the
     /// test that proves the fix for the panic `transport`'s module doc describes — a redirect

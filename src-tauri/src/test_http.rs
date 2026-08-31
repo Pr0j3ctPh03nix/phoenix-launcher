@@ -21,15 +21,32 @@ pub(crate) struct Canned {
     /// Owned (not `&'static str`): a cross-host redirect target has to name this same server's
     /// PORT, which only exists once the listener has bound — a caller builds it with `format!`.
     pub location: Option<String>,
+    /// The response body. Served whole for a plain request, and as a 206 `Content-Range` slice for
+    /// a `Range: bytes=N-` — which is what makes a RESUME provable over a real socket rather than
+    /// asserted about a mock.
+    pub body: Vec<u8>,
 }
 
 impl Canned {
     pub fn redirect(location: impl Into<String>) -> Self {
-        Self { status: 302, location: Some(location.into()) }
+        Self { status: 302, location: Some(location.into()), body: Vec::new() }
     }
     pub fn ok() -> Self {
-        Self { status: 200, location: None }
+        Self { status: 200, location: None, body: Vec::new() }
     }
+    pub fn body(bytes: impl Into<Vec<u8>>) -> Self {
+        Self { status: 200, location: None, body: bytes.into() }
+    }
+}
+
+/// What a path's request(s) carried. One record per path, overwritten by each request except
+/// `hits`, which counts them — "was this fetched once or twice" is the question a response CACHE
+/// has to answer.
+#[derive(Default)]
+pub(crate) struct Seen {
+    pub hits: u32,
+    pub authorization: bool,
+    pub range: Option<String>,
 }
 
 /// Runs until the test process exits — there is no shutdown handle because every caller is a
@@ -37,7 +54,7 @@ impl Canned {
 /// again costs nothing.
 pub(crate) struct TestServer {
     pub port: u16,
-    hits: Arc<Mutex<HashMap<String, bool>>>,
+    hits: Arc<Mutex<HashMap<String, Seen>>>,
 }
 
 impl TestServer {
@@ -63,11 +80,30 @@ impl TestServer {
     /// never hit — a test asserting on a hop that didn't happen has a wrong test, not a wrong
     /// answer of `false`.
     pub fn saw_authorization(&self, path: &str) -> bool {
-        *self.hits.lock().unwrap().get(path).unwrap_or_else(|| panic!("test server: {path} was never hit"))
+        self.seen(path).authorization
+    }
+
+    /// How many requests reached `path`. Zero for a path never asked for — which, unlike the
+    /// header question above, is a meaningful answer rather than a broken test.
+    pub fn hits(&self, path: &str) -> u32 {
+        self.hits.lock().unwrap().get(path).map_or(0, |s| s.hits)
+    }
+
+    /// The `Range` header of the last request to `path`.
+    pub fn saw_range(&self, path: &str) -> Option<String> {
+        self.seen(path).range
+    }
+
+    fn seen(&self, path: &str) -> Seen {
+        let hits = self.hits.lock().unwrap();
+        let s = hits
+            .get(path)
+            .unwrap_or_else(|| panic!("test server: {path} was never hit"));
+        Seen { hits: s.hits, authorization: s.authorization, range: s.range.clone() }
     }
 }
 
-fn handle_one(mut stream: TcpStream, routes: &HashMap<&'static str, Canned>, hits: &Arc<Mutex<HashMap<String, bool>>>) {
+fn handle_one(mut stream: TcpStream, routes: &HashMap<&'static str, Canned>, hits: &Arc<Mutex<HashMap<String, Seen>>>) {
     let mut reader = BufReader::new(stream.try_clone().expect("clone test stream"));
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).unwrap_or(0) == 0 {
@@ -77,32 +113,64 @@ fn handle_one(mut stream: TcpStream, routes: &HashMap<&'static str, Canned>, hit
     let path = request_line.split_whitespace().nth(1).unwrap_or("/").to_string();
 
     let mut had_authorization = false;
+    let mut range = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
             break; // end of headers (blank line) or a dropped connection
         }
-        if line.to_ascii_lowercase().starts_with("authorization:") {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("authorization:") {
             had_authorization = true;
         }
+        if let Some(v) = lower.strip_prefix("range:") {
+            range = Some(v.trim().to_string());
+        }
     }
-    hits.lock().unwrap().insert(path.clone(), had_authorization);
+    {
+        let mut seen = hits.lock().unwrap();
+        let entry = seen.entry(path.clone()).or_default();
+        entry.hits += 1;
+        entry.authorization = had_authorization;
+        entry.range = range.clone();
+    }
 
-    let (status, reason, location) = match routes.get(path.as_str()) {
-        Some(c) => (c.status, reason_phrase(c.status), c.location.clone()),
-        None => (404, "Not Found", None),
+    let (mut status, mut location, mut body) = match routes.get(path.as_str()) {
+        Some(c) => (c.status, c.location.clone(), c.body.clone()),
+        None => (404, None, Vec::new()),
     };
-    let mut resp = format!("HTTP/1.1 {status} {reason}\r\n");
-    if let Some(loc) = location {
+    // `bytes=N-` only — the one form `stream_to_file` ever sends. Anything else is served whole,
+    // which is a legal answer (the client treats a 200 as "the range was declined").
+    let mut content_range = None;
+    if status == 200 && !body.is_empty() {
+        if let Some(start) = range
+            .as_deref()
+            .and_then(|v| v.strip_prefix("bytes="))
+            .and_then(|v| v.strip_suffix('-'))
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|s| *s < body.len())
+        {
+            content_range = Some(format!("bytes {start}-{}/{}", body.len() - 1, body.len()));
+            body = body[start..].to_vec();
+            status = 206;
+        }
+    }
+    let mut resp = format!("HTTP/1.1 {status} {}\r\n", reason_phrase(status));
+    if let Some(loc) = location.take() {
         resp.push_str(&format!("Location: {loc}\r\n"));
     }
-    resp.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+    if let Some(cr) = content_range {
+        resp.push_str(&format!("Content-Range: {cr}\r\n"));
+    }
+    resp.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
     let _ = stream.write_all(resp.as_bytes());
+    let _ = stream.write_all(&body);
 }
 
 fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        206 => "Partial Content",
         302 => "Found",
         404 => "Not Found",
         _ => "Other",

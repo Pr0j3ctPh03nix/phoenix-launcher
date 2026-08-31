@@ -5084,4 +5084,245 @@ mod tests {
         let free = free_space(&missing);
         assert!(free.is_some_and(|b| b > 0), "temp volume free space unknowable: {free:?}");
     }
+
+    // ---- download-source failover ----
+
+    /// The one asset every failover test is about. ONE, deliberately: these tests assert which
+    /// source a given asset came from, and a single job keeps the 8-worker pool from turning that
+    /// into a race.
+    const SOLO: &[u8] = b"one base-game asset, long enough to have a middle to break in";
+
+    fn solo_release() -> String {
+        serde_json::json!({
+            "schema": 2,
+            "version": "1805",
+            "files": [ file_json("solo.vpk", "game/dota/solo.vpk", SOLO) ]
+        })
+        .to_string()
+    }
+
+    /// How a `Peer` source answers a download. One double rather than four, because what these
+    /// tests differ in is only the WAY an asset comes back wrong.
+    enum Answer {
+        /// Serves it, exactly as `Fake` does.
+        Serves,
+        /// Nothing answers — a `NetKind::Transport` failure, which is the retryable kind, so the
+        /// source is only given up on after `DL_RETRIES`.
+        Unreachable,
+        /// Writes `n` REAL bytes and then drops the connection: the shape that leaves a `.part`
+        /// worth resuming.
+        Truncates(usize),
+        /// Answers at the right LENGTH with the wrong bytes — a source contradicting the signed
+        /// manifest, which is the case whose `.part` must never reach another source.
+        Corrupt,
+        /// Writes a little, trips the cancel flag, and reports the abort the chunk callback then
+        /// asks for: a user pressing Stop mid-transfer.
+        Cancels(std::sync::Arc<AtomicBool>),
+    }
+
+    /// A source that can be told how to fail, wrapping a real `Fake` for everything else.
+    struct Peer {
+        inner: Fake,
+        answer: Answer,
+        calls: AtomicU64,
+        /// The `resume_from` of the LAST `download_to`, which is how a test proves what prefix a
+        /// source inherited from the one before it. `u64::MAX` = never asked for anything.
+        resumed: AtomicU64,
+    }
+
+    impl Peer {
+        fn new(answer: Answer) -> Self {
+            Self {
+                inner: base_fake("v1805", &solo_release(), vec![("solo.vpk", SOLO)]),
+                answer,
+                calls: AtomicU64::new(0),
+                resumed: AtomicU64::new(u64::MAX),
+            }
+        }
+        fn calls(&self) -> u64 {
+            self.calls.load(Ordering::SeqCst)
+        }
+        fn resumed(&self) -> u64 {
+            self.resumed.load(Ordering::SeqCst)
+        }
+    }
+
+    impl crate::downloader::Downloader for Peer {
+        fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+            self.inner.fetch_release(r, t)
+        }
+        fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+            self.inner.fetch_releases(r)
+        }
+        fn download(&self, a: &Asset) -> Result<Vec<u8>> {
+            self.inner.download(a)
+        }
+        fn download_to(
+            &self,
+            asset: &Asset,
+            dest: &Path,
+            resume_from: u64,
+            progress: crate::downloader::ChunkProgress,
+        ) -> Result<(u64, String)> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.resumed.store(resume_from, Ordering::SeqCst);
+            // The typed root is what `transient_net_failure` and the source walk both read; a
+            // bare string here would quietly change the behaviour under test.
+            let dead = || {
+                Err(anyhow::Error::new(NetKind::Transport).context("simulated unreachable source"))
+            };
+            match &self.answer {
+                Answer::Serves => self.inner.download_to(asset, dest, resume_from, progress),
+                Answer::Unreachable => dead(),
+                Answer::Truncates(n) => {
+                    std::fs::write(dest, &SOLO[..*n])?;
+                    progress(*n as u64, Some(SOLO.len() as u64));
+                    dead()
+                }
+                Answer::Corrupt => {
+                    let wrong = vec![b'X'; SOLO.len()];
+                    std::fs::write(dest, &wrong)?;
+                    progress(wrong.len() as u64, Some(wrong.len() as u64));
+                    Ok((wrong.len() as u64, sha(&wrong)))
+                }
+                Answer::Cancels(flag) => {
+                    std::fs::write(dest, &SOLO[..4])?;
+                    flag.store(true, Ordering::SeqCst);
+                    // exactly what a real backend does when the callback says stop
+                    if !progress(4, Some(SOLO.len() as u64)) {
+                        bail!("download aborted");
+                    }
+                    unreachable!("the chunk callback must refuse once the cancel flag is set")
+                }
+            }
+        }
+    }
+
+    /// Set up a two-source run over the solo release: `(manifest, releases, origins-ready pair)`.
+    fn two_sources(a: &Peer, b: &Peer) -> (Release, Release, Manifest) {
+        let (rel_a, manifest) = base_fetch(&a.inner);
+        let rel_b = b.fetch_release("r", None).unwrap();
+        (rel_a, rel_b, manifest)
+    }
+
+    /// Two sources, and an install that is served by the second. Without this an asset the first
+    /// source will not give up ends the whole run — irrelevant for a one-bundle shim, fatal for a
+    /// 7.9 GiB base game where any one of ~136 bundles can be the unlucky one.
+    #[test]
+    fn an_asset_the_first_source_cannot_serve_comes_from_the_next() {
+        let dir = tempdir("failover-next");
+        let (a, b) = (Peer::new(Answer::Unreachable), Peer::new(Answer::Serves));
+        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        install_base(
+            &dir,
+            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &manifest,
+            None,
+            None,
+            None,
+        )
+        .expect("the second source must finish the run");
+        assert_eq!(std::fs::read(dir.join("game/dota/solo.vpk")).unwrap(), SOLO);
+        assert!(a.calls() > 1, "the first source is retried before it is given up on");
+        assert_eq!(b.calls(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A TRANSPORT failure says nothing about the bytes already written, so they are kept and the
+    /// next source resumes from them. On the links this feature exists for that prefix is
+    /// gigabytes, and discarding it would make every failover start from zero.
+    #[test]
+    fn a_transport_failure_hands_the_next_source_the_prefix_it_left() {
+        let dir = tempdir("failover-resume");
+        let (a, b) = (Peer::new(Answer::Truncates(20)), Peer::new(Answer::Serves));
+        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        install_base(
+            &dir,
+            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &manifest,
+            None,
+            None,
+            None,
+        )
+        .expect("the second source must finish what the first started");
+        assert_eq!(b.resumed(), 20, "the .part the first source left is the second's prefix");
+        assert_eq!(std::fs::read(dir.join("game/dota/solo.vpk")).unwrap(), SOLO);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A VERIFICATION failure is the opposite case, and the distinction is the whole reason the two
+    /// are separate outcomes: those bytes came from a source that has just been shown to contradict
+    /// the signed manifest, so handing them to the next source as a resume prefix would let one
+    /// source's corruption survive the failover meant to escape it.
+    #[test]
+    fn a_source_that_serves_the_wrong_bytes_does_not_poison_the_next() {
+        let dir = tempdir("failover-corrupt");
+        let (a, b) = (Peer::new(Answer::Corrupt), Peer::new(Answer::Serves));
+        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        install_base(
+            &dir,
+            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &manifest,
+            None,
+            None,
+            None,
+        )
+        .expect("the second source must be able to serve it cleanly");
+        assert_eq!(a.calls(), 1, "wrong bytes are a settled answer — never retried at the source");
+        assert_eq!(b.resumed(), 0, "the poisoned .part must be gone before the next source starts");
+        assert_eq!(std::fs::read(dir.join("game/dota/solo.vpk")).unwrap(), SOLO);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only an EXHAUSTED chain fails the run, and it says so.
+    #[test]
+    fn every_source_exhausted_fails_the_run_cleanly() {
+        let dir = tempdir("failover-exhausted");
+        let (a, b) = (Peer::new(Answer::Unreachable), Peer::new(Answer::Corrupt));
+        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        let err = install_base(
+            &dir,
+            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &manifest,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(a.calls() > 0 && b.calls() > 0, "every source must actually be tried");
+        assert!(
+            format!("{err:#}").contains("from all 2 sources"),
+            "the failure should name the exhausted chain, got: {err:#}"
+        );
+        assert!(!dir.join("game/dota/solo.vpk").exists(), "nothing may be placed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cancel is an INSTRUCTION, not a source failure. Cancelling a 7.9 GiB install must not
+    /// silently restart it against the next mirror — so the abort line is asked directly rather
+    /// than inferred from an error message, and the second source is never reached at all.
+    #[test]
+    fn a_cancel_mid_transfer_is_a_cancel_and_never_a_failover() {
+        let dir = tempdir("failover-cancel");
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (a, b) = (Peer::new(Answer::Cancels(cancel.clone())), Peer::new(Answer::Serves));
+        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        let err = install_base(
+            &dir,
+            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &manifest,
+            None,
+            Some(&cancel),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.chain().any(|c| c.downcast_ref::<engine::Cancelled>().is_some()),
+            "a Stop must still report as Cancelled, got: {err:#}"
+        );
+        assert_eq!(b.calls(), 0, "a cancel must never advance to the next source");
+        assert_eq!(a.calls(), 1, "and must not be retried against the source it stopped, either");
+        assert!(!dir.join("game/dota/solo.vpk").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
