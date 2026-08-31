@@ -161,13 +161,19 @@ jobs:
           # Same key as the mod and the game: PINNED in the launcher is ONE ring for every payload,
           # not one key per payload_id, so anything else is refused by every client.
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
-          # 2,000,000 + the build counter — see release-tooling's manifest_schema.SERIAL_FLOOR, which
-          # is what actually enforces the floor now (dev/gen_launcher_manifest.py carries no format
-          # knowledge). Rises on every run, including a rebuild of the same tag, which a
-          # version-derived number cannot do.
-          PHOENIX_SERIAL: ${{ 2000000 + github.run_number }}
         run: |
           set -e
+          # 2,000,000 + the build counter — see release-tooling's manifest_schema.SERIAL_FLOOR,
+          # which is what actually enforces the floor now (dev/gen_launcher_manifest.py carries no
+          # format knowledge). Rises on every run, including a rebuild of the same tag, which a
+          # version-derived number cannot do.
+          #
+          # Added HERE rather than in `env:` because GitHub's expression language has no arithmetic
+          # operators at all: adding the offset inside an expression is a workflow PARSE error that
+          # rejects the whole file before any step runs. (Deliberately not spelled with the literal
+          # expression syntax even in this comment — see the header: substitution happens before
+          # bash sees the script, so an example written out here would itself be evaluated.)
+          serial=$(( 2000000 + GITHUB_RUN_NUMBER ))
           # No secret check here: seal refuses an unset key by itself, with the reason, and a
           # second copy of that rule is a second place for it to go stale.
           out=src-tauri/target/release
@@ -184,7 +190,7 @@ jobs:
           # serial floor, envelope shape). This script only ever knows "hash an exe, name it".
           python dev/gen_launcher_manifest.py \
             --version  "$TAG" \
-            --serial   "$PHOENIX_SERIAL" \
+            --serial   "$serial" \
             --exe      phoenix-launcher.exe \
             --exe-path "$out/phoenix-launcher.exe" \
             "${notes[@]}" \
