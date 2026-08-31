@@ -208,11 +208,8 @@ pub mod fake {
                         doc["payload_id"] = serde_json::json!("mod");
                     }
                     if doc.get("serial").is_none() {
-                        // Never stale unless a test says so. A release double is not the subject
-                        // of the freshness gate, and a floor baked into the build under test
-                        // (PHOENIX_MIN_SERIAL_*, which persists in whatever terminal a release was
-                        // built from) would otherwise turn most of the suite red for a reason
-                        // nothing on screen would name.
+                        // Never stale unless a test says so: a release double is not the subject
+                        // of the freshness gate, and every test that is says so explicitly.
                         doc["serial"] = serde_json::json!(u64::MAX);
                     }
                     edit(&mut doc);

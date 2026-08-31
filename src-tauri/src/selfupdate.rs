@@ -67,25 +67,53 @@ fn sibling(exe: &Path, suffix: &str) -> PathBuf {
     exe.with_file_name(name)
 }
 
-/// Is `release` newer than this build? `None` means we are current (or ahead of it, which is
-/// normal for a local dev build).
+/// Is `release` newer than this build? `Ok(None)` means there is nothing to offer — we are current,
+/// or ahead (normal for a local dev build), or the release is not one we can believe.
 ///
-/// Takes an already-fetched release rather than a repo: WHICH repo and WHICH credentials can see
-/// it is a shell decision (cmd/selfupdate.rs resolves it), and this way check and apply cost one
-/// round trip each instead of two.
-pub fn available(release: &Release) -> Option<Available> {
+/// THE VERSION COMPARED IS THE SIGNED ONE. A tag is a label the source chooses, so comparing
+/// against it lets whoever serves the release pick the answer: publish a genuine OLD release under
+/// a NEW tag and the comparison says "newer", the signature verifies (it is a real release), and
+/// the user is silently downgraded. `manifest.version` is inside the signed document, so an
+/// attacker cannot raise it without breaking the signature, and a replayed old release carries its
+/// own old version and is correctly refused. The tag is still what we FETCH by; it is never what
+/// we decide by.
+///
+/// A release with no manifest falls back to the tag — that is the pre-signing shape, and the same
+/// deliberate gap `expected_sha` documents. It stops firing once every release carries one.
+///
+/// Untrustworthy is `Ok(None)`, not an error: an unverifiable release is one we do not have, and
+/// there is nothing useful to say to a user about a release that was never really offered. An
+/// UNREADABLE one (schema too new) is an error on purpose — that one the user must act on.
+pub fn available(
+    settings: &Settings,
+    dl: &dyn Downloader,
+    release: &Release,
+) -> Result<Option<Available>> {
     let current = env!("CARGO_PKG_VERSION");
-    let version = release.tag_name.trim_start_matches('v').to_string();
+    let signed = match release.asset(engine::MANIFEST_ASSET) {
+        Some(_) => match engine::manifest_of(settings, dl, release, Payload::Launcher) {
+            Ok(m) => Some(m.version),
+            // Schema we cannot read: the one failure worth showing, so it propagates.
+            Err(e) if e.chain().any(|c| c.is::<crate::manifest::UnsupportedSchema>()) => {
+                return Err(e)
+            }
+            // Anything else — bad signature, unknown key, wrong payload, stale serial — is a
+            // release we do not have.
+            Err(_) => return Ok(None),
+        },
+        None => None,
+    };
+    let version = signed.unwrap_or_else(|| release.tag_name.trim_start_matches('v').to_string());
     if !version_lt(current, &version) {
-        return None;
+        return Ok(None);
     }
-    Some(Available {
+    Ok(Some(Available {
         tag: release.tag_name.clone(),
         version,
         current: current.to_string(),
         // an empty release body is "no notes", not an empty section in the UI
         notes: release.body.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string),
-    })
+    }))
 }
 
 /// Download the launcher published by `release`, verify it, and swap it into place. Returns the
@@ -196,10 +224,13 @@ fn exe_asset(release: &Release) -> Result<&Asset> {
 /// KNOWN AND DELIBERATE GAP: a release publishing no manifest at all falls back to the sidecar, so
 /// an attacker who can choose what we see can strip the signed pair and be believed on the weaker
 /// evidence. Closing it means refusing every release cut before signing existed — i.e. refusing to
-/// self-update the builds that most need to. It closes on its own once a floor can be baked
-/// (`PHOENIX_MIN_SERIAL_LAUNCHER`), because a floor above the last unsigned release makes the
-/// unsigned path unreachable. A release that publishes a manifest WITHOUT a signature is a
-/// different matter and is refused outright — that shape is only ever tampering.
+/// self-update the builds that most need to.
+///
+/// It does NOT close by itself. The branch is chosen by the manifest's ABSENCE, before any version
+/// or serial is read, so nothing downstream of that choice can make the unsigned path unreachable.
+/// Closing it takes a deliberate switch, once every release in the wild carries a manifest. A
+/// release that publishes a manifest WITHOUT a signature is a different matter and is refused
+/// outright — that shape is only ever tampering.
 fn expected_sha(
     settings: &Settings,
     dl: &dyn Downloader,
@@ -388,19 +419,48 @@ mod tests {
         }
     }
 
+    /// These releases publish no manifest, so `available` falls back to the tag — the pre-signing
+    /// shape. The downloader is therefore never reached; it only has to exist.
+    fn offered(tag: &str, body: Option<&str>) -> Option<Available> {
+        let dl = crate::downloader::fake::Fake::new(tag, r#"{"schema":2,"files":[]}"#, vec![]);
+        available(&Settings::default(), &dl, &release(tag, &[], body)).unwrap()
+    }
+
     #[test]
     fn only_newer_tags_are_offered() {
         let cur = env!("CARGO_PKG_VERSION");
-        assert!(available(&release("v999.0.0", &[], None)).is_some());
-        assert!(available(&release("v0.0.1", &[], None)).is_none());
+        assert!(offered("v999.0.0", None).is_some());
+        assert!(offered("v0.0.1", None).is_none());
         // the running build itself is not an update — the common case, every launch
-        assert!(available(&release(cur, &[], None)).is_none());
-        assert!(available(&release(&format!("v{cur}"), &[], None)).is_none());
+        assert!(offered(cur, None).is_none());
+        assert!(offered(&format!("v{cur}"), None).is_none());
+    }
+
+    /// A tag is a label whoever serves the release chooses; the signed version is not.
+    ///
+    /// The attack this closes: publish a GENUINE OLD launcher release under a NEW tag. Everything
+    /// else passes — the signature is real, the key is pinned, the payload id matches — and a
+    /// reader that compared against the tag would call it an upgrade and silently downgrade the
+    /// user. Comparing `manifest.version` instead makes the old release state its own age.
+    #[test]
+    fn a_new_tag_over_an_old_signed_release_is_not_an_upgrade() {
+        let old = r#"{"schema":2,"payload_id":"launcher","version":"0.0.1",
+                      "files":[{"dest":"x","name":"x","sha256":"aa","size":1}]}"#;
+        let dl = crate::downloader::fake::Fake::new("v999.0.0", old, vec![]);
+        let rel = dl.fetch_release("r", None).unwrap();
+        assert!(
+            rel.asset(engine::MANIFEST_ASSET).is_some(),
+            "the fake must publish a manifest or this proves nothing"
+        );
+        assert!(
+            available(&Settings::default(), &dl, &rel).unwrap().is_none(),
+            "the tag says 999.0.0; the SIGNED document says 0.0.1, and that is the one that counts"
+        );
     }
 
     #[test]
     fn version_strips_the_tag_prefix() {
-        let a = available(&release("v999.1.2", &[], None)).unwrap();
+        let a = offered("v999.1.2", None).unwrap();
         assert_eq!(a.version, "999.1.2");
         assert_eq!(a.tag, "v999.1.2");
         assert_eq!(a.current, env!("CARGO_PKG_VERSION"));
@@ -408,9 +468,9 @@ mod tests {
 
     #[test]
     fn blank_release_body_is_not_notes() {
-        assert!(available(&release("v999.0.0", &[], Some("  \n "))).unwrap().notes.is_none());
+        assert!(offered("v999.0.0", Some("  \n ")).unwrap().notes.is_none());
         assert_eq!(
-            available(&release("v999.0.0", &[], Some(" fixed stuff "))).unwrap().notes.as_deref(),
+            offered("v999.0.0", Some(" fixed stuff ")).unwrap().notes.as_deref(),
             Some("fixed stuff")
         );
     }
@@ -570,8 +630,7 @@ mod tests {
         let manifest = serde_json::json!({
             "schema": 2,
             "payload_id": payload,
-            // above the baked floor, whatever a release build set it to
-            "serial": Payload::Launcher.baked_min_serial() + 3,
+            "serial": 3,
             "version": "999.0.0",
             "files": [{
                 "name": EXE_ASSET,

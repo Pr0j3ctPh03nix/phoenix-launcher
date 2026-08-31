@@ -34,16 +34,18 @@ pub async fn launcher_check(
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let s = Settings::load();
-        let (_, release) = fetch(&s).map_err(CmdError::from)?;
+        let (dl, release) = fetch(&s).map_err(CmdError::from)?;
         // Record the tag whether or not it is an update: this is the freshness key the "What's
         // new" launcher page checks its cached history against, and the common case — this build
         // IS the latest — is exactly the one where that history must open without a round trip.
         *st.launcher_tag.lock().unwrap() = Some(release.tag_name.clone());
-        Ok(selfupdate::available(&release).map(|a| LauncherUpdateView {
-            tag: a.tag,
-            version: a.version,
-            current: a.current,
-            notes: a.notes,
+        Ok(selfupdate::available(&s, dl.as_ref(), &release).map_err(CmdError::from)?.map(|a| {
+            LauncherUpdateView {
+                tag: a.tag,
+                version: a.version,
+                current: a.current,
+                notes: a.notes,
+            }
         }))
     })
     .await
@@ -80,7 +82,7 @@ pub async fn launcher_update(
         // Refuse to "update" to something that is not newer. Guards the pinned path too: a tag
         // can be re-pointed at other bytes, and this is the only check that the release we are
         // about to execute is an upgrade at all.
-        if selfupdate::available(&release).is_none() {
+        if selfupdate::available(&s, dl.as_ref(), &release).map_err(CmdError::from)?.is_none() {
             return Err(CmdError::from(format!(
                 "release {} is not newer than this build ({}) — check for updates again",
                 release.tag_name,

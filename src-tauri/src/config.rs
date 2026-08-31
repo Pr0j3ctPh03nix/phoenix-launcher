@@ -25,13 +25,19 @@ pub const DEFAULT_LAUNCHER_REPO: &str = "Pr0j3ctPh03nix/phoenix-launcher";
 /// must ride the tokenless `browser_download_url` path (free CDN bandwidth, no API rate budget).
 pub const DEFAULT_GAME_REPO: &str = "Pr0j3ctPh03nix/game-dist";
 
-/// Read-only token for the private staging repo, injected at BUILD time:
-///     PHOENIX_BAKED_TOKEN=github_pat_... bun run tauri build
+/// Read-only GitHub access for the PRIVATE client-dist-staging repo, injected at BUILD time:
+///     PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS=github_pat_... bun run tauri build
+///
+/// Named for the one repo it opens, because it is not a key and grants nothing else: it exists
+/// solely so a client can list and download releases from a repo that is not public. It has no
+/// part in trust — nothing it fetches is believed on its account, only on the signature over it.
+///
 /// Deliberately not a source literal — a committed github_pat_ gets blocked/revoked by GitHub
 /// secret scanning on push. A user-saved token still wins over this. Merged at the point of
 /// use (`Settings::token()`), never into the persisted struct — a settings save must not be
-/// able to write the baked token to disk.
-const BAKED_TOKEN: Option<&str> = option_env!("PHOENIX_BAKED_TOKEN");
+/// able to write it to disk.
+const DIST_STAGING_REPO_ACCESS: Option<&str> =
+    option_env!("PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS");
 
 /// One place releases can be downloaded from. Position in `Settings::sources` is priority order.
 ///
@@ -200,10 +206,9 @@ pub struct Settings {
     /// mirror can always serve an older release it once held a valid signature for, and nothing
     /// else in a signed document says it is not the current one.
     ///
-    /// Plaintext in the user's profile, which is exactly why it is not the only floor — anything
-    /// that can edit this file can hand the ratchet back, so `trust::Payload::baked_min_serial`
-    /// sits underneath it in the binary. `serial_floor` is where the two meet, and it is the ONE
-    /// definition: nothing may compare a serial against half of it.
+    /// Plaintext in the user's profile, and deliberately the ONLY floor. A build-time backstop
+    /// used to sit under it; it was removed because anything able to edit this file can replace
+    /// the launcher outright, which is strictly more powerful — see the note in `trust.rs`.
     #[serde(default)]
     pub max_serial_seen: BTreeMap<String, u64>,
 }
@@ -323,7 +328,7 @@ impl Settings {
 
     /// The token to authenticate with: a user-saved token wins, else the build-time baked one.
     pub fn token(&self) -> Option<&str> {
-        self.token.as_deref().or(BAKED_TOKEN)
+        self.token.as_deref().or(DIST_STAGING_REPO_ACCESS)
     }
 
     /// The repo the launcher self-updates from. No token FIELD of its own: this repo is meant to
@@ -345,23 +350,18 @@ impl Settings {
         self.game_repo.as_deref().unwrap_or(DEFAULT_GAME_REPO)
     }
 
-    /// The lowest `serial` a signed manifest for `payload` may carry: whichever of the baked
-    /// backstop and this machine's own high-water mark is greater. Neither alone is enough — the
-    /// baked one cannot know what the user has since installed, and the persisted one lives in an
-    /// editable file.
+    /// The lowest `serial` a signed manifest for `payload` may carry: this machine's own
+    /// high-water mark. Zero on a fresh install, which is correct — there is nothing yet to be
+    /// rolled back FROM, and the first thing installed is whatever the source offers.
     pub fn serial_floor(&self, payload: crate::trust::Payload) -> u64 {
-        let seen = self.max_serial_seen.get(payload.id()).copied().unwrap_or(0);
-        seen.max(payload.baked_min_serial())
+        self.max_serial_seen.get(payload.id()).copied().unwrap_or(0)
     }
 
     /// Is this serial past what we have recorded for `payload`? The read half of the ratchet, so a
     /// caller holding a settings snapshot can decide whether a WRITE is needed at all —
     /// `Settings::update` always saves, and the common case is the same release checked again.
-    ///
-    /// Deliberately NOT `serial_floor`: that folds in the baked backstop, and a build whose baked
-    /// floor already exceeds the persisted one would then never record anything.
     pub fn serial_is_newer(&self, payload: crate::trust::Payload, serial: u64) -> bool {
-        serial > self.max_serial_seen.get(payload.id()).copied().unwrap_or(0)
+        serial > self.serial_floor(payload)
     }
 
     /// Move the ratchet forward. Returns whether anything changed.
@@ -461,26 +461,24 @@ mod tests {
         assert_eq!(s.sources.len(), 2);
     }
 
-    /// The rollback ratchet: forward only, per payload, and durable. It is half of the floor —
-    /// `trust::Payload::baked_min_serial` is the other half, and `serial_floor` is the only place
-    /// they are allowed to meet.
+    /// The rollback ratchet: forward only, per payload, and durable. It is the WHOLE floor — there
+    /// is no build-time backstop under it any more (see the note in `trust.rs`).
     #[test]
     fn the_serial_ratchet_only_ever_moves_forward() {
         use crate::trust::Payload;
-        let baked = Payload::Mod.baked_min_serial();
         let mut s = Settings::default();
-        assert_eq!(s.serial_floor(Payload::Mod), baked, "no history: the baked backstop alone");
+        assert_eq!(s.serial_floor(Payload::Mod), 0, "no history: nothing to roll back from");
 
         assert!(s.serial_is_newer(Payload::Mod, 5));
         assert!(s.advance_serial(Payload::Mod, 5));
-        assert_eq!(s.serial_floor(Payload::Mod), 5.max(baked));
+        assert_eq!(s.serial_floor(Payload::Mod), 5);
         assert!(!s.serial_is_newer(Payload::Mod, 5), "so no settings write is needed for it");
         assert!(!s.advance_serial(Payload::Mod, 5), "the same release again is not news");
         assert!(!s.advance_serial(Payload::Mod, 4), "and it never walks back");
         assert_eq!(s.max_serial_seen["mod"], 5);
         assert_eq!(
             s.serial_floor(Payload::Game),
-            Payload::Game.baked_min_serial(),
+            0,
             "one payload's history says nothing about another's"
         );
 

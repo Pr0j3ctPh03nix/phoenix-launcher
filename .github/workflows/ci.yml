@@ -76,4 +76,4 @@ jobs:
       - name: Build (no bundling — cache warm + compile check)
         run: bun run tauri build --no-bundle
         env:
-          PHOENIX_BAKED_TOKEN: ${{ secrets.PHOENIX_BAKED_TOKEN }}
+          PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS: ${{ secrets.PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS }}

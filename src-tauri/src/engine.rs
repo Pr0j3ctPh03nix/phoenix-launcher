@@ -848,9 +848,7 @@ mod tests {
     #[test]
     fn a_serial_below_the_floor_is_refused() {
         let doc = r#"{"schema":2,"version":"1.0.0","files":[]}"#;
-        // relative to the BAKED floor, which a release build can set and which the effective
-        // floor is the max of — an absolute serial here would only be testing an unbaked build
-        let base = Payload::Mod.baked_min_serial();
+        let base: u64 = 100;
         let dl = Fake::new("v1.0.0", doc, vec![]).serial(base + 5);
         let release = dl.fetch_release("r", None).unwrap();
         let at = |seen: u64| {
@@ -870,18 +868,17 @@ mod tests {
         assert!(format!("{e:#}").contains("no serial"), "got: {e:#}");
     }
 
-    /// The baked floor is the backstop under the persisted one, and `serial_floor` is where they
-    /// meet. Nothing may compare a serial against half of it — the settings file is plaintext in
-    /// the user's own profile, and the baked value is the half that cannot be edited.
+    /// The floor is per payload and comes from the machine's own history — nothing else. A fresh
+    /// install has none, which is correct: there is nothing yet to be rolled back FROM.
     #[test]
-    fn the_effective_floor_is_the_higher_of_the_two() {
+    fn the_floor_is_this_machines_history_and_nothing_else() {
         let mut s = Settings::default();
-        assert_eq!(s.serial_floor(Payload::Mod), Payload::Mod.baked_min_serial());
+        assert_eq!(s.serial_floor(Payload::Mod), 0);
         s.max_serial_seen.insert("mod".into(), 12);
-        assert_eq!(s.serial_floor(Payload::Mod), 12.max(Payload::Mod.baked_min_serial()));
+        assert_eq!(s.serial_floor(Payload::Mod), 12);
         assert_eq!(
             s.serial_floor(Payload::Game),
-            Payload::Game.baked_min_serial(),
+            0,
             "one payload's history says nothing about another's"
         );
     }

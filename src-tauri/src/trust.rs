@@ -198,53 +198,23 @@ impl Payload {
         }
     }
 
-    /// The serial floor baked into this build. See the constants below.
-    pub fn baked_min_serial(self) -> u64 {
-        match self {
-            Self::Mod => MIN_SERIAL_MOD,
-            Self::Launcher => MIN_SERIAL_LAUNCHER,
-            Self::Game => MIN_SERIAL_GAME,
-        }
-    }
 }
 
-/// Per-payload serial floors, injected at BUILD time the same way `PHOENIX_BAKED_TOKEN` is
-/// (config.rs):
-///
-/// ```sh
-/// PHOENIX_MIN_SERIAL_MOD=42 bun run tauri build
-/// ```
-///
-/// Absent means 0 — no floor, which is the correct default for a build cut before any release was
-/// signed. The persisted floor (`Settings::max_serial_seen`) does the day-to-day ratcheting; this
-/// is the backstop under it, because that file is plaintext in the user's profile and anything
-/// that can edit it can otherwise hand the ratchet back. A build that bakes a floor can never be
-/// walked below it by any means at all.
-///
-/// A malformed value is a BUILD failure, not a silent 0: `parse_floor` is const-evaluated, so
-/// `PHOENIX_MIN_SERIAL_MOD=v42` stops the build instead of quietly shipping a launcher whose
-/// backstop is missing — which is precisely the situation nobody would notice.
-const MIN_SERIAL_MOD: u64 = parse_floor(option_env!("PHOENIX_MIN_SERIAL_MOD"));
-const MIN_SERIAL_LAUNCHER: u64 = parse_floor(option_env!("PHOENIX_MIN_SERIAL_LAUNCHER"));
-const MIN_SERIAL_GAME: u64 = parse_floor(option_env!("PHOENIX_MIN_SERIAL_GAME"));
-
-/// Decimal parse in const context: absent is 0, anything that is not a non-empty run of ASCII
-/// digits fails the build (as does a value that overflows — const arithmetic is checked).
-const fn parse_floor(v: Option<&str>) -> u64 {
-    let b = match v {
-        Some(s) => s.as_bytes(),
-        None => return 0,
-    };
-    assert!(!b.is_empty(), "PHOENIX_MIN_SERIAL_* must be a decimal number");
-    let mut i = 0;
-    let mut n: u64 = 0;
-    while i < b.len() {
-        assert!(b[i] >= b'0' && b[i] <= b'9', "PHOENIX_MIN_SERIAL_* must be a decimal number");
-        n = n * 10 + (b[i] - b'0') as u64;
-        i += 1;
-    }
-    n
-}
+// There is deliberately NO build-time serial floor. One existed (PHOENIX_MIN_SERIAL_*, baked per
+// payload) as a backstop under the persisted ratchet, on the reasoning that settings.json is
+// plaintext and anything able to edit it could hand the ratchet back. That reasoning does not
+// survive contact: anything with write access to the user's profile can replace the launcher
+// itself, which is strictly more powerful than rolling its ratchet back.
+//
+// The only window it genuinely covered was a FIRST install on a fresh machine, where nothing is
+// persisted yet, behind a source that chooses to serve an old release. The worst outcome there is
+// a genuine, signed, previously-published release — stale, not hostile — and the next check from
+// any honest source corrects it. That is not worth a per-build variable that has to be set
+// correctly forever and is silently useless when it is not.
+//
+// The launcher's own payload needs no floor at all: it knows its version from CARGO_PKG_VERSION
+// and compares against the SIGNED manifest (see selfupdate::available), so a downgrade cannot be
+// offered no matter what a source claims.
 
 /// Verify `minisig` over `data`, returning the id of the key that signed it.
 ///
@@ -636,16 +606,6 @@ mod tests {
             accept(Payload::Mod, &m, 0),
             Err(TrustError::StaleSerial { payload: "mod", found: None, floor: 0 })
         );
-    }
-
-    /// Absent env vars mean no floor. (A malformed one cannot be tested here — it fails the
-    /// BUILD, which is the entire point of const-evaluating it.)
-    #[test]
-    fn an_unset_baked_floor_is_zero() {
-        assert_eq!(parse_floor(None), 0);
-        assert_eq!(parse_floor(Some("0")), 0);
-        assert_eq!(parse_floor(Some("18446744073709551615")), u64::MAX);
-        assert_eq!(parse_floor(Some("42")), 42);
     }
 
     /// Naming a pinned key must not be enough to be believed — only signing as one is.
