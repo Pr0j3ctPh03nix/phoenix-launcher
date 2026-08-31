@@ -11,6 +11,11 @@
 # Headless frontend screenshots + their working copy (see dev/shoot.sh)
 /dev/preview/.out/
 
+# Bytecode from the vendored release tooling in tools/ — written whenever CI, or a local dry run,
+# imports one of those scripts.
+__pycache__/
+*.pyc
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db
