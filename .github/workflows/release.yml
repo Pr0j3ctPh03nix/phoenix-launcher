@@ -161,13 +161,15 @@ jobs:
           # Same key as the mod and the game: PINNED in the launcher is ONE ring for every payload,
           # not one key per payload_id, so anything else is refused by every client.
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
-          # 2,000,000 + the build counter — see gen_launcher_manifest.SERIAL_FLOOR. Rises on every
-          # run, including a rebuild of the same tag, which a version-derived number cannot do.
+          # 2,000,000 + the build counter — see release-tooling's manifest_schema.SERIAL_FLOOR, which
+          # is what actually enforces the floor now (dev/gen_launcher_manifest.py carries no format
+          # knowledge). Rises on every run, including a rebuild of the same tag, which a
+          # version-derived number cannot do.
           PHOENIX_SERIAL: ${{ 2000000 + github.run_number }}
         run: |
           set -e
-          # No secret check here: phx_release refuses an unset key by itself, with the reason, and
-          # a second copy of that rule is a second place for it to go stale.
+          # No secret check here: seal refuses an unset key by itself, with the reason, and a
+          # second copy of that rule is a second place for it to go stale.
           out=src-tauri/target/release
           # release-tooling, fetched at the pinned SHA above — the same scripts, at the same
           # revision, that seal the mod and the base game. The public half comes from the same
@@ -177,17 +179,21 @@ jobs:
           # and its absence is the only difference between a dry run and the real thing.
           notes=()
           [ -f release_body.md ] && notes=(--notes-file release_body.md)
-          python "$tools/gen_launcher_manifest.py" \
+          # This repo's own discovery step (dev/): hashes the exe and builds ONE files[] entry
+          # through release-tooling's build_manifest.py, which owns every format rule (schema,
+          # serial floor, envelope shape). This script only ever knows "hash an exe, name it".
+          python dev/gen_launcher_manifest.py \
             --version  "$TAG" \
             --serial   "$PHOENIX_SERIAL" \
             --exe      phoenix-launcher.exe \
             --exe-path "$out/phoenix-launcher.exe" \
             "${notes[@]}" \
-            --out      "$out/manifest.json"
-          # The same seal every other payload goes through — validate, sign, prove — rather than a
-          # second hand-written copy of those three steps in a second repo. The key is read from
-          # the environment and never written to disk.
-          python "$tools/phx_release.py" seal \
+            --out      "$out/manifest.json" \
+            --tools    "$tools"
+          # The same seal every other payload goes through — sign, then prove — rather than a
+          # second hand-written copy of those two steps in a second repo. The key is read from the
+          # environment and never written to disk.
+          python "$tools/seal.py" seal \
             --manifest "$out/manifest.json" \
             --pub      .tooling/keys/phoenix-active.pub \
             --trusted-comment "phoenix launcher $TAG"
