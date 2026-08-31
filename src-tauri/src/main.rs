@@ -29,6 +29,11 @@ mod mirror;
 mod selfupdate;
 mod state;
 mod steaminf;
+// Test-only shared HTTP/1.1 test server for github.rs/mirror.rs redirect-chain unit tests — see
+// its own doc comment for why a real TCP round trip is what those tests need.
+#[cfg(test)]
+mod test_http;
+mod transport;
 mod trust;
 mod verify;
 mod views;

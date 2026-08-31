@@ -16,6 +16,10 @@ rfd = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
+# Already in the dependency tree via ureq itself (URL parsing) — declared directly because
+# transport.rs's own redirect-target parsing/joining is security-relevant code, not incidental
+# reuse of whatever ureq happens to pull in.
+url = "2"
 sha2 = "0.10"
 hex = "0.4"
 # Ed25519 for manifest signatures (trust.rs). Already in the tree — ureq -> rustls -> ring — so

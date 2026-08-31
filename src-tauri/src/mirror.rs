@@ -18,6 +18,7 @@ use anyhow::{Context, Result};
 use crate::config::{normalize_mirror_url, Settings, Source};
 use crate::downloader::{Asset, Downloader, NetKind, Release};
 use crate::github::Github;
+use crate::transport::{self, FetchError};
 
 const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 
@@ -274,10 +275,11 @@ fn fetch_published_mirrors(settings: &Settings) -> Result<Option<Vec<String>>> {
 
 fn fetch_list_from_mirror(base: &str) -> Result<Option<Vec<String>>> {
     let agent = probe_agent();
-    match agent.get(&format!("{base}/{MIRRORS_ASSET}")).set("User-Agent", UA).call() {
+    let url = format!("{base}/{MIRRORS_ASSET}");
+    match transport::fetch(&agent, &url, |req, _same_origin| req.set("User-Agent", UA)) {
         Ok(r) => Ok(Some(parse_list(&read_all(r)?)?)),
-        Err(ureq::Error::Status(404, _)) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("{base}: {}", short(e))),
+        Err(FetchError::Http(ureq::Error::Status(404, _))) => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("{base}: {}", short_fetch(e))),
     }
 }
 
@@ -296,8 +298,29 @@ fn probe_agent() -> ureq::Agent {
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout_read(IO_TIMEOUT)
         .timeout_write(IO_TIMEOUT)
-        .redirects(5)
+        // 0, not a positive count: `transport::fetch` drives every hop itself — see its module doc
+        // for why ureq's own auto-follow is not safe to hand a mirror's redirects to.
+        .redirects(0)
+        // https-only, and re-checked on EVERY hop of a redirect chain, not just the URL we start
+        // with (each hop `transport::fetch` issues is its own fresh request, so this same check
+        // runs again every time). A mirror's `releases.json` names its own asset URLs (see
+        // `probe_mirror` below) — so a hostile or compromised mirror can point a probe at
+        // `http://`, `file://`, or a `\\host\share` UNC path. The last one is the one that matters
+        // most: Windows treats that shape as an implicit SMB target, and touching it is enough to
+        // leak this machine's NTLMv2 hash to whatever server answers, before a single byte of
+        // content is read.
+        .https_only(true)
         .build()
+}
+
+/// `net_reason`-style compaction for the redirect-following path: `short` already strips a
+/// `ureq::Error` down to its kind; this covers the two ways `transport::fetch` can fail without
+/// ever reaching ureq at all.
+fn short_fetch(e: FetchError) -> String {
+    match e {
+        FetchError::Http(inner) => short(inner),
+        other => other.to_string(),
+    }
 }
 
 /// Probe every source at once.
@@ -359,9 +382,10 @@ fn probe_mirror(source: &Source, url: &str) -> Probe {
 
     // 1. the index — proves it is a mirror at all, and yields the assets to time against.
     let started = Instant::now();
-    let resp = match agent.get(&format!("{url}/releases.json")).set("User-Agent", UA).call() {
+    let index_url = format!("{url}/releases.json");
+    let resp = match transport::fetch(&agent, &index_url, |req, _same_origin| req.set("User-Agent", UA)) {
         Ok(r) => r,
-        Err(e) => return Probe::failed(source, format!("releases.json: {}", short(e))),
+        Err(e) => return Probe::failed(source, format!("releases.json: {}", short_fetch(e))),
     };
     // Through `read_all`'s ceiling, NOT `into_json`: ureq bounds `into_string` but not
     // `into_json`, which hands the whole body to serde as a stream — so an endless
@@ -385,16 +409,15 @@ fn probe_mirror(source: &Source, url: &str) -> Probe {
     };
 
     // 2. a real transfer. Ranged so the cost is bounded on the mirror's side too, and so the
-    //    answer doubles as a resume-support check.
-    let resp = match agent
-        .get(&asset.browser_download_url)
-        .set("User-Agent", UA)
-        .set("Range", &format!("bytes=0-{}", PROBE_BYTES - 1))
-        .call()
-    {
+    //    answer doubles as a resume-support check. `asset.browser_download_url` is itself content
+    //    the mirror's `releases.json` named — see `transport`'s module doc for why that URL, and
+    //    every redirect it might send back, goes through the same guarded fetch as the index did.
+    let resp = match transport::fetch(&agent, &asset.browser_download_url, |req, _same_origin| {
+        req.set("User-Agent", UA).set("Range", &format!("bytes=0-{}", PROBE_BYTES - 1))
+    }) {
         Ok(r) => r,
         Err(e) => {
-            p.error = Some(format!("{}: {}", asset.name, short(e)));
+            p.error = Some(format!("{}: {}", asset.name, short_fetch(e)));
             return p;
         }
     };
@@ -569,5 +592,91 @@ mod tests {
         let out = rebuild(&existing, &["https://kept".into()]);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|s| s.url() != Some("https://gone")));
+    }
+
+    /// A URL that fails the https-only check must be refused as an ordinary error, never a panic
+    /// — including the UNC shape (`\\host\share`), which Windows treats as an implicit SMB target
+    /// and would leak this machine's NTLMv2 hash to whatever answers there the moment it is
+    /// touched. Goes through `fetch_list_from_mirror` itself (not just `probe_agent` in
+    /// isolation), since that is the real call site a published mirror's base URL reaches.
+    #[test]
+    fn mirror_fetch_refuses_non_https_urls_cleanly() {
+        for base in [
+            "http://mirror.example",
+            "file:///etc/passwd",
+            "\\\\attacker\\share",
+            "//attacker/share",
+        ] {
+            let result = fetch_list_from_mirror(base);
+            assert!(result.is_err(), "expected {base} to be refused, got {result:?}");
+        }
+    }
+
+    /// A redirect chain longer than `MAX_REDIRECTS` must fail cleanly rather than being followed
+    /// forever — `transport::fetch`'s own hop count, proven over a genuine TCP round trip (there
+    /// is no way to prove this without one; see `test_http`'s doc comment). Built with
+    /// `.redirects(0)`, matching `probe_agent`'s real setting: production never lets ureq's OWN
+    /// auto-follow run at all (see `transport`'s module doc for why), so the cap enforced here is
+    /// `transport::fetch`'s loop, not ureq's.
+    #[test]
+    fn mirror_fetch_refuses_a_redirect_chain_past_the_cap() {
+        use crate::test_http::{Canned, TestServer};
+        let server = TestServer::start(|_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/loop", Canned::redirect("/loop"));
+            routes
+        });
+
+        let agent = ureq::builder()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(IO_TIMEOUT)
+            .timeout_write(IO_TIMEOUT)
+            .redirects(0)
+            .build();
+        let url = format!("http://127.0.0.1:{}/loop", server.port);
+        let err = transport::fetch(&agent, &url, |req, _same_origin| req)
+            .expect_err("an endless redirect must not be followed forever");
+        assert!(matches!(err, FetchError::TooManyRedirects), "expected TooManyRedirects, got {err:?}");
+    }
+
+    /// The scheme check runs on every hop, not just the URL a caller starts with: a mirror can
+    /// answer its INDEX fine and then redirect an asset somewhere else entirely. This is also the
+    /// test that proves the fix for the panic `transport`'s module doc describes — a redirect
+    /// naming a scheme with no host (`file:///nope`) used to crash the process via ureq's own
+    /// auto-follow; routing every hop through `transport::fetch` (a fresh top-level `.call()` each
+    /// time, safely guarded by `Request::parse_url()`) is what turns that into an ordinary `Err`
+    /// (`InvalidUrl` — `parse_url` refuses the empty host before ever reaching the scheme check
+    /// `https_only` relies on; that check is what would fire for a well-formed http(s) URL, and is
+    /// exercised by the initial-URL test above). `https_only` itself needs TLS to exercise, which
+    /// this local plain-HTTP server has none of, but the empty-host check applies unconditionally,
+    /// so a `file://` Location still proves the RE-CHECK happens on the SECOND hop, which the
+    /// initial-URL test (`mirror_fetch_refuses_non_https_urls_cleanly`) cannot show by itself.
+    /// (A `\\host\share` Location does not serve this test — WHATWG URL joining normalizes its
+    /// backslashes into a protocol-relative `//host/share`, i.e. it becomes an ordinary
+    /// same-scheme redirect to a new HOST, not a scheme change; that shape is exactly what
+    /// `https_only` on the initial-URL tests already covers.)
+    #[test]
+    fn mirror_fetch_refuses_a_bad_scheme_introduced_mid_chain() {
+        use crate::test_http::{Canned, TestServer};
+        let server = TestServer::start(|_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/start", Canned::redirect("file:///nope"));
+            routes
+        });
+        let agent = ureq::builder()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(IO_TIMEOUT)
+            .timeout_write(IO_TIMEOUT)
+            .redirects(0)
+            .build();
+        let url = format!("http://127.0.0.1:{}/start", server.port);
+        // The call itself completing (whether Ok or Err) is half the proof: the OLD code path
+        // (ureq's own `.redirects(N)` auto-follow) panicked the whole test process here instead.
+        let err = transport::fetch(&agent, &url, |req, _same_origin| req)
+            .expect_err("a redirect to a non-http(s) scheme must be refused, not followed");
+        match err {
+            FetchError::Http(e) => assert_eq!(e.kind(), ureq::ErrorKind::InvalidUrl),
+            other => panic!("expected Http(InvalidUrl), got {other:?}"),
+        }
     }
 }

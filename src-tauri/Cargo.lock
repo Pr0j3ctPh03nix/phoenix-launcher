@@ -2532,6 +2532,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-window-state",
  "ureq",
+ "url",
  "windows-sys 0.59.0",
  "winreg 0.52.0",
  "zstd",
