@@ -31,6 +31,30 @@ jobs:
       # human-readable version; update both together.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
+      # The release FORMAT and the tooling that seals it live in one repo, shared by all three
+      # payloads (the mod, the launcher, the base game) so that one implementation signs all of
+      # them. It used to be vendored into tools/ here; a copy's only possible states are "identical"
+      # and "silently stale", and keeping it identical needed a drift check in a third repo.
+      #
+      # A SHA, never a branch — and it is load-bearing twice over. What sealed a payload has to be
+      # an exact revision for a release to stay reproducible, and keys/ below is compiled into the
+      # binary, so a moving ref would mean the trust root of a build is whatever HEAD said that day.
+      # Bumping it is a deliberate, reviewable commit here.
+      #
+      # `path:` is not decorative either: src-tauri/build.rs reads the pinned release keys from
+      # `.tooling/keys` by default, so this step is a prerequisite of every cargo invocation below,
+      # not just of the signing step. It must come AFTER the main checkout, which cleans the
+      # workspace it lands in.
+      #
+      # No `token:`, which is only correct while release-tooling is PUBLIC — the job's default
+      # GITHUB_TOKEN is scoped to this repository alone and cannot read a sibling private one.
+      - name: Fetch release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: Pr0j3ctPh03nix/release-tooling
+          ref: a6a71384aec856da8cb96c4149086685b9732417
+          path: .tooling
+
       # The version lives in three files and the git tag, and self-update compares the TAG against
       # the binary's CARGO_PKG_VERSION. Ship a tag ahead of Cargo.toml and every client offers an
       # update whose installed build reports the old version — so it offers it again, forever, with
@@ -128,7 +152,7 @@ jobs:
       # the sidecar, and self-update is the one path that has to keep working for builds older than
       # every change made to it. Clients move onto the signed path as they update through this one.
       # NOT tag-gated, on purpose. A manual run seals but publishes nothing, so the signing secret
-      # and the vendored tooling can be proven WITHOUT cutting a release — otherwise the first time
+      # and the fetched tooling can be proven WITHOUT cutting a release — otherwise the first time
       # either is exercised is the one-way cutover itself.
       - name: Sign the launcher payload
         shell: bash
@@ -145,11 +169,10 @@ jobs:
           # No secret check here: phx_release refuses an unset key by itself, with the reason, and
           # a second copy of that rule is a second place for it to go stale.
           out=src-tauri/target/release
-          # Vendored, not fetched: a release of the READER must not depend on the producer's repo
-          # being reachable, on a private repo, or on a token scoped for something else. tools/ is
-          # mirrored from the dev superset by its sync.py, whose --check fails if these have
-          # drifted from the copies that sign the mod and the game. See tools/README.md.
-          tools=tools
+          # release-tooling, fetched at the pinned SHA above — the same scripts, at the same
+          # revision, that seal the mod and the base game. The public half comes from the same
+          # checkout as the code that verifies against it, so the two can never disagree.
+          tools=.tooling/tools
           # The notes come from the annotated tag, so a manual run has none — the field is optional
           # and its absence is the only difference between a dry run and the real thing.
           notes=()
@@ -166,7 +189,7 @@ jobs:
           # the environment and never written to disk.
           python "$tools/phx_release.py" seal \
             --manifest "$out/manifest.json" \
-            --pub      "$tools/phoenix-release.pub" \
+            --pub      .tooling/keys/phoenix-active.pub \
             --trusted-comment "phoenix launcher $TAG"
 
       # DRAFT first: this action creates the release and then uploads in PARALLEL, so a non-draft

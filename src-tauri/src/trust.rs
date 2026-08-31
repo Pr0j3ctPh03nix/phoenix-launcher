@@ -61,9 +61,10 @@ pub const SIG_SUFFIX: &str = ".minisig";
 /// secret, not a checksum, and carries no authority of its own.
 pub type KeyId = [u8; 8];
 
-/// A key this build is willing to believe. Pinned in the binary: there is no key distribution
-/// problem to solve here, because the launcher that would have to fetch a new key is exactly the
-/// thing the key protects.
+/// A key this build is willing to believe. Compiled into the binary: there is no key distribution
+/// problem to solve here, because a key fetched from the payload's own channel is not a trust root
+/// — it is one more thing whoever serves the payload gets to choose. Only a key that arrived WITH
+/// the binary can say anything the binary did not already have to take on faith.
 pub struct TrustedKey {
     pub id: KeyId,
     /// Raw 32-byte Ed25519 public key.
@@ -78,36 +79,14 @@ pub struct TrustedKey {
 /// unable to accept a release — an unrecoverable state, since the fix would have to ship
 /// through the very channel that broke.
 ///
-/// These are the raw halves of the published `.pub` files, decoded once with the producer's own
-/// parser rather than re-read by hand here. Changing a byte of this table silently makes a build
-/// unable to install anything; there is no runtime signal, because the failure looks exactly like
-/// "no release is available" by design (see `TrustError` below).
-pub const PINNED: &[TrustedKey] = &[
-    // ACTIVE — signs every release. Published as `docs/keys/phoenix-active.pub` in the dev
-    // superset, synced to `dist/tools/phoenix-release.pub`, which release.yml verifies its own
-    // freshly-made signature against before it publishes anything.
-    TrustedKey {
-        id: [0xd7, 0x11, 0x58, 0xee, 0xfd, 0xdd, 0x64, 0x9c],
-        key: [
-            0x9b, 0xd5, 0xa9, 0x03, 0xa9, 0xa3, 0x29, 0xf9, //
-            0xd2, 0x4c, 0x0c, 0x31, 0xfd, 0x20, 0x00, 0x8c, //
-            0x3b, 0x40, 0xd4, 0x3f, 0x34, 0xe1, 0x35, 0xd4, //
-            0x71, 0x8a, 0xda, 0x9f, 0x07, 0x6d, 0xa6, 0xb7,
-        ],
-    },
-    // RECOVERY — the cold spare, kept offline; signs nothing until it has to. Deliberately absent
-    // from CI, so a release it signs is built and published BY HAND — the launcher accepts it
-    // because of this entry, which is the entire reason the entry exists years before it is used.
-    TrustedKey {
-        id: [0x27, 0x5e, 0x5c, 0x3a, 0x13, 0x7b, 0xe3, 0x5a],
-        key: [
-            0x97, 0xa2, 0x0a, 0x20, 0xc8, 0xe1, 0x5e, 0x27, //
-            0x1a, 0x5a, 0xe4, 0x4a, 0xce, 0x2b, 0x0b, 0x72, //
-            0x7d, 0x4a, 0xe8, 0x42, 0xd1, 0x39, 0x33, 0x9b, //
-            0x84, 0xf0, 0xfc, 0xd3, 0x44, 0x93, 0xef, 0xc1,
-        ],
-    },
-];
+/// **Generated, not transcribed.** `build.rs` decodes the published `.pub` files of
+/// `Pr0j3ctPh03nix/release-tooling` — pinned by commit SHA in both workflows and checked out to
+/// `.tooling/` — and emits this table; a build that cannot read them is refused outright, because
+/// an empty trust root is a launcher that can never install anything. The hand-written literal
+/// that used to sit here could only agree with those files or be silently wrong, and being wrong
+/// has no runtime signal whatsoever: the failure looks exactly like "no release is available" by
+/// design (see `TrustError` below).
+pub const PINNED: &[TrustedKey] = &include!(concat!(env!("OUT_DIR"), "/pinned_keys.rs"));
 
 /// Why a document is not believable. Typed (like `NetKind` and `UnsupportedSchema`) so the command
 /// layer can classify without matching on message text — see `views::wire_kind`, which maps every
@@ -606,6 +585,23 @@ mod tests {
             accept(Payload::Mod, &m, 0),
             Err(TrustError::StaleSerial { payload: "mod", found: None, floor: 0 })
         );
+    }
+
+    /// The generated table is the two published release keys, and nothing else.
+    ///
+    /// `PINNED` is emitted by `build.rs` from whatever `.pub` files it was pointed at, so the thing
+    /// worth asserting is no longer "these bytes were typed correctly" — it is that the generation
+    /// ran against the RIGHT keys and sliced them correctly. A build against a stale checkout, an
+    /// unrelated `keys/` directory, or a parser off by a byte lands here instead of in the field,
+    /// where the only symptom would be every release quietly becoming uninstallable.
+    #[test]
+    fn the_pinned_table_is_exactly_the_two_published_release_keys() {
+        let ids: Vec<String> = PINNED.iter().map(|k| hex::encode(k.id)).collect();
+        assert_eq!(PINNED.len(), 2, "expected ACTIVE + RECOVERY, got {ids:?}");
+        // order is not part of the contract (a signature names its own key), membership is
+        for want in ["d71158eefddd649c", "275e5c3a137be35a"] {
+            assert!(ids.iter().any(|id| id == want), "{want} is not in the pinned table: {ids:?}");
+        }
     }
 
     /// Naming a pinned key must not be enough to be believed — only signing as one is.

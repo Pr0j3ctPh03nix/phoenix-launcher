@@ -11,8 +11,13 @@
 # Headless frontend screenshots + their working copy (see dev/shoot.sh)
 /dev/preview/.out/
 
-# Bytecode from the vendored release tooling in tools/ — written whenever CI, or a local dry run,
-# imports one of those scripts.
+# Pr0j3ctPh03nix/release-tooling, fetched at a pinned SHA by both workflows (and by hand for a
+# local build — src-tauri/build.rs reads the release keys from .tooling/keys). It has its own repo;
+# a copy committed here would be exactly the drifting vendored copy this replaced.
+/.tooling/
+
+# Bytecode from running that tooling — written whenever CI, or a local dry run, imports one of
+# those scripts from inside this tree.
 __pycache__/
 *.pyc
 

@@ -40,6 +40,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Not optional here either: src-tauri/build.rs generates trust::PINNED from `.tooling/keys`
+      # and REFUSES to build without it, so both cargo steps below depend on this. Pinned to the
+      # same SHA release.yml uses — the rationale for fetching rather than vendoring, and for a SHA
+      # rather than a branch, is written out there.
+      - name: Fetch release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: Pr0j3ctPh03nix/release-tooling
+          ref: a6a71384aec856da8cb96c4149086685b9732417
+          path: .tooling
+
       - uses: oven-sh/setup-bun@v2
 
       - uses: dtolnay/rust-toolchain@stable
