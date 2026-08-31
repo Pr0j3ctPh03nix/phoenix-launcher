@@ -52,7 +52,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/release-tooling
-          ref: a542f1fb5244c9e0e4c338120b014a18390a7e7f
+          ref: fa40a0b45cc1b6260760494e1ae94dee705f5c36
           path: .tooling
 
       # The version lives in three files and the git tag, and self-update compares the TAG against
