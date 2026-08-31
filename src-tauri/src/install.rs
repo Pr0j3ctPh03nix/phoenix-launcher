@@ -4569,6 +4569,34 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The decompression-bomb shape, sized up: a compressed frame that would inflate to tens of
+    /// megabytes behind a member the manifest says is 4 bytes long. Those 4 bytes check out —
+    /// what follows never does, and `extract_members` never asks the decoder for it (see its doc
+    /// comment: it only ever requests `sum(declared sizes) + 1` probe byte). An extreme ratio
+    /// here, rather than a few bytes of trailing garbage, is what makes that property read as
+    /// "however much a bomb offers, we never ask for it" instead of "one byte over".
+    #[test]
+    fn a_bundle_whose_real_content_dwarfs_its_declared_size_is_refused_not_exhausted() {
+        let dir = tempdir("bundle-bomb");
+        let a = b"AAAA" as &[u8]; // the declared member — matches exactly, so ITS check passes
+        let bomb: Vec<u8> = a.iter().copied().chain(std::iter::repeat(0u8).take(50_000_000)).collect();
+        let (packed, psha, _) = pack(&[&bomb]); // the real stream: 4 honest bytes, then ~50 MB more
+        assert!(packed.len() < 200_000, "the packed frame must stay tiny for this to be a bomb");
+        let m = serde_json::json!({
+            "schema": 3, "version": "1.0.0",
+            "bundles": [{ "name": "b0.phxb", "codec": "zstd",
+                          "psize": packed.len(), "psha256": psha, "size": a.len() as u64,
+                          "members": [sha(a)] }],
+            "files": [ bundled_json("game/dota/a.txt", a) ],
+        })
+        .to_string();
+        let dl = Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]);
+        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        assert!(format!("{e:#}").contains("past its declared members"), "got: {e:#}");
+        assert!(!dir.join("game/dota/a.txt").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An interrupted PACKED download resumes from its `.part` (R6: progress lives per asset).
     #[test]
     fn an_interrupted_bundle_download_resumes_instead_of_restarting() {

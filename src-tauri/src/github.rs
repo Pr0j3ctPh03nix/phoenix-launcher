@@ -286,3 +286,58 @@ impl Downloader for Github {
         Ok((written, hex::encode(hasher.finalize())))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::time::Duration;
+
+    /// `download_limited` has to cut a transfer off itself, against the REAL transport — not by
+    /// trusting `Content-Length` (a peer's own claim) and not by ever needing to see the end of
+    /// the body. Proven with a raw HTTP/1.1 server that streams several times the cap with NO
+    /// `Content-Length` at all — the shape an endless, hostile response takes — so the read has to
+    /// stop within `max + 1` bytes on its own regardless of how much more the peer has queued.
+    #[test]
+    fn download_limited_stops_reading_a_host_that_sends_past_the_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener");
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else { return };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            // drain the request up to the blank line — its contents don't matter here
+            let mut buf = [0u8; 4096];
+            let mut req = Vec::new();
+            while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                match Read::read(&mut stream, &mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => req.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n");
+            let chunk = vec![b'A'; 64 * 1024];
+            // several times the test's cap below; a client that reads only `max + 1` bytes and
+            // stops must not need any of this to finish sending
+            for _ in 0..64 {
+                if stream.write_all(&chunk).is_err() {
+                    return; // the client stopped reading and closed its end — the success case
+                }
+            }
+        });
+
+        let gh = Github::new(None);
+        let asset = Asset {
+            name: "endless".into(),
+            url: String::new(),
+            browser_download_url: format!("http://{addr}/endless"),
+            size: 0,
+        };
+        let cap = 256 * 1024; // well under the ~4 MiB the server offers
+        let err = gh.download_limited(&asset, cap).expect_err("an endless body must be refused");
+        assert!(
+            err.to_string().contains("larger than"),
+            "expected the size-cap refusal, got: {err}"
+        );
+    }
+}
