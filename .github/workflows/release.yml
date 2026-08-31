@@ -151,30 +151,24 @@ jobs:
           PHOENIX_SERIAL: ${{ 2000000 + github.run_number }}
         run: |
           set -e
-          test -n "$PHOENIX_SIGNING_KEY" || {
-            echo "secrets.PHOENIX_SIGNING_KEY is not set — refusing to publish an unsigned launcher"
-            exit 1
-          }
+          # No secret check here: phx_release refuses an unset key by itself, with the reason, and
+          # a second copy of that rule is a second place for it to go stale.
           out=src-tauri/target/release
-          python .phoenix-tools/tools/gen_launcher_manifest.py \
+          tools=.phoenix-tools/tools
+          python "$tools/gen_launcher_manifest.py" \
             --version  "$TAG" \
             --serial   "$PHOENIX_SERIAL" \
             --exe      phoenix-launcher.exe \
             --exe-path "$out/phoenix-launcher.exe" \
             --notes-file release_body.md \
             --out      "$out/manifest.json"
-          # Outside the workspace and removed by a trap: a failure between writing and deleting it
-          # must not leave the release key in a directory later steps read.
-          keyfile="$(mktemp)"
-          trap 'rm -f "$keyfile"' EXIT
-          printf '%s' "$PHOENIX_SIGNING_KEY" > "$keyfile"
-          python .phoenix-tools/tools/phoenix_minisign.py sign --sec "$keyfile" \
-            --trusted-comment "phoenix launcher $TAG" "$out/manifest.json"
-          # Prove it verifies under the published public half before anyone depends on it, and that
-          # the document itself is one a reader accepts.
-          python .phoenix-tools/tools/phoenix_minisign.py verify \
-            --pub .phoenix-tools/tools/phoenix-release.pub "$out/manifest.json"
-          python .phoenix-tools/tools/validate_manifest.py "$out/manifest.json"
+          # The same seal every other payload goes through — validate, sign, prove — rather than a
+          # second hand-written copy of those three steps in a second repo. The key is read from
+          # the environment and never written to disk.
+          python "$tools/phx_release.py" seal \
+            --manifest "$out/manifest.json" \
+            --pub      "$tools/phoenix-release.pub" \
+            --trusted-comment "phoenix launcher $TAG"
 
       # DRAFT first: this action creates the release and then uploads in PARALLEL, so a non-draft
       # release is reachable by clients while its assets are still going up — and a client that sees
