@@ -62,13 +62,10 @@ pub fn set_selected_source(selected: Option<SourceRef>) -> Result<(), CmdError> 
 pub async fn sweep_mirrors() -> Result<MirrorSweepView, CmdError> {
     tauri::async_runtime::spawn_blocking(move || {
         let sweep = mirror::sweep(&Settings::load(), true);
-        let sources = sweep.sources.clone();
-        Settings::update(move |s| {
-            s.sources = sources;
-            // Asking to be re-tested is asking for the answer the test gives.
-            s.selected = None;
-        })
-        .map_err(CmdError::from)?;
+        // `persist` writes the measured order AND the accepted list's serial together — see
+        // `mirror::Refresh::persist`. `true`: asking to be re-tested is asking for the answer the
+        // test gives, so the pin goes.
+        sweep.persist(true).map_err(CmdError::from)?;
         Ok(MirrorSweepView::build(sweep, None))
     })
     .await
@@ -98,7 +95,7 @@ pub fn set_auto_pick_best(on: bool) -> Result<(), CmdError> {
 pub async fn auto_sweep_mirrors() -> Result<(), CmdError> {
     tauri::async_runtime::spawn_blocking(move || {
         let settings = Settings::load();
-        let (sources, _) = mirror::refresh(&settings);
+        let refreshed = mirror::refresh(&settings);
 
         // MEASURING is gated on a mirror actually being usable as a download source, which today
         // it is not: `MIRROR_DOWNLOADS_ENABLED` is the deployment switch (read its doc), and while
@@ -106,24 +103,22 @@ pub async fn auto_sweep_mirrors() -> Result<(), CmdError> {
         // flips, a boot-time sweep spends a 512 KiB transfer and up to ~8s PER SOURCE, on every
         // launch, to order a list nothing reads. Refreshing the list is still worth doing — it is
         // one request and it is what surfaces a newly published mirror in the settings pane.
+        //
+        // This early return is therefore the branch that runs on EVERY launch today, which makes it
+        // the one place the mirror serial ratchet actually advances in the field. `persist` is what
+        // carries it; a bare `s.sources = …` here would leave the anti-rollback floor at zero
+        // forever, and nothing would ever look wrong.
         if !mirror::MIRROR_DOWNLOADS_ENABLED
             || !settings.auto_pick_best
-            || !mirror::has_new_mirror(&sources)
+            || !mirror::has_new_mirror(&refreshed.sources)
         {
-            return Settings::update(move |s| s.sources = sources).map_err(CmdError::from);
+            return refreshed.persist(false).map_err(CmdError::from);
         }
 
-        let payload = settings.payload_of(&settings.source_repo);
-        let (sources, probes) =
-            mirror::measure(sources, &settings.source_repo, payload, settings.token());
+        let (refreshed, probes) = refreshed.measured(&settings);
+        // Follow the ranking, whose head is now the fastest that works — unless NOTHING was usable.
         let pick_best = mirror::any_healthy(&probes);
-        Settings::update(move |s| {
-            s.sources = sources;
-            if pick_best {
-                s.selected = None; // follow the ranking, whose head is now the fastest that works
-            }
-        })
-        .map_err(CmdError::from)
+        refreshed.persist(pick_best).map_err(CmdError::from)
     })
     .await
     .map_err(CmdError::task)?

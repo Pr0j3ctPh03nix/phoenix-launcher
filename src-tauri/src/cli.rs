@@ -100,8 +100,9 @@ pub fn run_sweep(flags: &[String]) -> Result<()> {
     }
 
     if flags.iter().any(|f| f == "--save") {
-        let sources = sweep.sources.clone();
-        Settings::update(move |s| s.sources = sources)?;
+        // `false`: the headless sweep does not touch the user's pin — only the settings pane's own
+        // test button does, and only because pressing it asks for the ranking's answer.
+        sweep.persist(false)?;
         println!("\nsaved {} source(s) to settings", sweep.sources.len());
     }
     Ok(())

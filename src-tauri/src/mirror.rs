@@ -3,8 +3,10 @@
 //! A mirror is a base URL serving a payload by CONTENT: `<url>/<payload>/manifest.json`, and the
 //! blobs that document names under `<url>/<payload>/blobs/<sha256>` (the layout, and why there is
 //! no tag directory in it, is `Mirror`'s doc; `doc_url`/`blob_url` build it for both the probe and
-//! the download backend). Mirrors are never authored by the user: they are published in a
-//! `mirrors.json` and refreshed by `sweep`.
+//! the download backend). Mirrors are never authored by the user: they are published in a SIGNED
+//! `mirrors.json` and refreshed by `sweep`. Believing that document is `signed`'s job, below — and
+//! it is the only door to it, because a list that is merely parsed rewrites this machine's download
+//! sources permanently.
 //!
 //! The measurement is deliberately more than a reachability check, because the failure this exists
 //! to catch is not an unreachable host. It is a network path that completes a handshake, serves a
@@ -29,10 +31,12 @@ const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 /// The published mirror list, as a release asset and at every mirror's root.
 pub const MIRRORS_ASSET: &str = "mirrors.json";
 
-/// Ceiling on a mirror's `mirrors.json`. It is a JSON array of base URLs, so a megabyte is already
-/// thousands of them — and it is a list of hosts the installer will later take bytes from, which
-/// makes its size a trust input like any other. The payload MANIFEST the probe reads is bounded
-/// separately and far higher (`trust::MAX_DOC_BYTES`); see `probe_mirror`.
+/// Ceiling on a mirror's `mirrors.json`. An entry is a couple of hundred bytes, so a megabyte is
+/// already thousands of them — and it is a list of hosts the installer will later take bytes from,
+/// which makes its size a trust input like any other. It also has to be buffered whole before its
+/// signature can be checked, so this bounds a read that happens BEFORE anything is believed. The
+/// payload MANIFEST the probe reads is bounded separately and far higher
+/// (`trust::MAX_DOC_BYTES`); see `probe_mirror`.
 const MIRRORS_MAX_BYTES: u64 = 1 << 20;
 
 /// Whether a mirror can serve an INSTALL yet. The `Downloader` implementation now exists (see
@@ -131,6 +135,75 @@ pub struct Sweep {
     /// Why the published list could not be read, if it could not. Never fatal — the sweep runs on
     /// whatever list we already had.
     pub refresh_error: Option<String>,
+    /// The serial of the list this sweep accepted, if it accepted one. Private, and written only
+    /// by `persist`, for the reason spelled out on `Refresh::persist`.
+    serial: Option<u64>,
+}
+
+impl Sweep {
+    /// Persist a measured sweep. The measured ORDER and the accepted SERIAL in one settings write —
+    /// see `Refresh::persist`, of which this is the measured half.
+    ///
+    /// `clear_pin` drops the user's pinned source, which is the caller's policy and not this
+    /// module's: the test button clears it (asking to be re-tested is asking for the answer the
+    /// test gives) and the headless `--save` does not.
+    pub fn persist(&self, clear_pin: bool) -> Result<()> {
+        store(self.sources.clone(), self.serial, clear_pin)
+    }
+}
+
+/// What a list refresh concluded: the sources as they should now stand, and — only when a list was
+/// actually accepted — the serial to ratchet with.
+pub struct Refresh {
+    pub sources: Vec<Source>,
+    /// Why the published list could not be read, if it could not. Never fatal.
+    pub error: Option<String>,
+    /// Private on purpose: it may only leave here through `persist`, together with the sources it
+    /// came from.
+    serial: Option<u64>,
+}
+
+impl Refresh {
+    /// Time every source and reorder them fastest-first, keeping the accepted serial.
+    ///
+    /// The serial is a property of the DOCUMENT, so it survives any reordering of the hosts that
+    /// document named — which is exactly why measuring must not be a path that quietly loses it.
+    pub fn measured(self, settings: &Settings) -> (Self, Vec<Probe>) {
+        let payload = settings.payload_of(&settings.source_repo);
+        let (sources, probes) =
+            measure(self.sources, &settings.source_repo, payload, settings.token());
+        (Self { sources, error: self.error, serial: self.serial }, probes)
+    }
+
+    /// Persist a refresh: the sources it concluded AND the serial of the list they came from, in
+    /// one settings write.
+    ///
+    /// Never one without the other, and that is why the field is private and this is a method. The
+    /// ratchet is what makes checking a signature worth anything at all — a mirror can always serve
+    /// an older list it once held a valid signature for, and the signature on it is still perfectly
+    /// good — and it advances only when a list is actually APPLIED, which is here. A call site that
+    /// stored the sources alone would leave the floor at zero forever: the rollback check would go
+    /// on running against a floor nothing ever raised, and the only symptom of that is a rollback
+    /// nobody notices.
+    pub fn persist(&self, clear_pin: bool) -> Result<()> {
+        store(self.sources.clone(), self.serial, clear_pin)
+    }
+}
+
+/// The one settings write both of the above make.
+fn store(sources: Vec<Source>, serial: Option<u64>, clear_pin: bool) -> Result<()> {
+    Settings::update(move |s| {
+        s.sources = sources;
+        // Only when a list was ACCEPTED — `Ok(None)` and every refusal leave the floor alone, since
+        // neither produced a document to be current with. `advance_serial` is monotonic, so this
+        // can never walk the floor back either.
+        if let Some(n) = serial {
+            s.advance_serial(Payload::Mirrors, n);
+        }
+        if clear_pin {
+            s.selected = None;
+        }
+    })
 }
 
 /// Is there a published mirror nobody has ever timed? The ONLY thing that triggers an automatic
@@ -143,19 +216,39 @@ pub fn has_new_mirror(sources: &[Source]) -> bool {
     sources.iter().any(|s| matches!(s, Source::Mirror { measured: false, .. }))
 }
 
-/// Refresh the published mirror list. Cheap — one small document — so this runs on every launch.
+/// Refresh the published mirror list. Cheap — one small document and its signature — so this runs
+/// on every launch.
+pub fn refresh(settings: &Settings) -> Refresh {
+    apply(&settings.sources, fetch_published_mirrors(settings))
+}
+
+/// What an answer DOES to the list. Three outcomes, none of them interchangeable, and the
+/// differences between them are the whole safety property of this file:
 ///
-/// Returns the list as it should now be, plus why it could not be updated, if it could not.
-pub fn refresh(settings: &Settings) -> (Vec<Source>, Option<String>) {
-    match fetch_published_mirrors(settings) {
-        // A published list REPLACES the mirrors — including an empty one, which is the publisher
-        // saying there are none. Flags survive by URL; the primary is not in the document and so
-        // is untouched by construction.
-        Ok(Some(urls)) => (rebuild(&settings.sources, &urls), None),
-        // No document published at all is not an error and not an empty list: it is silence. The
-        // existing mirrors stay, because "could not ask" must never read as "there are none".
-        Ok(None) => (settings.sources.clone(), None),
-        Err(e) => (settings.sources.clone(), Some(format!("{e:#}"))),
+/// * a VERIFIED list REPLACES the mirrors — including an empty one, which is the publisher saying
+///   there are none. Flags survive by URL (`rebuild`); the primary is not in the document and so is
+///   untouched by construction.
+/// * `Ok(None)` — nothing published a list at all — is silence, not an empty list. The existing
+///   mirrors stay, because "could not ask" must never read as "there are none".
+/// * an ERROR is that same silence, and an error is what a document that FAILED TO VERIFY produces.
+///   Refused and empty must not collapse into one outcome: if they did, a tampered or truncated
+///   answer would wipe every mirror a user has, which is precisely the harm the signature is here
+///   to prevent — and it would do it quietly, since a wiped list looks exactly like a publisher who
+///   retired their mirrors.
+///
+/// Split out from `refresh` so all three can be exercised without a network; `refresh` is one line
+/// over it.
+fn apply(existing: &[Source], answer: Result<Option<signed::SignedList>>) -> Refresh {
+    match answer {
+        Ok(Some(list)) => Refresh {
+            sources: rebuild(existing, list.urls()),
+            error: None,
+            serial: Some(list.serial()),
+        },
+        Ok(None) => Refresh { sources: existing.to_vec(), error: None, serial: None },
+        Err(e) => {
+            Refresh { sources: existing.to_vec(), error: Some(format!("{e:#}")), serial: None }
+        }
     }
 }
 
@@ -188,15 +281,25 @@ pub fn measure(
 /// Refresh, then measure — the test button's whole job.
 ///
 /// Pure: it reads settings and returns what they should become, so the caller decides whether to
-/// persist (the GUI does; the CLI only on `--save`).
+/// persist (the GUI does; the CLI only on `--save`) — through `Sweep::persist`, which is the only
+/// thing that may write one.
 pub fn sweep(settings: &Settings, do_measure: bool) -> Sweep {
-    let (sources, refresh_error) = refresh(settings);
+    let refreshed = refresh(settings);
     if !do_measure {
-        return Sweep { sources, probes: Vec::new(), refresh_error };
+        return Sweep {
+            sources: refreshed.sources,
+            probes: Vec::new(),
+            refresh_error: refreshed.error,
+            serial: refreshed.serial,
+        };
     }
-    let payload = settings.payload_of(&settings.source_repo);
-    let (sources, probes) = measure(sources, &settings.source_repo, payload, settings.token());
-    Sweep { sources, probes, refresh_error }
+    let (refreshed, probes) = refreshed.measured(settings);
+    Sweep {
+        sources: refreshed.sources,
+        probes,
+        refresh_error: refreshed.error,
+        serial: refreshed.serial,
+    }
 }
 
 /// Did the measurement find anything usable at all?
@@ -241,51 +344,77 @@ fn rebuild(existing: &[Source], urls: &[String]) -> Vec<Source> {
     out
 }
 
-/// The published mirror list: a JSON array of base URLs.
+/// The name of the detached signature published beside the list, at both sources.
+fn mirrors_sig() -> String {
+    format!("{MIRRORS_ASSET}{}", crate::trust::SIG_SUFFIX)
+}
+
+/// A `.minisig`'s bytes as the text `trust::verify` reads.
+fn sig_text(bytes: Vec<u8>) -> Result<String> {
+    String::from_utf8(bytes)
+        .map_err(|_| anyhow::Error::new(crate::trust::TrustError::Malformed("not UTF-8")))
+}
+
+/// The published mirror list, VERIFIED — from the registry repo's release, or from a mirror.
 ///
-/// `Ok(None)` means no list is published — a different thing from `Ok(Some(vec![]))`, which is a
-/// publisher stating there are no mirrors.
+/// `Ok(None)` means no list is published, which is a different thing from a verified document whose
+/// `mirrors` array is empty: that one is a publisher stating there are none, and it replaces the
+/// set. `Err` is "no answer", and it covers BOTH a source that could not be reached and a document
+/// that failed to verify — see `apply` for why those two must land in the same place.
 ///
-/// THE PRIMARY IS AUTHORITATIVE WHENEVER IT ANSWERS. Mirrors are consulted only when it could not
-/// be REACHED, which is the case the fallback was written for. It used to fall through whenever
-/// the primary merely published no list — the ordinary state today — and since `refresh` replaces
-/// the source set wholesale with whatever comes back, any one enabled mirror could evict every
-/// sibling and install its own hosts, permanently, with the primary perfectly healthy. This
-/// document is unverified (there is no `mirrors` payload reader yet), so until there is one, who
-/// is allowed to author it is the only control available.
+/// THE REGISTRY IS AUTHORITATIVE WHENEVER IT ANSWERS; mirrors are consulted only when it could not
+/// be reached at all. The signature and the serial ratchet are what make a mirror's copy safe to
+/// obey — before them, any one enabled mirror could evict every sibling and install its own hosts,
+/// permanently, with the registry perfectly healthy, so "who is allowed to author it" was the only
+/// control there was. What the ordering still buys, now that it is not the control, is FRESHNESS
+/// and a useful error: the registry publishes first, so a mirror's copy can only ever be as new,
+/// and a mirror's failure is not the one worth showing a user when the source of truth is down.
 ///
 /// The document describes MIRRORS ONLY. There is no element in it that could name, reorder or
 /// remove the primary source.
-fn fetch_published_mirrors(settings: &Settings) -> Result<Option<Vec<String>>> {
-    // primary: the release asset
-    let gh = Github::new(settings.token());
-    let last_err = match gh.fetch_release(&settings.source_repo, None) {
-        Ok(release) => {
-            return match release.asset(MIRRORS_ASSET) {
-                // Bounded like every other trust-adjacent fetch (see engine::manifest_of): this is
-                // a list of hosts the installer will later take bytes from, so its size is a trust
-                // input.
-                Some(a) => gh
-                    .download_limited(a, crate::trust::MAX_DOC_BYTES)
-                    .and_then(|b| parse_list(&b))
-                    .map(Some),
-                // Reached, and publishes no list. That is an ANSWER, not a gap.
-                None => Ok(None),
-            };
+fn fetch_published_mirrors(settings: &Settings) -> Result<Option<signed::SignedList>> {
+    let floor = settings.serial_floor(Payload::Mirrors);
+    // `cmd::open_repo`, not a bare `Github`: this repo is PUBLIC, so the fetch takes the same
+    // anonymous-first / token-on-refusal rule every other public repo takes rather than leading
+    // with a credential scoped to the dist repo (see `Settings::mirrors_repo`). The source WALK
+    // `open_repo` also performs degenerates to the primary alone here, because `payload_of` does
+    // not know this repo and must not — a mirror's copy is reached below instead, at the root path
+    // a mirror actually serves it from.
+    let last_err = match crate::cmd::open_repo(settings.mirrors_repo(), settings) {
+        Ok((dl, release)) => {
+            // Reached, and publishes no list. That is an ANSWER, not a gap — and it is the only
+            // "absent" this function recognises, which is why a missing SIGNATURE below is an error
+            // instead: "unsigned" must never be spelled the same way as "not published".
+            let Some(doc_asset) = release.asset(MIRRORS_ASSET) else { return Ok(None) };
+            let sig_name = mirrors_sig();
+            let sig_asset = release.asset(&sig_name).ok_or_else(|| {
+                anyhow::Error::new(crate::trust::TrustError::Unsigned(MIRRORS_ASSET.to_string()))
+            })?;
+            // Bounded like every other trust-adjacent fetch (see engine::manifest_of): the document
+            // is buffered whole in order to be verified, so its size is a trust input, and the read
+            // happens before a single check has run.
+            let doc = dl.download_limited(doc_asset, crate::trust::MAX_DOC_BYTES)?;
+            let sig = sig_text(dl.download_limited(sig_asset, crate::trust::MAX_SIG_BYTES)?)?;
+            // Everything past `open_repo` succeeding is the registry ANSWERING, so its verdict —
+            // including a refusal — is returned rather than falling through to the mirrors below.
+            return signed::verify(&doc, &sig, floor).map(Some);
         }
         Err(e) => e,
     };
 
+    // One agent for the whole fallback: `probe_agent`'s pool is what keeps N mirrors from paying N
+    // fresh handshakes for two small documents each.
+    let agent = probe_agent();
     let mut published = false;
     for url in settings.sources.iter().filter(|s| s.enabled()).filter_map(|s| s.url()) {
-        match fetch_list_from_mirror(url) {
-            Ok(Some(urls)) => return Ok(Some(urls)),
+        match fetch_list_from_mirror(&agent, url, floor) {
+            Ok(Some(list)) => return Ok(Some(list)),
             Ok(None) => published = true,
             Err(_) => {}
         }
     }
 
-    // The primary was unreachable and no mirror had a list either: report the primary's failure,
+    // The registry was unreachable and no mirror had a list either: report the registry's failure,
     // which is the one worth showing, unless a mirror positively answered "there is none".
     if published {
         Ok(None)
@@ -294,14 +423,44 @@ fn fetch_published_mirrors(settings: &Settings) -> Result<Option<Vec<String>>> {
     }
 }
 
-fn fetch_list_from_mirror(base: &str) -> Result<Option<Vec<String>>> {
-    let agent = probe_agent();
-    let url = format!("{base}/{MIRRORS_ASSET}");
-    match transport::fetch(&agent, &url, |req, _same_origin| req.set("User-Agent", UA)) {
-        Ok(r) => Ok(Some(parse_list(&read_all(r, MIRRORS_MAX_BYTES)?)?)),
-        Err(FetchError::Http(ureq::Error::Status(404, _))) => Ok(None),
-        Err(e) => Err(anyhow::anyhow!("{base}: {}", short_fetch(e))),
-    }
+/// One mirror's copy of the list: `<base>/mirrors.json`, with `<base>/mirrors.json.minisig` beside
+/// it.
+///
+/// THE LEAST TRUSTED SOURCE IN THE SYSTEM, and by some distance: this is a host we were told about
+/// by a document, serving the document that decides which hosts we are told about next. Nothing
+/// here can reach the parsed form without `signed::verify` — see that module's doc for why the
+/// verified type cannot be built any other way.
+///
+/// A missing DOCUMENT is `Ok(None)`: this host does not carry the list, which is a true answer and
+/// the one thing the caller may read as "no list published". A missing SIGNATURE is an error, for
+/// exactly that reason — a mirror that could turn "I refuse to sign this" into "there is no list"
+/// would still be choosing what the caller does, and here the caller does nothing at all.
+///
+/// The `agent` is a parameter for the same reason `probe_mirror`'s is: `probe_agent()` is
+/// https-only and a loopback listener cannot speak TLS, so the end-to-end tests below could not
+/// otherwise reach this. Production has exactly one caller and it passes `probe_agent()`.
+fn fetch_list_from_mirror(
+    agent: &ureq::Agent,
+    base: &str,
+    floor: u64,
+) -> Result<Option<signed::SignedList>> {
+    // `Ok(None)` here is a 404 and nothing else: every other failure is an error, so a host that
+    // answers oddly is never mistaken for one that answers "no".
+    let get = |name: &str, max: u64| -> Result<Option<Vec<u8>>> {
+        let url = root_url(base, name);
+        match transport::fetch(agent, &url, |req, _same_origin| req.set("User-Agent", UA)) {
+            Ok(r) => Ok(Some(read_all(r, max)?)),
+            Err(FetchError::Http(ureq::Error::Status(404, _))) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("{base}: {}", short_fetch(e))),
+        }
+    };
+    let Some(doc) = get(MIRRORS_ASSET, MIRRORS_MAX_BYTES)? else { return Ok(None) };
+    let sig = get(&mirrors_sig(), crate::trust::MAX_SIG_BYTES)?.ok_or_else(|| {
+        anyhow::Error::new(crate::trust::TrustError::Unsigned(MIRRORS_ASSET.to_string()))
+    })?;
+    signed::verify(&doc, &sig_text(sig)?, floor)
+        .map(Some)
+        .with_context(|| base.to_string())
 }
 
 /// Read a small document whole, under a ceiling the CALLER states — the two this module reads from
@@ -322,8 +481,152 @@ fn read_all(resp: ureq::Response, max: u64) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn parse_list(bytes: &[u8]) -> Result<Vec<String>> {
-    serde_json::from_slice::<Vec<String>>(bytes).context("mirrors.json is not a list of URLs")
+/// The published mirror list, and the ONLY door to it.
+///
+/// Everything that turns bytes into mirrors lives in here, and the only things it lets out are
+/// `verify` and the type that function returns. The serde types are private, so no caller — not
+/// another module, not the rest of this file — can deserialize the document without a signature in
+/// hand, and `SignedList`'s own fields are private, so it cannot be assembled by hand either.
+///
+/// That is a deliberate use of the module system rather than a convention, because the thing it
+/// prevents is not a bug in code that exists. `refresh` REPLACES the mirror set wholesale and the
+/// result is persisted, so a document that reaches the parsed form unverified is not a bad answer
+/// to one download — it is a permanent rewrite of where this machine fetches every future release
+/// from. A free `parse_list(&[u8]) -> Vec<String>` used to sit here, called from both fetch paths;
+/// making the verified form unconstructable is what stops a third path from being written that
+/// forgets, and stops it at compile time rather than in review.
+mod signed {
+    use anyhow::{Context, Result};
+    use serde::Deserialize;
+
+    use crate::config::normalize_mirror_url;
+    use crate::trust::{self, Payload};
+
+    /// The document version this build reads. Its OWN number, unrelated to a manifest's `schema`:
+    /// the two formats share a signing scheme and nothing else.
+    ///
+    /// An unknown one is REFUSED rather than read optimistically, and the trade that makes is the
+    /// safe one: a refusal is silence, and silence leaves the mirrors this machine already has
+    /// alone (`apply`), whereas guessing at a format we have never seen means acting on a document
+    /// we cannot claim to have understood — in the one place where acting means handing a stranger
+    /// every future download.
+    const FORMAT: u64 = 1;
+
+    /// The wire document, exactly as `phoenix-mirror-registry`'s `generate_mirror_list.py` renders
+    /// it. Private, and it stays private: `Deserialize` is the bypass this module exists to remove.
+    ///
+    /// `signed_at` is deliberately NOT declared. It is advisory — nothing may fail on it and it may
+    /// be absent entirely — and a field a reader parses but never acts on is one that invites the
+    /// next reader to believe freshness is checked here. It is covered by the signature either way;
+    /// `serial` is what orders these documents, and it is the only thing that does.
+    #[derive(Deserialize)]
+    struct Document {
+        format: u64,
+        /// Optional so an absent one fails as `TrustError::WrongPayload { found: None }` rather
+        /// than as a syntax error: a signed document of ours always names its payload, so
+        /// "somebody signed a document that does not say what it is" deserves the trust layer's
+        /// answer and not serde's.
+        #[serde(default)]
+        payload_id: Option<String>,
+        /// Optional for the same reason — absent is `StaleSerial { found: None }`, a document that
+        /// cannot be shown to be current.
+        #[serde(default)]
+        serial: Option<u64>,
+        mirrors: Vec<Entry>,
+    }
+
+    /// One registration. Unknown keys are IGNORED (serde's default), which is what lets the
+    /// registry add a field without freezing the list of every launcher already installed.
+    #[derive(Deserialize)]
+    struct Entry {
+        base_url: String,
+        name: String,
+        country: String,
+        payloads: Vec<String>,
+    }
+
+    /// A mirror list that has been verified, identified and found current. `verify` is its sole
+    /// constructor: the fields below are private, so nothing outside this module can produce one
+    /// even by writing a struct literal.
+    #[derive(Debug)]
+    pub(super) struct SignedList {
+        urls: Vec<String>,
+        serial: u64,
+    }
+
+    impl SignedList {
+        /// The base URLs, in the order the publisher listed them.
+        pub(super) fn urls(&self) -> &[String] {
+            &self.urls
+        }
+
+        /// The serial this document was accepted at — what the caller ratchets the floor forward
+        /// with, once it has actually applied the list (`Refresh::persist`).
+        pub(super) fn serial(&self) -> u64 {
+            self.serial
+        }
+    }
+
+    /// Bytes and a detached signature in; a list worth obeying out.
+    ///
+    /// The gates run in the order `engine::manifest_of` runs them, and for the same reasons: the
+    /// caller has already BOUNDED the read, then the SIGNATURE comes before the parser (the parser
+    /// is the largest attack surface here, and running it over unauthenticated bytes is the thing
+    /// signing exists to stop), then the FORMAT, then IDENTITY AND FRESHNESS — a valid signature
+    /// says we produced this document, not that it is the document that was asked for, nor that it
+    /// is not one we published years ago and a mirror kept.
+    pub(super) fn verify(doc: &[u8], sig: &str, floor: u64) -> Result<SignedList> {
+        // WHICH key signed is deliberately not acted on, exactly as on the manifest path: a list
+        // signed by the cold spare is a list signed by us, and the spare exists for the day the
+        // active key is gone.
+        trust::verify(doc, sig).map_err(anyhow::Error::new).context("verifying the mirror list")?;
+        let parsed: Document =
+            serde_json::from_slice(doc).context("the mirror list is not readable")?;
+        if parsed.format != FORMAT {
+            anyhow::bail!(
+                "the mirror list is format {}, and this launcher reads format {FORMAT}",
+                parsed.format
+            );
+        }
+        let serial =
+            trust::accept_ident(Payload::Mirrors, parsed.payload_id.as_deref(), parsed.serial, floor)
+                .map_err(anyhow::Error::new)?;
+
+        // ONE bad entry refuses the WHOLE document rather than being dropped. This list is signed,
+        // so a malformed entry cannot be an attacker's doing — it is our own producer having
+        // shipped what it promises it cannot — and quietly dropping it is the exact failure
+        // `generate_mirror_list.py` exists to make impossible ("a well-formed document that
+        // silently ships nothing"). A reader that repeats the drop is where that silence comes
+        // back, with a green build at both ends and a mirror nobody can use.
+        let mut urls = Vec::with_capacity(parsed.mirrors.len());
+        for m in &parsed.mirrors {
+            // SHAPE only. The producer's vocabulary — the name charset, the two-letter country, the
+            // set of payload names that exist — is checked where it is authored, and is not
+            // transcribed here on purpose: a reader's copy of another repo's rules can only drift
+            // from them, and the single power it would have is to refuse a legitimate future
+            // registration. A payload kind added under format 1 must not freeze the mirror list of
+            // every launcher already in the field.
+            if m.name.is_empty()
+                || m.country.is_empty()
+                || m.payloads.is_empty()
+                || m.payloads.iter().any(String::is_empty)
+            {
+                anyhow::bail!("the mirror list carries an entry with an empty field: {:?}", m.name);
+            }
+            // The published string must ALREADY be the one the client uses. Normalizing it here
+            // would mean downloading from a URL nobody published and no reviewer read — and the
+            // producer refuses a non-canonical `base_url` for that same reason, so one arriving
+            // here means this is not the document that repo builds.
+            if normalize_mirror_url(&m.base_url).as_deref() != Some(m.base_url.as_str()) {
+                anyhow::bail!(
+                    "the mirror list carries a base_url that is not canonical: {:?}",
+                    m.base_url
+                );
+            }
+            urls.push(m.base_url.clone());
+        }
+        Ok(SignedList { urls, serial })
+    }
 }
 
 fn probe_agent() -> ureq::Agent {
@@ -643,6 +946,16 @@ fn short(e: ureq::Error) -> String {
 /// one address while installing from another.
 fn doc_url(base: &str, payload: &str, name: &str) -> String {
     format!("{}/{payload}/{name}", base.trim_end_matches('/'))
+}
+
+/// A document at a mirror's ROOT: `<base>/<name>`.
+///
+/// The mirror list lives here and not under a payload directory, because it is not any payload's
+/// content: it describes the HOSTS, and a host serves one list whatever payload trees it happens to
+/// carry. That is also why `Settings::payload_of` must never learn the registry repo — there is no
+/// `<base>/mirrors/` to address.
+fn root_url(base: &str, name: &str) -> String {
+    format!("{}/{name}", base.trim_end_matches('/'))
 }
 
 /// A payload entry's bytes: `<base>/<payload>/blobs/<sha256>` — no extension, because the name IS
@@ -1031,7 +1344,8 @@ mod tests {
     /// — including the UNC shape (`\\host\share`), which Windows treats as an implicit SMB target
     /// and would leak this machine's NTLMv2 hash to whatever answers there the moment it is
     /// touched. Goes through `fetch_list_from_mirror` itself (not just `probe_agent` in
-    /// isolation), since that is the real call site a published mirror's base URL reaches.
+    /// isolation), since that is the real call site a published mirror's base URL reaches — and
+    /// with the REAL agent, since `probe_agent`'s `https_only` flag IS the check under test.
     #[test]
     fn mirror_fetch_refuses_non_https_urls_cleanly() {
         for base in [
@@ -1040,7 +1354,7 @@ mod tests {
             "\\\\attacker\\share",
             "//attacker/share",
         ] {
-            let result = fetch_list_from_mirror(base);
+            let result = fetch_list_from_mirror(&probe_agent(), base, 0);
             assert!(result.is_err(), "expected {base} to be refused, got {result:?}");
         }
     }
@@ -1070,6 +1384,209 @@ mod tests {
         let err = transport::fetch(&agent, &url, |req, _same_origin| req)
             .expect_err("an endless redirect must not be followed forever");
         assert!(matches!(err, FetchError::TooManyRedirects), "expected TooManyRedirects, got {err:?}");
+    }
+
+    // ---- the published list, and the signature that makes it worth obeying ----
+
+    /// Every payload the format defines, as the producer spells them.
+    const ALL: &str = r#"["mod", "launcher", "game"]"#;
+
+    /// The document exactly as `generate_mirror_list.py` renders it — the producer's literal field
+    /// names, values and framing, never a Rust struct serialized back out. That is what makes these
+    /// tests able to notice a cross-repo rename: `"payload_id": "mirrors"` here is compared against
+    /// `Payload::Mirrors.id()` by the code under test, so a typo on either side fails below rather
+    /// than in the field, where the symptom would be a mirror list nobody can read and no error
+    /// anywhere.
+    fn list_doc(payload_id: &str, serial: u64, mirrors: &str) -> String {
+        format!(
+            "{{\n  \"format\": 1,\n  \"payload_id\": \"{payload_id}\",\n  \"serial\": {serial},\n  \
+             \"signed_at\": \"2026-09-01T11:00:00Z\",\n  \"mirrors\": [{mirrors}]\n}}\n"
+        )
+    }
+
+    /// One registration. `payloads` is raw array text so a test can publish one the format does not
+    /// describe.
+    fn entry(name: &str, url: &str, payloads: &str) -> String {
+        format!(r#"{{"base_url": "{url}", "name": "{name}", "country": "FI", "payloads": {payloads}}}"#)
+    }
+
+    /// A mirror serving the two documents at its ROOT — either of them optional, so a test can omit
+    /// the signature or the list itself.
+    fn list_server(doc: Option<Vec<u8>>, sig: Option<String>) -> crate::test_http::TestServer {
+        use crate::test_http::{Canned, TestServer};
+        TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            if let Some(d) = doc {
+                routes.insert("/mirrors.json", Canned::body(d));
+            }
+            if let Some(s) = sig {
+                routes.insert("/mirrors.json.minisig", Canned::body(s.into_bytes()));
+            }
+            routes
+        })
+    }
+
+    /// `signed::verify` over a document this suite's key really signed — the shortcut every test
+    /// below that has nothing to prove about the network takes.
+    fn verify_signed(doc: &str, floor: u64) -> Result<signed::SignedList> {
+        signed::verify(doc.as_bytes(), &crate::trust::testing::test_sig(doc.as_bytes()), floor)
+    }
+
+    /// The whole accept path over a real socket: the producer's document and its detached signature
+    /// fetched from a mirror's root, verified, and turned into what a refresh applies.
+    #[test]
+    fn a_signed_list_from_a_mirror_is_accepted() {
+        let doc = list_doc(
+            "mirrors",
+            5,
+            &format!(
+                "{}, {}",
+                entry("phx-fi-1", "https://fi1.example", ALL),
+                entry("phx-ru-1", "https://ru1.example", r#"["mod"]"#)
+            ),
+        );
+        let sig = crate::trust::testing::test_sig(doc.as_bytes());
+        let server = list_server(Some(doc.into_bytes()), Some(sig));
+        let base = format!("http://127.0.0.1:{}", server.port);
+
+        let list = fetch_list_from_mirror(&test_agent(), &base, 0)
+            .expect("a correctly signed list must verify")
+            .expect("…and must never read as \"this host publishes no list\"");
+        assert_eq!(list.urls(), ["https://fi1.example", "https://ru1.example"]);
+        assert_eq!(list.serial(), 5, "the number the caller ratchets the floor with");
+        // BOTH documents crossed the wire, from the mirror's ROOT — there is no payload directory
+        // for a list that describes the hosts themselves — and the signature was fetched rather
+        // than assumed absent.
+        assert_eq!(server.hits("/mirrors.json"), 1);
+        assert_eq!(server.hits("/mirrors.json.minisig"), 1);
+    }
+
+    /// A byte changed under a signature that was made over the honest bytes. The assertion that
+    /// matters is `Err` and specifically NOT `Ok(None)`: the caller counts `Ok(None)` as a mirror
+    /// positively answering "there is no list", which suppresses the registry's own error — so a
+    /// refusal that could pass for one would turn a tampering attempt into silence.
+    #[test]
+    fn a_tampered_list_is_a_refusal_not_an_answer() {
+        let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
+        let sig = crate::trust::testing::test_sig(doc.as_bytes());
+        let tampered = doc.replace("https://fi1.example", "https://evil.example");
+        assert_ne!(tampered, doc, "the fixture must actually differ");
+
+        let server = list_server(Some(tampered.into_bytes()), Some(sig));
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
+        assert!(got.is_err(), "a rewritten host must be refused, got {got:?}");
+    }
+
+    /// A signature this launcher is perfectly happy with, over a document that is not a mirror
+    /// list. Our own key signs four payload lines, so "we produced this" cannot be the last
+    /// question asked — and the document is shaped like a mirror list here on purpose, so that what
+    /// refuses it is the `payload_id` check and not the parser tripping over a foreign shape.
+    #[test]
+    fn a_valid_signature_over_another_payloads_document_is_refused() {
+        use crate::trust::TrustError;
+        let doc = list_doc("mod", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
+        let err = verify_signed(&doc, 0).expect_err("a mod document is not a mirror list");
+        assert!(
+            matches!(
+                err.downcast_ref::<TrustError>(),
+                Some(TrustError::WrongPayload { expected: "mirrors", found: Some(got) }) if got == "mod"
+            ),
+            "expected a payload refusal, got: {err:#}"
+        );
+    }
+
+    /// The rollback ratchet, on the one payload where a rollback rewrites the download sources
+    /// rather than the game: a mirror can always serve an older list it once held a perfectly valid
+    /// signature for, and that signature never stops verifying.
+    #[test]
+    fn a_list_older_than_this_machine_has_accepted_is_refused() {
+        use crate::trust::TrustError;
+        let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
+        assert_eq!(
+            verify_signed(&doc, 5).expect("the same list, checked again").serial(),
+            5,
+            "every launch re-reads the current list; refusing it would refuse the ordinary case"
+        );
+        let err = verify_signed(&doc, 9).expect_err("serial 5 is below a floor of 9");
+        assert!(
+            matches!(
+                err.downcast_ref::<TrustError>(),
+                Some(TrustError::StaleSerial { payload: "mirrors", found: Some(5), floor: 9 })
+            ),
+            "expected a stale-serial refusal, got: {err:#}"
+        );
+    }
+
+    /// "Unsigned" and "absent" must not be spelled the same way. A mirror that could answer with an
+    /// unsigned list and have it counted as "there is no list here" would still be choosing what
+    /// the caller does; a mirror that genuinely carries no list is answering a question.
+    #[test]
+    fn an_unsigned_list_is_refused_while_a_missing_one_is_simply_absent() {
+        let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
+        let server = list_server(Some(doc.into_bytes()), None); // the list, with no signature beside it
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
+        assert!(got.is_err(), "an unsigned list must not pass for an absent one: {got:?}");
+
+        let bare = list_server(None, None); // 404s both
+        let base = format!("http://127.0.0.1:{}", bare.port);
+        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
+        assert!(matches!(&got, Ok(None)), "a 404 on the list is an answer: {got:?}");
+    }
+
+    /// Rules this reader adds ON TOP of the signature, each proven over a document our own key
+    /// really signed: "we produced this" is not "this is usable", and every refusal here leaves the
+    /// mirrors already in settings alone rather than acting on a document half-understood.
+    #[test]
+    fn a_signed_document_this_reader_cannot_act_on_is_still_refused() {
+        let good = entry("phx-fi-1", "https://fi1.example", ALL);
+        // A format from the future. Refused rather than read optimistically — the cost is a list
+        // that stops updating until the launcher does, and the alternative is guessing at the one
+        // document that decides where every future download comes from.
+        let future = list_doc("mirrors", 5, &good).replace("\"format\": 1", "\"format\": 2");
+        assert!(verify_signed(&future, 0).is_err(), "an unknown format must not be read");
+
+        // A `base_url` the client would have to rewrite before using it. The published string has
+        // to BE the string that gets fetched, or the URL a reviewer approved and the URL this
+        // machine downloads from are two different things.
+        for bad in ["https://fi1.example/", " https://fi1.example", "fi1.example"] {
+            let doc = list_doc("mirrors", 5, &entry("phx-fi-1", bad, ALL));
+            assert!(verify_signed(&doc, 0).is_err(), "{bad:?} is not a canonical base_url");
+        }
+
+        // An entry that serves nothing, or names itself nothing. One bad entry refuses the WHOLE
+        // document: this list is signed, so a broken one is our producer having shipped what it
+        // promises it cannot, and dropping it quietly is the silent-non-publish failure the
+        // registry repo exists to make impossible.
+        let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", "[]"));
+        assert!(verify_signed(&doc, 0).is_err(), "a mirror that serves no payload is never used");
+        let doc = list_doc("mirrors", 5, &entry("", "https://fi1.example", ALL));
+        assert!(verify_signed(&doc, 0).is_err(), "a nameless registration is not one");
+    }
+
+    /// The three outcomes `apply` must keep apart — the whole of this module's failure semantics.
+    ///
+    /// A verified EMPTY list is the publisher stating there are no mirrors, and it replaces the
+    /// set. A source that could not be asked, and a document that was refused, both leave the set
+    /// exactly as it was: "could not ask" is not "there are none", and a refused document is not an
+    /// empty one — collapsing that second pair is how a tampered answer would wipe a user's mirrors
+    /// with nothing anywhere looking wrong.
+    #[test]
+    fn a_verified_empty_list_replaces_the_set_while_silence_leaves_it_alone() {
+        let existing = vec![Source::Primary, mirror("https://kept", true)];
+
+        let empty = verify_signed(&list_doc("mirrors", 5, ""), 0).expect("an empty list is valid");
+        let applied = apply(&existing, Ok(Some(empty)));
+        assert_eq!(applied.sources, vec![Source::Primary], "an empty list is an instruction");
+        assert_eq!(applied.serial, Some(5), "…and it still ratchets — we accepted a document");
+        assert!(applied.error.is_none());
+
+        for silence in [Ok(None), Err(anyhow::anyhow!("the source is dark"))] {
+            let applied = apply(&existing, silence);
+            assert_eq!(applied.sources, existing, "silence must never read as \"there are none\"");
+            assert_eq!(applied.serial, None, "nothing was accepted, so nothing may raise the floor");
+        }
     }
 
     // ---- the probe, against the layout a mirror really serves ----
