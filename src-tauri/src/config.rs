@@ -25,6 +25,14 @@ pub const DEFAULT_LAUNCHER_REPO: &str = "Pr0j3ctPh03nix/phoenix-launcher";
 /// must ride the tokenless `browser_download_url` path (free CDN bandwidth, no API rate budget).
 pub const DEFAULT_GAME_REPO: &str = "Pr0j3ctPh03nix/game-dist";
 
+/// Where the signed mirror list is published. A repo of its own, and PUBLIC: the list used to be
+/// read from `source_repo`, which is wrong in both directions — the dist repo is private (so every
+/// client would need the baked credential just to learn which mirrors exist, including the clients
+/// that cannot reach GitHub, who are the entire audience for mirrors), and "who may register a
+/// mirror" is not "who may cut a client release". A public registry can take a pull request from a
+/// mirror operator without handing them the release channel.
+pub const DEFAULT_MIRRORS_REPO: &str = "Pr0j3ctPh03nix/phoenix-mirror-registry";
+
 /// Read-only GitHub access for the PRIVATE client-dist-staging repo, injected at BUILD time:
 ///     PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS=github_pat_... bun run tauri build
 ///
@@ -42,10 +50,11 @@ const DIST_STAGING_REPO_ACCESS: Option<&str> =
 /// One place releases can be downloaded from. Position in `Settings::sources` is priority order.
 ///
 /// The two variants are deliberately asymmetric, and that asymmetry is the safety property:
-/// `Primary` has NO `enabled` field and NO url. Mirrors are discovered from a published
-/// `mirrors.json`, which is a list of mirror URLs — so there exists no value that document could
-/// carry, however malformed or hostile, that names, disables or removes the main source. Mirrors
-/// can only ever be a complement to it. `migrate` guarantees exactly one `Primary` survives.
+/// `Primary` has NO `enabled` field and NO url. Mirrors are discovered from a published, SIGNED
+/// `mirrors.json`, which describes mirrors and nothing else — so there exists no value that
+/// document could carry, however malformed or hostile, that names, disables or removes the main
+/// source. Mirrors can only ever be a complement to it. `migrate` guarantees exactly one `Primary`
+/// survives.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Source {
@@ -150,6 +159,10 @@ pub struct Settings {
     /// rationale as `launcher_repo`).
     #[serde(default)]
     pub game_repo: Option<String>,
+    /// `owner/name` of the repo publishing the signed mirror list. None = `DEFAULT_MIRRORS_REPO`
+    /// (same Option rationale as `launcher_repo`).
+    #[serde(default)]
+    pub mirrors_repo: Option<String>,
     /// Folder that CONTAINS `game/`. None = resolve to the updater exe's own directory.
     #[serde(default)]
     pub game_dir: Option<PathBuf>,
@@ -240,6 +253,7 @@ impl Default for Settings {
             source_repo: default_repo(),
             launcher_repo: None,
             game_repo: None,
+            mirrors_repo: None,
             game_dir: None,
             language: None,
             launch_extra: String::new(),
@@ -356,9 +370,27 @@ impl Settings {
         self.game_repo.as_deref().unwrap_or(DEFAULT_GAME_REPO)
     }
 
+    /// The repo the signed mirror list is published from. Public, so `mirror::fetch_published_mirrors`
+    /// reads it through `cmd::open_repo` — anonymous first, the baked credential only if the
+    /// anonymous attempt was REFUSED. That credential is scoped to the dist repo and a fine-grained
+    /// PAT can be turned away where anonymous access would have worked, which on this repo would
+    /// cost every client its mirror list for nothing.
+    ///
+    /// Deliberately ABSENT from `payload_of`, which answers a different question: "which payload
+    /// DIRECTORY does a mirror serve this repo's releases from". A mirror serves the list at its own
+    /// root (`<base>/mirrors.json` — see `mirror::fetch_list_from_mirror`), not under
+    /// `<base>/mirrors/`, so teaching `payload_of` this repo would point `cmd::candidates` and the
+    /// probe at a directory that exists on no mirror.
+    pub fn mirrors_repo(&self) -> &str {
+        self.mirrors_repo.as_deref().unwrap_or(DEFAULT_MIRRORS_REPO)
+    }
+
     /// The payload a repo names, and therefore the directory a mirror serves it from
     /// (`<base>/<payload>/…`). `None` for a repo this build knows nothing about, which is reachable
     /// only through the debug CLI's `--repo`.
+    ///
+    /// THREE repos, not four: `mirrors_repo` belongs to no payload directory and must never be
+    /// added here — see that method.
     ///
     /// Lives here rather than beside either of its callers because the three repo names it compares
     /// against are settings, and because both the download chain (`cmd::candidates`) and the probe
