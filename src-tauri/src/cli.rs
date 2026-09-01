@@ -50,7 +50,7 @@ pub fn run_sweep(flags: &[String]) -> Result<()> {
     while let Some(k) = it.next() {
         if k == "--mirror" {
             if let Some(url) = it.next().and_then(|u| crate::config::normalize_mirror_url(u)) {
-                settings.sources.push(crate::config::Source::Mirror { url, enabled: true, measured: false });
+                settings.sources.push(crate::config::Source::Mirror { url, enabled: true, measured: false, payloads: Vec::new() });
             }
         }
     }

@@ -186,7 +186,16 @@ fn candidates<'a>(settings: &'a Settings, repo: &str) -> Vec<Candidate<'a>> {
         .chain((0..settings.sources.len()).filter(move |i| Some(*i) != active));
     let mut primary = Some(primary);
     let mut out = Vec::new();
-    for source in order.map(|i| &settings.sources[i]).filter(|s| s.enabled()) {
+    // `carries` is the second filter and it is not cosmetic: a mirror publishes which payload trees
+    // it holds, and one that holds only `mod` has no `game/` directory at all. Letting it into a
+    // game chain spends a connection and a 404 per asset before falling through, on the largest
+    // download in the system — and ranks it as a usable source for a payload it has never had.
+    // An entry that advertises nothing is trusted (see `Source::carries`), so this cannot silently
+    // empty the chain for settings written before mirrors advertised anything.
+    for source in order
+        .map(|i| &settings.sources[i])
+        .filter(|s| s.enabled() && s.carries(payload))
+    {
         match source {
             // The primary keeps its own credential rule wherever the ranking puts it.
             Source::Primary => out.extend(primary.take()),
@@ -509,7 +518,7 @@ mod tests {
         let url = "https://mirror.example".to_string();
         let settings = Settings {
             sources: vec![
-                Source::Mirror { url: url.clone(), enabled: true, measured: true },
+                Source::Mirror { url: url.clone(), enabled: true, measured: true, payloads: Vec::new() },
                 Source::Primary,
             ],
             selected: Some(SourceRef::Mirror { url }),

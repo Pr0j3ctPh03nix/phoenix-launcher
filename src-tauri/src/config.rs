@@ -6,6 +6,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use crate::trust::Payload;
+
 /// On-disk schema version of settings.json. v1 = initial. Bump and extend `migrate` when the
 /// shape changes (e.g. a future `installs[]` for multi-install support).
 const SETTINGS_VERSION: u32 = 1;
@@ -74,10 +76,39 @@ pub enum Source {
         /// list unprompted is exactly what would move a user off the source they chose.
         #[serde(default)]
         measured: bool,
+        /// The payload trees this mirror says it carries, taken from the signed list.
+        ///
+        /// Kept rather than validated-and-dropped because a mirror need not carry all three: the
+        /// probe has to measure a directory that exists on THIS host, and the download chain must
+        /// not route a payload to a host without it. EMPTY means unknown — an entry written before
+        /// this field existed — and is read permissively, so upgrading cannot disable a mirror that
+        /// works; the next refresh fills it in from the list.
+        #[serde(default)]
+        payloads: Vec<String>,
     },
 }
 
 impl Source {
+    /// Does this source carry `payload`? The primary carries everything; a mirror carries what the
+    /// signed list said, and an entry that says nothing is trusted rather than excluded (see the
+    /// field's own note on why empty is permissive).
+    pub fn carries(&self, payload: Payload) -> bool {
+        match self {
+            Source::Primary => true,
+            Source::Mirror { payloads, .. } => {
+                payloads.is_empty() || payloads.iter().any(|p| p == payload.id())
+            }
+        }
+    }
+
+    /// The payloads a mirror advertises, for callers deciding what to measure it with.
+    pub fn payloads(&self) -> &[String] {
+        match self {
+            Source::Primary => &[],
+            Source::Mirror { payloads, .. } => payloads,
+        }
+    }
+
     pub fn url(&self) -> Option<&str> {
         match self {
             Source::Primary => None,
@@ -464,7 +495,7 @@ mod tests {
     use super::*;
 
     fn mirror(url: &str, enabled: bool) -> Source {
-        Source::Mirror { url: url.to_string(), enabled, measured: true }
+        Source::Mirror { url: url.to_string(), enabled, measured: true, payloads: Vec::new() }
     }
     fn pin(url: &str) -> SourceRef {
         SourceRef::Mirror { url: url.to_string() }

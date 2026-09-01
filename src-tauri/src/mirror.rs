@@ -241,7 +241,7 @@ pub fn refresh(settings: &Settings) -> Refresh {
 fn apply(existing: &[Source], answer: Result<Option<signed::SignedList>>) -> Refresh {
     match answer {
         Ok(Some(list)) => Refresh {
-            sources: rebuild(existing, list.urls()),
+            sources: rebuild(existing, list.hosts()),
             error: None,
             serial: Some(list.serial()),
         },
@@ -322,23 +322,38 @@ pub fn any_healthy(probes: &[Probe]) -> bool {
 ///
 /// The primary is preserved from `existing` wherever it sits, and re-inserted if somehow absent.
 /// It is never drawn from the document, which is what makes it unremovable by one.
-fn rebuild(existing: &[Source], urls: &[String]) -> Vec<Source> {
-    let published: Vec<String> = {
+fn rebuild(existing: &[Source], hosts: &[signed::Host]) -> Vec<Source> {
+    let published: Vec<(String, Vec<String>)> = {
         let mut seen = std::collections::HashSet::new();
-        urls.iter().filter_map(|u| normalize_mirror_url(u)).filter(|u| seen.insert(u.clone())).collect()
+        hosts
+            .iter()
+            .filter_map(|h| normalize_mirror_url(&h.url).map(|u| (u, h.payloads.clone())))
+            .filter(|(u, _)| seen.insert(u.clone()))
+            .collect()
     };
 
     let mut out: Vec<Source> = existing
         .iter()
-        .filter(|s| s.is_primary() || s.url().is_some_and(|u| published.iter().any(|p| p == u)))
+        .filter(|s| s.is_primary() || s.url().is_some_and(|u| published.iter().any(|(p, _)| p == u)))
         .cloned()
         .collect();
     if !out.iter().any(Source::is_primary) {
         out.insert(0, Source::Primary);
     }
-    for url in published {
+    // A surviving mirror keeps its flags and its rank — the whole point of matching by URL — but
+    // takes the LIST's word on what it carries. Payloads are the publisher's statement about a
+    // host, not a local preference, so an entry that gained or lost one must be re-read here or the
+    // probe and the download chain go on believing a shape the list has stopped claiming.
+    for s in &mut out {
+        if let Source::Mirror { url, payloads, .. } = s {
+            if let Some((_, fresh)) = published.iter().find(|(p, _)| p == url) {
+                *payloads = fresh.clone();
+            }
+        }
+    }
+    for (url, payloads) in published {
         if !out.iter().any(|s| s.url() == Some(url.as_str())) {
-            out.push(Source::Mirror { url, enabled: true, measured: false });
+            out.push(Source::Mirror { url, enabled: true, measured: false, payloads });
         }
     }
     out
@@ -405,22 +420,22 @@ fn fetch_published_mirrors(settings: &Settings) -> Result<Option<signed::SignedL
     // One agent for the whole fallback: `probe_agent`'s pool is what keeps N mirrors from paying N
     // fresh handshakes for two small documents each.
     let agent = probe_agent();
-    let mut published = false;
     for url in settings.sources.iter().filter(|s| s.enabled()).filter_map(|s| s.url()) {
-        match fetch_list_from_mirror(&agent, url, floor) {
-            Ok(Some(list)) => return Ok(Some(list)),
-            Ok(None) => published = true,
-            Err(_) => {}
+        if let Ok(Some(list)) = fetch_list_from_mirror(&agent, url, floor) {
+            return Ok(Some(list));
         }
     }
 
-    // The registry was unreachable and no mirror had a list either: report the registry's failure,
-    // which is the one worth showing, unless a mirror positively answered "there is none".
-    if published {
-        Ok(None)
-    } else {
-        Err(last_err)
-    }
+    // NO MIRROR IS AUTHORITATIVE ABOUT WHETHER A LIST EXISTS — only the registry is, and it already
+    // returned above if it answered at all. A mirror's 404 says one thing: that HOST does not carry
+    // the document. It used to be counted as the publisher saying "there are none", and the
+    // consequences were the reverse of harmless: `Ok(None)` reaches `apply` as a successful refresh
+    // with `error: None`, so the settings pane reports nothing wrong while the mirror set silently
+    // stops changing — for precisely the users whose registry is unreachable, which is everyone
+    // this feature exists for. Any host that has not synced the list yet was enough to trigger it.
+    //
+    // So the registry's failure is what gets reported. Being unable to ask is not an answer.
+    Err(last_err)
 }
 
 /// One mirror's copy of the list: `<base>/mirrors.json`, with `<base>/mirrors.json.minisig` beside
@@ -545,19 +560,32 @@ mod signed {
         payloads: Vec<String>,
     }
 
+    /// One published mirror, reduced to what the client acts on: where it is, and which payload
+    /// trees it says it carries.
+    ///
+    /// `payloads` is kept — not merely validated and dropped — because a mirror need not carry all
+    /// three, and both the probe and the download chain have to know. `name` and `country` are
+    /// still deliberately discarded: nothing renders them, and a field carried but unused is one a
+    /// later reader starts to believe is doing something.
+    #[derive(Debug)]
+    pub(super) struct Host {
+        pub(super) url: String,
+        pub(super) payloads: Vec<String>,
+    }
+
     /// A mirror list that has been verified, identified and found current. `verify` is its sole
     /// constructor: the fields below are private, so nothing outside this module can produce one
     /// even by writing a struct literal.
     #[derive(Debug)]
     pub(super) struct SignedList {
-        urls: Vec<String>,
+        hosts: Vec<Host>,
         serial: u64,
     }
 
     impl SignedList {
-        /// The base URLs, in the order the publisher listed them.
-        pub(super) fn urls(&self) -> &[String] {
-            &self.urls
+        /// The published mirrors, in the order the publisher listed them.
+        pub(super) fn hosts(&self) -> &[Host] {
+            &self.hosts
         }
 
         /// The serial this document was accepted at — what the caller ratchets the floor forward
@@ -598,7 +626,7 @@ mod signed {
         // `generate_mirror_list.py` exists to make impossible ("a well-formed document that
         // silently ships nothing"). A reader that repeats the drop is where that silence comes
         // back, with a green build at both ends and a mirror nobody can use.
-        let mut urls = Vec::with_capacity(parsed.mirrors.len());
+        let mut hosts = Vec::with_capacity(parsed.mirrors.len());
         for m in &parsed.mirrors {
             // SHAPE only. The producer's vocabulary — the name charset, the two-letter country, the
             // set of payload names that exist — is checked where it is authored, and is not
@@ -623,9 +651,9 @@ mod signed {
                     m.base_url
                 );
             }
-            urls.push(m.base_url.clone());
+            hosts.push(Host { url: m.base_url.clone(), payloads: m.payloads.clone() });
         }
-        Ok(SignedList { urls, serial })
+        Ok(SignedList { hosts, serial })
     }
 }
 
@@ -692,8 +720,33 @@ pub fn probe_one(
         // Two backends, two measurements, deliberately not unified: the primary IS GitHub, so its
         // release index is the right thing to time there, and a mirror has no such index at all.
         Source::Primary => probe_primary(source, repo, token),
-        Source::Mirror { url, .. } => probe_mirror(&probe_agent(), source, url, payload),
+        Source::Mirror { url, .. } => {
+            probe_mirror(&probe_agent(), source, url, measurable(source, payload))
+        }
     }
+}
+
+/// Which payload directory to time this mirror through.
+///
+/// It has to be one the host actually CARRIES, and that is not always the one the caller asked
+/// about: `measure` asks about the source repo's payload — always `mod`, since that is the repo
+/// whose ranking it builds — and timing that fixed directory measured one which need not exist. A
+/// game-only mirror 404'd, was painted unusable and dropped from `any_healthy` while serving the
+/// 7.9 GiB payload perfectly; a mod-only mirror measured healthy and then headed the ranking used
+/// for a game install it cannot serve at all.
+///
+/// Preferring the requested payload keeps the ordinary case measuring exactly what will be
+/// downloaded. Falling back to another one the host carries is deliberate: throughput is a property
+/// of the HOST, and a real transfer from it beats no number — while `candidates` is what keeps a
+/// payload from being routed to a mirror lacking it, so a speed measured here can never on its own
+/// send a download somewhere it cannot be served.
+///
+/// `None` means nothing measurable: a mirror advertising only payload names this build cannot name.
+fn measurable(source: &Source, want: Option<Payload>) -> Option<Payload> {
+    if want.is_some_and(|p| source.carries(p)) {
+        return want;
+    }
+    source.payloads().iter().find_map(|id| Payload::from_id(id))
 }
 
 /// The primary, measured through the real GitHub download path — API release lookup, then a ranged
@@ -1256,7 +1309,31 @@ mod tests {
     use super::*;
 
     fn mirror(url: &str, measured: bool) -> Source {
-        Source::Mirror { url: url.to_string(), enabled: true, measured }
+        // No payloads: an entry that advertises nothing is read permissively, so these tests keep
+        // measuring what they were written to measure. `carries_only` is for the cases that are
+        // ABOUT a mirror holding some payloads and not others.
+        Source::Mirror { url: url.to_string(), enabled: true, measured, payloads: Vec::new() }
+    }
+
+    fn carries_only(url: &str, payloads: &[&str]) -> Source {
+        Source::Mirror {
+            url: url.to_string(),
+            enabled: true,
+            measured: true,
+            payloads: payloads.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    /// `rebuild` takes what the signed list said; these build one entry of it.
+    fn host(url: &str) -> signed::Host {
+        signed::Host { url: url.to_string(), payloads: Vec::new() }
+    }
+
+    fn host_with(url: &str, payloads: &[&str]) -> signed::Host {
+        signed::Host {
+            url: url.to_string(),
+            payloads: payloads.iter().map(|p| p.to_string()).collect(),
+        }
     }
 
     fn probe(source: &Source, healthy: bool) -> Probe {
@@ -1291,7 +1368,9 @@ mod tests {
         let marked: Vec<Source> = sources
             .into_iter()
             .map(|s| match s {
-                Source::Mirror { url, enabled, .. } => Source::Mirror { url, enabled, measured: true },
+                Source::Mirror { url, enabled, payloads, .. } => {
+                    Source::Mirror { url, enabled, measured: true, payloads }
+                }
                 p => p,
             })
             .collect();
@@ -1319,7 +1398,7 @@ mod tests {
         // the document lists them in a different order and adds one
         let out = rebuild(
             &existing,
-            &["https://slow".into(), "https://new".into(), "https://fast".into()],
+            &[host("https://slow"), host("https://new"), host("https://fast")],
         );
         assert_eq!(out[0].url(), Some("https://fast"));
         assert!(out[1].is_primary());
@@ -1335,9 +1414,53 @@ mod tests {
     #[test]
     fn rebuild_removes_only_unpublished_mirrors() {
         let existing = vec![Source::Primary, mirror("https://gone", true), mirror("https://kept", true)];
-        let out = rebuild(&existing, &["https://kept".into()]);
+        let out = rebuild(&existing, &[host("https://kept")]);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|s| s.url() != Some("https://gone")));
+    }
+
+    /// A mirror is measured through a payload it actually holds.
+    ///
+    /// `measure` always asks about the source repo's payload — `mod` — so a fixed answer meant a
+    /// game-only mirror was timed against a `mod/` directory it does not have: 404, painted
+    /// UNUSABLE, dropped from `any_healthy`, while serving the 7.9 GiB payload perfectly.
+    #[test]
+    fn a_mirror_is_measured_through_a_payload_it_carries() {
+        let game_only = carries_only("https://g", &["game"]);
+        assert_eq!(measurable(&game_only, Some(Payload::Mod)), Some(Payload::Game));
+        // …and the requested one still wins wherever the host has it, so the ordinary case measures
+        // exactly what will be downloaded.
+        let both = carries_only("https://b", &["mod", "game"]);
+        assert_eq!(measurable(&both, Some(Payload::Mod)), Some(Payload::Mod));
+    }
+
+    /// An entry advertising nothing predates the field. Reading that as "carries nothing" would
+    /// have made an upgrade silently unmeasurable — and unusable — for every mirror already saved.
+    #[test]
+    fn a_mirror_that_advertises_nothing_is_trusted_not_excluded() {
+        let legacy = mirror("https://old", true);
+        assert_eq!(measurable(&legacy, Some(Payload::Game)), Some(Payload::Game));
+        assert!(legacy.carries(Payload::Mod) && legacy.carries(Payload::Game));
+    }
+
+    /// A payload kind added after this build ships is not a directory it can name, so there is
+    /// nothing to time — and inventing a path for it would 404 a mirror that is perfectly healthy.
+    #[test]
+    fn a_mirror_carrying_only_unknown_payloads_is_not_measurable() {
+        let future = carries_only("https://f", &["something-new"]);
+        assert_eq!(measurable(&future, Some(Payload::Mod)), None);
+        assert!(!future.carries(Payload::Mod));
+    }
+
+    /// Which payloads a host carries is the PUBLISHER's statement about it, not a local preference,
+    /// so a refresh must re-read it — while flags and rank still survive by URL.
+    #[test]
+    fn rebuild_refreshes_payloads_but_keeps_flags() {
+        let existing = vec![Source::Primary, carries_only("https://m", &["mod"])];
+        let out = rebuild(&existing, &[host_with("https://m", &["mod", "game"])]);
+        let m = out.iter().find(|s| s.url() == Some("https://m")).expect("kept by URL");
+        assert!(m.carries(Payload::Game), "the list now says it carries the game");
+        assert!(matches!(m, Source::Mirror { measured: true, .. }), "and it is still measured");
     }
 
     /// A URL that fails the https-only check must be refused as an ordinary error, never a panic
@@ -1452,7 +1575,8 @@ mod tests {
         let list = fetch_list_from_mirror(&test_agent(), &base, 0)
             .expect("a correctly signed list must verify")
             .expect("…and must never read as \"this host publishes no list\"");
-        assert_eq!(list.urls(), ["https://fi1.example", "https://ru1.example"]);
+        let urls: Vec<&str> = list.hosts().iter().map(|h| h.url.as_str()).collect();
+        assert_eq!(urls, ["https://fi1.example", "https://ru1.example"]);
         assert_eq!(list.serial(), 5, "the number the caller ratchets the floor with");
         // BOTH documents crossed the wire, from the mirror's ROOT — there is no payload directory
         // for a list that describes the hosts themselves — and the signature was fetched rather
