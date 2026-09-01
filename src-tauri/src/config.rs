@@ -356,6 +356,27 @@ impl Settings {
         self.game_repo.as_deref().unwrap_or(DEFAULT_GAME_REPO)
     }
 
+    /// The payload a repo names, and therefore the directory a mirror serves it from
+    /// (`<base>/<payload>/…`). `None` for a repo this build knows nothing about, which is reachable
+    /// only through the debug CLI's `--repo`.
+    ///
+    /// Lives here rather than beside either of its callers because the three repo names it compares
+    /// against are settings, and because both the download chain (`cmd::candidates`) and the probe
+    /// (`mirror::measure`) have to answer this the SAME way: a probe that measured one directory
+    /// while the installer read another would rank a source on a transfer nothing would ever repeat.
+    pub fn payload_of(&self, repo: &str) -> Option<crate::trust::Payload> {
+        use crate::trust::Payload;
+        if repo == self.source_repo {
+            Some(Payload::Mod)
+        } else if repo == self.game_repo() {
+            Some(Payload::Game)
+        } else if repo == self.launcher_repo() {
+            Some(Payload::Launcher)
+        } else {
+            None
+        }
+    }
+
     /// The lowest `serial` a signed manifest for `payload` may carry: this machine's own
     /// high-water mark. Zero on a fresh install, which is correct — there is nothing yet to be
     /// rolled back FROM, and the first thing installed is whatever the source offers.

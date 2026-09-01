@@ -22,8 +22,8 @@ pub(crate) struct Canned {
     /// PORT, which only exists once the listener has bound — a caller builds it with `format!`.
     pub location: Option<String>,
     /// The response body. Served whole for a plain request, and as a 206 `Content-Range` slice for
-    /// a `Range: bytes=N-` — which is what makes a RESUME provable over a real socket rather than
-    /// asserted about a mock.
+    /// a `Range` header (`parse_range`) — which is what makes a RESUME, and a probe's bounded read,
+    /// provable over a real socket rather than asserted about a mock.
     pub body: Vec<u8>,
 }
 
@@ -139,19 +139,13 @@ fn handle_one(mut stream: TcpStream, routes: &HashMap<&'static str, Canned>, hit
         Some(c) => (c.status, c.location.clone(), c.body.clone()),
         None => (404, None, Vec::new()),
     };
-    // `bytes=N-` only — the one form `stream_to_file` ever sends. Anything else is served whole,
-    // which is a legal answer (the client treats a 200 as "the range was declined").
+    // Anything this cannot read is served whole, which is a legal answer (the client treats a 200
+    // as "the range was declined").
     let mut content_range = None;
     if status == 200 && !body.is_empty() {
-        if let Some(start) = range
-            .as_deref()
-            .and_then(|v| v.strip_prefix("bytes="))
-            .and_then(|v| v.strip_suffix('-'))
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|s| *s < body.len())
-        {
-            content_range = Some(format!("bytes {start}-{}/{}", body.len() - 1, body.len()));
-            body = body[start..].to_vec();
+        if let Some((start, end)) = range.as_deref().and_then(|v| parse_range(v, body.len())) {
+            content_range = Some(format!("bytes {start}-{end}/{}", body.len()));
+            body = body[start..=end].to_vec();
             status = 206;
         }
     }
@@ -165,6 +159,27 @@ fn handle_one(mut stream: TcpStream, routes: &HashMap<&'static str, Canned>, hit
     resp.push_str(&format!("Content-Length: {}\r\nConnection: close\r\n\r\n", body.len()));
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.write_all(&body);
+}
+
+/// The two `Range` forms this crate sends, as an INCLUSIVE slice of a body `len` bytes long:
+/// `bytes=N-` (a resume — `downloader::stream_to_file`) and `bytes=N-M` (a bounded read —
+/// `mirror::probe_mirror`, which asks for `PROBE_BYTES` and must be able to see a real 206 come
+/// back, since `Probe::range_ok` is a measured result and not an assumption).
+///
+/// `M` past the end is CLAMPED rather than refused: asking for more than exists is what a probe
+/// does to every asset smaller than its chunk, and answering 200 there would make a mirror that
+/// resumes perfectly well look like one that cannot.
+fn parse_range(header: &str, len: usize) -> Option<(usize, usize)> {
+    let (start, end) = header.trim().strip_prefix("bytes=")?.split_once('-')?;
+    let start: usize = start.parse().ok()?;
+    if start >= len {
+        return None; // unsatisfiable; served whole, as above
+    }
+    let end = match end {
+        "" => len - 1,
+        v => v.parse::<usize>().ok()?.min(len - 1),
+    };
+    (start <= end).then_some((start, end))
 }
 
 fn reason_phrase(status: u16) -> &'static str {

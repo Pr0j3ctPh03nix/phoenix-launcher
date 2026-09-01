@@ -24,7 +24,6 @@ use crate::github::Github;
 use crate::install::Origin;
 use crate::manifest::Manifest;
 use crate::mirror::{self, Mirror};
-use crate::trust::Payload;
 use crate::views::CmdError;
 
 /// Open a repo's latest release from the best source that can actually serve it, returning the
@@ -177,7 +176,7 @@ fn candidates<'a>(settings: &'a Settings, repo: &str) -> Vec<Candidate<'a>> {
         credentials: if authed_first { None } else { token.map(with_token) },
         authoritative: true,
     };
-    let Some(payload) = payload_of(settings, repo).filter(|_| mirror::MIRROR_DOWNLOADS_ENABLED)
+    let Some(payload) = settings.payload_of(repo).filter(|_| mirror::MIRROR_DOWNLOADS_ENABLED)
     else {
         return vec![primary];
     };
@@ -200,20 +199,6 @@ fn candidates<'a>(settings: &'a Settings, repo: &str) -> Vec<Candidate<'a>> {
     }
     out.extend(primary); // a source list somehow without a Primary still gets one, last
     out
-}
-
-/// The payload a repo names, and therefore the directory a mirror serves it from. `None` for a repo
-/// this build knows nothing about, which is reachable only through the debug CLI's `--repo`.
-fn payload_of(settings: &Settings, repo: &str) -> Option<Payload> {
-    if repo == settings.source_repo {
-        Some(Payload::Mod)
-    } else if repo == settings.game_repo() {
-        Some(Payload::Game)
-    } else if repo == settings.launcher_repo() {
-        Some(Payload::Launcher)
-    } else {
-        None
-    }
 }
 
 /// One candidate's whole attempt: anonymously, then with credentials if it was REFUSED.
@@ -356,6 +341,7 @@ mod tests {
     use super::*;
     use crate::config::{Source, SourceRef};
     use crate::downloader::fake::Fake;
+    use crate::trust::Payload;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     const DOC: &str = r#"{"version":"1.0.0","files":[]}"#;
@@ -541,9 +527,9 @@ mod tests {
     #[test]
     fn a_repo_maps_to_the_payload_directory_a_mirror_serves_it_from() {
         let s = Settings::default();
-        assert_eq!(payload_of(&s, &s.source_repo).map(Payload::id), Some("mod"));
-        assert_eq!(payload_of(&s, s.game_repo()).map(Payload::id), Some("game"));
-        assert_eq!(payload_of(&s, s.launcher_repo()).map(Payload::id), Some("launcher"));
-        assert!(payload_of(&s, "somebody/else").is_none());
+        assert_eq!(s.payload_of(&s.source_repo).map(Payload::id), Some("mod"));
+        assert_eq!(s.payload_of(s.game_repo()).map(Payload::id), Some("game"));
+        assert_eq!(s.payload_of(s.launcher_repo()).map(Payload::id), Some("launcher"));
+        assert!(s.payload_of("somebody/else").is_none());
     }
 }

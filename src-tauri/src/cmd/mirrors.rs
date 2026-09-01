@@ -101,11 +101,11 @@ pub async fn auto_sweep_mirrors() -> Result<(), CmdError> {
         let (sources, _) = mirror::refresh(&settings);
 
         // MEASURING is gated on a mirror actually being usable as a download source, which today
-        // it is not: there is no `Downloader` implementation for a mirror, so every installed byte
-        // comes from GitHub regardless of how this ranks. Until that exists, a boot-time sweep
-        // spends a 512 KiB transfer and up to ~8s PER SOURCE, on every launch, to order a list
-        // nothing reads. Refreshing the list is still worth doing — it is one request and it is
-        // what surfaces a newly published mirror in the settings pane.
+        // it is not: `MIRROR_DOWNLOADS_ENABLED` is the deployment switch (read its doc), and while
+        // it is off every installed byte comes from GitHub regardless of how this ranks. Until it
+        // flips, a boot-time sweep spends a 512 KiB transfer and up to ~8s PER SOURCE, on every
+        // launch, to order a list nothing reads. Refreshing the list is still worth doing — it is
+        // one request and it is what surfaces a newly published mirror in the settings pane.
         if !mirror::MIRROR_DOWNLOADS_ENABLED
             || !settings.auto_pick_best
             || !mirror::has_new_mirror(&sources)
@@ -113,7 +113,9 @@ pub async fn auto_sweep_mirrors() -> Result<(), CmdError> {
             return Settings::update(move |s| s.sources = sources).map_err(CmdError::from);
         }
 
-        let (sources, probes) = mirror::measure(sources, &settings.source_repo, settings.token());
+        let payload = settings.payload_of(&settings.source_repo);
+        let (sources, probes) =
+            mirror::measure(sources, &settings.source_repo, payload, settings.token());
         let pick_best = mirror::any_healthy(&probes);
         Settings::update(move |s| {
             s.sources = sources;

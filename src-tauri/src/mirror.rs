@@ -1,8 +1,10 @@
 //! Download sources: discovering mirrors, and measuring whether one actually *works*.
 //!
-//! A mirror is a base URL serving a release index at `<url>/releases.json` — GitHub's `/releases`
-//! JSON shape — with each release's assets beside it. Mirrors are never authored by the user: they
-//! are published in a `mirrors.json` and refreshed by `sweep`.
+//! A mirror is a base URL serving a payload by CONTENT: `<url>/<payload>/manifest.json`, and the
+//! blobs that document names under `<url>/<payload>/blobs/<sha256>` (the layout, and why there is
+//! no tag directory in it, is `Mirror`'s doc; `doc_url`/`blob_url` build it for both the probe and
+//! the download backend). Mirrors are never authored by the user: they are published in a
+//! `mirrors.json` and refreshed by `sweep`.
 //!
 //! The measurement is deliberately more than a reachability check, because the failure this exists
 //! to catch is not an unreachable host. It is a network path that completes a handshake, serves a
@@ -18,12 +20,20 @@ use anyhow::{Context, Result};
 use crate::config::{normalize_mirror_url, Settings, Source};
 use crate::downloader::{Asset, Downloader, NetKind, Release};
 use crate::github::Github;
+use crate::manifest::Manifest;
 use crate::transport::{self, FetchError};
+use crate::trust::Payload;
 
 const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 
 /// The published mirror list, as a release asset and at every mirror's root.
 pub const MIRRORS_ASSET: &str = "mirrors.json";
+
+/// Ceiling on a mirror's `mirrors.json`. It is a JSON array of base URLs, so a megabyte is already
+/// thousands of them — and it is a list of hosts the installer will later take bytes from, which
+/// makes its size a trust input like any other. The payload MANIFEST the probe reads is bounded
+/// separately and far higher (`trust::MAX_DOC_BYTES`); see `probe_mirror`.
+const MIRRORS_MAX_BYTES: u64 = 1 << 20;
 
 /// Whether a mirror can serve an INSTALL yet. The `Downloader` implementation now exists (see
 /// `Mirror` below), so this is no longer a statement about missing code: it is the DEPLOYMENT
@@ -60,7 +70,8 @@ pub struct Probe {
     /// None for the primary — it has no URL, and the UI keys on `primary` instead.
     pub url: Option<String>,
     pub primary: bool,
-    /// Milliseconds to fetch and parse the index. All a plain reachability check would have said.
+    /// Milliseconds to fetch and read the document that names the release — the primary's release
+    /// index, a mirror's manifest. All a plain reachability check would have said.
     pub latency_ms: Option<u64>,
     /// Bytes per second over a real asset chunk. The number worth sorting on.
     pub bytes_per_sec: Option<u64>,
@@ -149,8 +160,16 @@ pub fn refresh(settings: &Settings) -> (Vec<Source>, Option<String>) {
 }
 
 /// Time every source and order them fastest-first, marking each mirror measured.
-pub fn measure(sources: Vec<Source>, repo: &str, token: Option<&str>) -> (Vec<Source>, Vec<Probe>) {
-    let probes = probe_all(&sources, repo, token);
+///
+/// `payload` is `repo`'s (`Settings::payload_of`) — a mirror is addressed by payload directory, not
+/// by repo, and only the settings know which is which.
+pub fn measure(
+    sources: Vec<Source>,
+    repo: &str,
+    payload: Option<Payload>,
+    token: Option<&str>,
+) -> (Vec<Source>, Vec<Probe>) {
+    let probes = probe_all(&sources, repo, payload, token);
     // Kept zipped through the sort: `sources[i]` and `probes[i]` describe the same source, and
     // reordering one without the other would silently mislabel every measurement.
     let mut paired: Vec<(Source, Probe)> = sources.into_iter().zip(probes).collect();
@@ -175,7 +194,8 @@ pub fn sweep(settings: &Settings, do_measure: bool) -> Sweep {
     if !do_measure {
         return Sweep { sources, probes: Vec::new(), refresh_error };
     }
-    let (sources, probes) = measure(sources, &settings.source_repo, settings.token());
+    let payload = settings.payload_of(&settings.source_repo);
+    let (sources, probes) = measure(sources, &settings.source_repo, payload, settings.token());
     Sweep { sources, probes, refresh_error }
 }
 
@@ -278,15 +298,27 @@ fn fetch_list_from_mirror(base: &str) -> Result<Option<Vec<String>>> {
     let agent = probe_agent();
     let url = format!("{base}/{MIRRORS_ASSET}");
     match transport::fetch(&agent, &url, |req, _same_origin| req.set("User-Agent", UA)) {
-        Ok(r) => Ok(Some(parse_list(&read_all(r)?)?)),
+        Ok(r) => Ok(Some(parse_list(&read_all(r, MIRRORS_MAX_BYTES)?)?)),
         Err(FetchError::Http(ureq::Error::Status(404, _))) => Ok(None),
         Err(e) => Err(anyhow::anyhow!("{base}: {}", short_fetch(e))),
     }
 }
 
-fn read_all(resp: ureq::Response) -> Result<Vec<u8>> {
+/// Read a small document whole, under a ceiling the CALLER states — the two this module reads from
+/// a mirror are not remotely the same size, and one ceiling for both would have to be the larger.
+///
+/// Over-limit is an ERROR rather than a silent truncation. A truncated document is still handed to
+/// a parser, which reports it as malformed — blaming a host's syntax for its size, and on the
+/// manifest path ranking a mirror dead for serving a release that merely grew.
+fn read_all(resp: ureq::Response, max: u64) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    resp.into_reader().take(1 << 20).read_to_end(&mut buf)?;
+    // `take(max + 1)` rather than trusting Content-Length, exactly as `Mirror::manifest_bytes`
+    // does: the length header is the peer's claim, and a host that intends to exhaust this
+    // process's memory is not going to declare it.
+    resp.into_reader().take(max + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > max {
+        anyhow::bail!("the document is larger than the {max} bytes allowed for it");
+    }
     Ok(buf)
 }
 
@@ -304,9 +336,10 @@ fn probe_agent() -> ureq::Agent {
         .redirects(0)
         // https-only, and re-checked on EVERY hop of a redirect chain, not just the URL we start
         // with (each hop `transport::fetch` issues is its own fresh request, so this same check
-        // runs again every time). A mirror's `releases.json` names its own asset URLs (see
-        // `probe_mirror` below) — so a hostile or compromised mirror can point a probe at
-        // `http://`, `file://`, or a `\\host\share` UNC path. The last one is the one that matters
+        // runs again every time). The probe DERIVES every URL it starts from (`doc_url`/`blob_url`,
+        // see `probe_mirror` below), but a mirror still chooses every `Location` it answers with —
+        // so a hostile or compromised one can point the next hop at `http://`, `file://`, or a
+        // `\\host\share` UNC path. The last one is the one that matters
         // most: Windows treats that shape as an implicit SMB target, and touching it is enough to
         // leak this machine's NTLMv2 hash to whatever server answers, before a single byte of
         // content is read.
@@ -330,10 +363,15 @@ fn short_fetch(e: FetchError) -> String {
 /// N × `PROBE_BUDGET`, which is the multi-minute freeze a user would read as a broken button. The
 /// count is published and small, so a thread each is simpler than a pool and costs nothing worth
 /// managing. Disabled mirrors are probed too — that is how one that has recovered gets noticed.
-pub fn probe_all(sources: &[Source], repo: &str, token: Option<&str>) -> Vec<Probe> {
+pub fn probe_all(
+    sources: &[Source],
+    repo: &str,
+    payload: Option<Payload>,
+    token: Option<&str>,
+) -> Vec<Probe> {
     std::thread::scope(|scope| {
         let handles: Vec<_> =
-            sources.iter().map(|s| scope.spawn(move || probe_one(s, repo, token))).collect();
+            sources.iter().map(|s| scope.spawn(move || probe_one(s, repo, payload, token))).collect();
         sources
             .iter()
             .zip(handles)
@@ -342,10 +380,17 @@ pub fn probe_all(sources: &[Source], repo: &str, token: Option<&str>) -> Vec<Pro
     })
 }
 
-pub fn probe_one(source: &Source, repo: &str, token: Option<&str>) -> Probe {
+pub fn probe_one(
+    source: &Source,
+    repo: &str,
+    payload: Option<Payload>,
+    token: Option<&str>,
+) -> Probe {
     match source {
+        // Two backends, two measurements, deliberately not unified: the primary IS GitHub, so its
+        // release index is the right thing to time there, and a mirror has no such index at all.
         Source::Primary => probe_primary(source, repo, token),
-        Source::Mirror { url, .. } => probe_mirror(source, url),
+        Source::Mirror { url, .. } => probe_mirror(&probe_agent(), source, url, payload),
     }
 }
 
@@ -377,53 +422,100 @@ fn probe_primary(source: &Source, repo: &str, token: Option<&str>) -> Probe {
     p
 }
 
-fn probe_mirror(source: &Source, url: &str) -> Probe {
-    let agent = probe_agent();
+/// A mirror, measured through the layout a mirror actually serves (see this module's doc): its
+/// payload manifest, then a ranged read of the biggest blob that document names.
+///
+/// NOTHING READ HERE IS VERIFIED, and nothing may come to depend on that changing. There is no
+/// signature check on this manifest — the install path fetches and verifies its own copy
+/// (`engine::manifest_of` -> `trust::accept`) before an installed byte rests on it — so the only
+/// things taken from it are a hash, handed straight back as a URL, and a size, used only to decide
+/// which blob to time. Every read stays bounded whatever the document claims: `MAX_DOC_BYTES` for
+/// the manifest, `PROBE_BYTES` for the range, `PROBE_BUDGET` for the clock. A hostile mirror can
+/// spend this probe's few seconds and mislead its own ranking, which is all a source can ever do.
+///
+/// The `agent` is a parameter for the same reason `Mirror`'s tests build their own: `probe_agent()`
+/// is https-only and a loopback listener cannot speak TLS, so the end-to-end tests below could not
+/// otherwise reach this at all. Production has exactly one caller and it passes `probe_agent()`.
+fn probe_mirror(
+    agent: &ureq::Agent,
+    source: &Source,
+    url: &str,
+    payload: Option<Payload>,
+) -> Probe {
     let mut p = Probe::blank(source);
-
-    // 1. the index — proves it is a mirror at all, and yields the assets to time against.
-    let started = Instant::now();
-    let index_url = format!("{url}/releases.json");
-    let resp = match transport::fetch(&agent, &index_url, |req, _same_origin| req.set("User-Agent", UA)) {
-        Ok(r) => r,
-        Err(e) => return Probe::failed(source, format!("releases.json: {}", short_fetch(e))),
+    // A repo this build cannot name has no `<base>/<payload>/` to look under — `cmd::candidates`
+    // drops mirrors from the download chain for the same reason, so there is nothing here worth
+    // measuring: a number for a source that could never be used is worse than no number.
+    let Some(payload) = payload else {
+        return Probe::failed(source, "this build cannot name the payload for that repo");
     };
-    // Through `read_all`'s ceiling, NOT `into_json`: ureq bounds `into_string` but not
-    // `into_json`, which hands the whole body to serde as a stream — so an endless
-    // `releases.json` from a host we have not authenticated would run the process out of memory
-    // before the probe ever judged it. This is the least trusted input the launcher reads.
-    let releases: Vec<Release> = match read_all(resp).and_then(|b| Ok(serde_json::from_slice(&b)?)) {
-        Ok(v) => v,
-        Err(e) => return Probe::failed(source, format!("releases.json is not readable: {e}")),
+
+    // 1. the manifest — the one document a mirror must serve for a payload, so an answer here is
+    //    what proves the host is a mirror of it at all (the role `releases.json` used to play).
+    //    It is also the only way to address a blob: there is no index, and no listable directory.
+    let started = Instant::now();
+    let manifest_url = doc_url(url, payload.id(), crate::engine::MANIFEST_ASSET);
+    let resp = match transport::fetch(agent, &manifest_url, |req, _same_origin| {
+        req.set("User-Agent", UA)
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            let why = format!("{}: {}", crate::engine::MANIFEST_ASSET, short_fetch(e));
+            return Probe::failed(source, why);
+        }
+    };
+    // Bounded through `read_all`, NOT `into_json`: ureq bounds `into_string` but not `into_json`,
+    // which hands the whole body to serde as a stream — so an endless `manifest.json` from a host
+    // we have not authenticated would run the process out of memory before the probe ever judged
+    // it. This is the least trusted input the launcher reads.
+    //
+    // The ceiling is the one this SAME document is read under on the install path
+    // (`Mirror::manifest_bytes`), not `mirrors.json`'s: a payload manifest is a genuinely large
+    // document — the base game's is ~4.6k entries of ~200 bytes (see `trust::MAX_DOC_BYTES`) —
+    // and a megabyte would start reporting a healthy game mirror as unreadable as that grew.
+    let doc = match read_all(resp, crate::trust::MAX_DOC_BYTES) {
+        Ok(b) => b,
+        Err(e) => return Probe::failed(source, format!("{}: {e}", crate::engine::MANIFEST_ASSET)),
+    };
+    // The strict reader, not a private permissive one: a second parser over the least trusted
+    // document in the system is exactly the thing that drifts, and a document this one refuses is
+    // a document the installer would refuse too.
+    let manifest = match Manifest::parse(&doc) {
+        Ok(m) => m,
+        Err(e) => {
+            let why = format!("{} is not readable: {e:#}", crate::engine::MANIFEST_ASSET);
+            return Probe::failed(source, why);
+        }
     };
     p.latency_ms = Some(started.elapsed().as_millis() as u64);
+    p.tag = Some(tag_of(&manifest.version));
 
-    let Some(release) = releases.iter().find(|r| r.is_published()) else {
-        p.error = Some("no published release is advertised".to_string());
+    let Some(sha256) = probe_blob(&manifest) else {
+        p.error = Some("the release carries no blob to test".to_string());
         return p;
     };
-    p.tag = Some(release.tag_name.clone());
+    // 12 hex digits, the short form `manifest.rs`'s own validator prints: a 64-character name in a
+    // settings row is noise. `probe_blob` returned it only after `is_content_hash`, so the slice
+    // cannot land inside a character.
+    let label = format!("blob {}", &sha256[..12]);
 
-    let Some(asset) = probe_asset(release) else {
-        p.error = Some("the release carries no asset to test".to_string());
-        return p;
-    };
-
-    // 2. a real transfer. Ranged so the cost is bounded on the mirror's side too, and so the
-    //    answer doubles as a resume-support check. `asset.browser_download_url` is itself content
-    //    the mirror's `releases.json` named — see `transport`'s module doc for why that URL, and
-    //    every redirect it might send back, goes through the same guarded fetch as the index did.
-    let resp = match transport::fetch(&agent, &asset.browser_download_url, |req, _same_origin| {
+    // 2. a real transfer. Ranged so the cost is bounded on the mirror's side too, and so the answer
+    //    doubles as a resume-support check. The URL is DERIVED from the hash, never a URL the
+    //    document named — a content-addressed mirror advertises none, which is one attacker-chosen
+    //    string fewer than the old release-index probe had to handle. What it does still choose is
+    //    every `Location` it answers with, which is why this goes through the same guarded fetch as
+    //    the manifest did — see `transport`'s module doc.
+    let resp = match transport::fetch(agent, &blob_url(url, payload.id(), sha256), |req, _so| {
         req.set("User-Agent", UA).set("Range", &format!("bytes=0-{}", PROBE_BYTES - 1))
     }) {
         Ok(r) => r,
         Err(e) => {
-            p.error = Some(format!("{}: {}", asset.name, short_fetch(e)));
+            p.error = Some(format!("{label}: {}", short_fetch(e)));
             return p;
         }
     };
     p.range_ok = resp.status() == 206;
-    time_read(&mut p, resp.into_reader(), &asset.name);
+    time_read(&mut p, resp.into_reader(), &label);
     p
 }
 
@@ -473,7 +565,41 @@ fn time_read(p: &mut Probe, mut reader: impl Read, asset: &str) {
     }
 }
 
-/// The asset to time: the BIGGEST one that is not release metadata.
+/// The blob to time: the BIGGEST one the mirror could actually be asked for.
+///
+/// Size is what makes the measurement honest, exactly as in `probe_asset` below — a release carries
+/// hundreds of small loose game files, and a throttled path serves a 2 KB file flawlessly, so
+/// picking arbitrarily would let the very link this module exists to catch report itself healthy.
+///
+/// `probe_asset`'s name-based exclusions (`mirrors.json`, `manifest.json`, `*.sha256`) have no
+/// analogue here and need none. They exist because GitHub's release index lists the release
+/// DOCUMENTS alongside the payload's assets; a manifest lists no such thing — it describes payload
+/// content only, and the documents live at the payload root, a different URL space from `blobs/`.
+///
+/// What replaces them is a ROUTE rule, because not every entry in the document HAS a blob.
+/// `install::build_acqs` is the authority on the three routes, and only two of them ever cross the
+/// wire: a bundle (addressed by `psha256`, `psize` bytes packed) and an entry carrying a `name`.
+/// An entry with no `name` is carried inside a bundle and a zero-size one is materialized locally,
+/// so neither has a blob of its own — timing one would 404 against a perfectly healthy mirror and
+/// rank it dead, which is precisely the misjudgement the metadata exclusions were written to avoid.
+fn probe_blob(m: &Manifest) -> Option<&str> {
+    let bundles = m.bundles.iter().map(|b| (b.psha256.as_str(), b.psize));
+    let named = m
+        .payload_entries()
+        .filter(|(name, _, size)| name.is_some() && *size > 0)
+        .map(|(_, sha256, size)| (sha256, size));
+    bundles
+        .chain(named)
+        // Stated where the URL is built, not left resting on `Manifest::parse` having checked it a
+        // module away: the hash's FORM is what decides which of two URL shapes a name resolves to
+        // (`Mirror::url_of`), so anything that is not one would be reached for as a DOCUMENT.
+        .filter(|(sha256, _)| is_content_hash(sha256))
+        .max_by_key(|&(_, size)| size)
+        .map(|(sha256, _)| sha256)
+}
+
+/// The asset to time on GITHUB, whose release index is a real index: the BIGGEST one that is not
+/// release metadata.
 ///
 /// Size is what makes the measurement honest. A release carries hundreds of small loose game
 /// files, and a throttled path serves a 2 KB file flawlessly — so picking arbitrarily would let
@@ -504,6 +630,41 @@ fn short(e: ureq::Error) -> String {
         ureq::Error::Status(code, _) => format!("HTTP {code}"),
         ureq::Error::Transport(t) => t.kind().to_string(),
     }
+}
+
+// ---- the layout, shared by the probe and the download backend ----
+
+/// A release DOCUMENT beside the payload: `<base>/<payload>/<name>`.
+///
+/// A free function rather than a `Mirror` method because the PROBE builds the same URLs without a
+/// `Mirror`: the two need different agents (a probe fails fast, a download waits out a slow link —
+/// see `CONNECT_TIMEOUT` against `DL_CONNECT_TIMEOUT`), and that is the whole of the difference.
+/// Two places formatting these paths by hand is how a layout change ships half-applied — measuring
+/// one address while installing from another.
+fn doc_url(base: &str, payload: &str, name: &str) -> String {
+    format!("{}/{payload}/{name}", base.trim_end_matches('/'))
+}
+
+/// A payload entry's bytes: `<base>/<payload>/blobs/<sha256>` — no extension, because the name IS
+/// the hash and an extension would be a second, unsigned claim about the content.
+fn blob_url(base: &str, payload: &str, sha256: &str) -> String {
+    format!("{}/{payload}/blobs/{sha256}", base.trim_end_matches('/'))
+}
+
+/// 64 lowercase hex — the one shape a payload entry's `sha256` may take. The authority on the rule
+/// is `manifest::Manifest::validate_hashes`, which REFUSES a manifest that breaks it; this is the
+/// same test applied to decide which of two URL shapes a name belongs to.
+fn is_content_hash(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The tag a mirror's release is NAMED by.
+///
+/// A mirror publishes no release index and no tag directory (see `Mirror`'s doc), so a release has
+/// exactly one name there: the `version` its manifest carries. Shared with `fetch_release` so a
+/// mirror cannot appear to advertise one release to the settings pane and another to the installer.
+fn tag_of(version: &str) -> String {
+    format!("v{version}")
 }
 
 // ---- the download backend ----
@@ -557,7 +718,7 @@ pub struct Mirror {
 }
 
 impl Mirror {
-    pub fn new(base: &str, payload: crate::trust::Payload) -> Self {
+    pub fn new(base: &str, payload: Payload) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
             payload: payload.id(),
@@ -566,15 +727,12 @@ impl Mirror {
         }
     }
 
-    /// A release DOCUMENT beside the payload: `<base>/<payload>/<name>`.
     fn doc_url(&self, name: &str) -> String {
-        format!("{}/{}/{name}", self.base, self.payload)
+        doc_url(&self.base, self.payload, name)
     }
 
-    /// A payload entry's bytes: `<base>/<payload>/blobs/<sha256>` — no extension, because the name
-    /// IS the hash and an extension would be a second, unsigned claim about the content.
     fn blob_url(&self, sha256: &str) -> String {
-        format!("{}/{}/blobs/{sha256}", self.base, self.payload)
+        blob_url(&self.base, self.payload, sha256)
     }
 
     /// Where an `Asset` this backend is handed actually lives.
@@ -644,13 +802,6 @@ fn download_agent() -> ureq::Agent {
         .build()
 }
 
-/// 64 lowercase hex — the one shape a payload entry's `sha256` may take. The authority on the rule
-/// is `manifest::Manifest::validate_hashes`, which REFUSES a manifest that breaks it; this is the
-/// same test applied to decide which of two URL shapes a name belongs to.
-fn is_content_hash(name: &str) -> bool {
-    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-}
-
 /// A mirror's fetch failure as an anyhow chain rooted at a typed `NetKind`.
 ///
 /// Rooting it is load-bearing twice over: source failover advances on `NetKind::Transport`, and
@@ -696,7 +847,7 @@ impl Downloader for Mirror {
             .ok()
             .and_then(|v| v.get("version")?.as_str().map(str::to_string))
             .context("the mirror's manifest.json names no version")?;
-        let tag_name = format!("v{version}");
+        let tag_name = tag_of(&version);
         if let Some(want) = tag {
             if want != tag_name {
                 // A refusal about THIS source, not about the release: rooted at a status so the
@@ -919,6 +1070,188 @@ mod tests {
         let err = transport::fetch(&agent, &url, |req, _same_origin| req)
             .expect_err("an endless redirect must not be followed forever");
         assert!(matches!(err, FetchError::TooManyRedirects), "expected TooManyRedirects, got {err:?}");
+    }
+
+    // ---- the probe, against the layout a mirror really serves ----
+
+    /// `probe_agent()` minus `https_only`, which a loopback listener cannot satisfy — the same
+    /// swap, for the same reason, as `test_mirror` below. Every other setting is the real one,
+    /// `redirects(0)` included, so `transport::fetch` still drives the chain.
+    fn test_agent() -> ureq::Agent {
+        ureq::builder()
+            .timeout_connect(CONNECT_TIMEOUT)
+            .timeout_read(IO_TIMEOUT)
+            .timeout_write(IO_TIMEOUT)
+            .redirects(0)
+            .build()
+    }
+
+    /// A manifest as a mirror serves it. Text rather than a hand-built struct so every test below
+    /// goes through the real `Manifest::parse` — bundle invariants included, which is what makes a
+    /// fixture that could not exist in a release fail here instead of quietly proving nothing.
+    fn manifest_doc(files: &str, bundles: &str) -> String {
+        format!(
+            r#"{{"schema":3,"payload_id":"mod","version":"1.4.2","files":[{files}],"bundles":[{bundles}]}}"#
+        )
+    }
+
+    fn leak(path: String) -> &'static str {
+        Box::leak(path.into_boxed_str()) // routes are &'static
+    }
+
+    /// The whole probe over a real socket: the manifest names the blobs, the biggest one is pulled
+    /// ranged, and what comes back is a throughput figure — the only number `rank` sorts on.
+    ///
+    /// The mirror here serves nothing at `releases.json`, which is the point: that document does
+    /// not exist in this layout, and a probe that still asked for it measured every real mirror as
+    /// dead.
+    #[test]
+    fn a_probe_measures_a_content_addressed_mirror() {
+        use crate::test_http::{Canned, TestServer};
+        let (bundle, member, loose) = ("b".repeat(64), "c".repeat(64), "d".repeat(64));
+        let doc = manifest_doc(
+            &format!(
+                r#"{{"name":"notes.txt","dest":"game/notes.txt","sha256":"{loose}","size":24}},
+                   {{"dest":"game/big.vpk","sha256":"{member}","size":65536}}"#
+            ),
+            &format!(
+                r#"{{"name":"payload.phxb","codec":"zstd","psize":40960,
+                     "psha256":"{bundle}","size":65536,"members":["{member}"]}}"#
+            ),
+        );
+        let packed: Vec<u8> = (0..40960u32).map(|i| i as u8).collect();
+        let (bundle_path, loose_path) =
+            (leak(format!("/mod/blobs/{bundle}")), leak(format!("/mod/blobs/{loose}")));
+        let body = packed.clone();
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/mod/manifest.json", Canned::body(doc.into_bytes()));
+            routes.insert(bundle_path, Canned::body(body));
+            routes.insert(loose_path, Canned::body(b"twenty-four bytes, here.".to_vec()));
+            routes
+        });
+
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let source = mirror(&base, false);
+        let p = probe_mirror(&test_agent(), &source, &base, Some(Payload::Mod));
+
+        assert!(p.error.is_none(), "a healthy mirror must not report one: {:?}", p.error);
+        assert!(p.healthy());
+        assert!(p.bytes_per_sec.is_some(), "throughput is the measurement, not latency");
+        assert!(p.latency_ms.is_some());
+        // named by the manifest it serves, exactly as the download backend names it
+        assert_eq!(p.tag.as_deref(), Some("v1.4.2"));
+        // asked for a bounded chunk and got a 206 — the answer a resume across a dropped
+        // connection depends on, and the reason the request is `bytes=0-N` and not `bytes=0-`
+        assert_eq!(
+            server.saw_range(bundle_path).as_deref(),
+            Some(format!("bytes=0-{}", PROBE_BYTES - 1).as_str())
+        );
+        assert!(p.range_ok);
+        assert_eq!(server.hits(bundle_path), 1);
+        assert_eq!(server.hits("/mod/releases.json"), 0, "no release index exists to ask for");
+    }
+
+    /// SIZE, over a real transfer: the 24-byte file is the one a throttled link would serve
+    /// flawlessly, so a probe that picked it would paint the broken source green. It is not merely
+    /// unranked — it is never requested at all.
+    #[test]
+    fn the_probe_never_times_a_small_file_when_a_large_one_exists() {
+        use crate::test_http::{Canned, TestServer};
+        let (bundle, member, loose) = ("b".repeat(64), "c".repeat(64), "d".repeat(64));
+        let doc = manifest_doc(
+            &format!(
+                r#"{{"name":"notes.txt","dest":"game/notes.txt","sha256":"{loose}","size":24}},
+                   {{"dest":"game/big.vpk","sha256":"{member}","size":65536}}"#
+            ),
+            &format!(
+                r#"{{"name":"payload.phxb","codec":"zstd","psize":40960,
+                     "psha256":"{bundle}","size":65536,"members":["{member}"]}}"#
+            ),
+        );
+        let (bundle_path, loose_path) =
+            (leak(format!("/mod/blobs/{bundle}")), leak(format!("/mod/blobs/{loose}")));
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/mod/manifest.json", Canned::body(doc.into_bytes()));
+            routes.insert(bundle_path, Canned::body(vec![7u8; 40960]));
+            routes.insert(loose_path, Canned::body(b"twenty-four bytes, here.".to_vec()));
+            routes
+        });
+
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let p = probe_mirror(&test_agent(), &mirror(&base, false), &base, Some(Payload::Mod));
+        assert!(p.healthy());
+        assert_eq!(server.hits(loose_path), 0, "the small file must never be the measurement");
+        assert_eq!(server.hits(bundle_path), 1);
+    }
+
+    /// Which entry can be timed at all, decided the way `install::build_acqs` decides what to
+    /// download. The trap this pins: the BIGGEST thing in the document above is the 64 KiB member,
+    /// and it has no blob of its own — its bytes exist only inside the bundle — so choosing on size
+    /// alone would 404 against a mirror serving exactly what it should, and rank it dead.
+    #[test]
+    fn the_probe_picks_the_biggest_entry_that_has_a_blob_of_its_own() {
+        let (bundle, member, loose) = ("b".repeat(64), "c".repeat(64), "d".repeat(64));
+        let bundled = manifest_doc(
+            &format!(
+                r#"{{"name":"notes.txt","dest":"game/notes.txt","sha256":"{loose}","size":24}},
+                   {{"dest":"game/big.vpk","sha256":"{member}","size":65536}}"#
+            ),
+            &format!(
+                r#"{{"name":"payload.phxb","codec":"zstd","psize":40960,
+                     "psha256":"{bundle}","size":65536,"members":["{member}"]}}"#
+            ),
+        );
+        let m = Manifest::parse(bundled.as_bytes()).expect("a valid schema-3 manifest");
+        assert_eq!(probe_blob(&m), Some(bundle.as_str()));
+
+        // no bundles (a schema-2-shaped release): every entry names an asset, so the biggest of
+        // those is both the honest choice and a fetchable one
+        let loose_only = manifest_doc(
+            &format!(
+                r#"{{"name":"big.vpk","dest":"game/big.vpk","sha256":"{member}","size":9999}},
+                   {{"name":"notes.txt","dest":"game/notes.txt","sha256":"{loose}","size":24}}"#
+            ),
+            "",
+        );
+        let m = Manifest::parse(loose_only.as_bytes()).expect("a valid bundle-less manifest");
+        assert_eq!(probe_blob(&m), Some(member.as_str()));
+
+        // a zero-size entry is materialized locally and stored nowhere, so there is nothing to
+        // time — reported as "no blob", never as a request for a blob that cannot exist
+        let empty_only = manifest_doc(
+            &format!(r#"{{"name":"marker","dest":"game/marker","sha256":"{loose}","size":0}}"#),
+            "",
+        );
+        let m = Manifest::parse(empty_only.as_bytes()).expect("a valid empty-entry manifest");
+        assert_eq!(probe_blob(&m), None);
+    }
+
+    /// No manifest, no mirror. Answering that document is what proves a host serves this payload —
+    /// the role `releases.json` played — so a host that cannot is reported as failed, with nothing
+    /// measured for the ranking to mistake for a result.
+    #[test]
+    fn a_host_that_serves_no_manifest_fails_the_probe() {
+        use crate::test_http::TestServer;
+        let server = TestServer::start(|_port| std::collections::HashMap::new()); // 404s everything
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let p = probe_mirror(&test_agent(), &mirror(&base, false), &base, Some(Payload::Mod));
+        assert!(!p.healthy());
+        assert!(p.bytes_per_sec.is_none() && p.latency_ms.is_none() && p.tag.is_none());
+        let why = p.error.expect("a failed probe must say why");
+        assert!(why.contains("manifest.json") && why.contains("404"), "unhelpful reason: {why}");
+    }
+
+    /// A repo this build cannot name has no `<base>/<payload>/` to look under, so there is no
+    /// measurement to take — and the probe must not fall back to some other payload's directory,
+    /// which would rank a source on a transfer the installer would never repeat.
+    #[test]
+    fn a_repo_with_no_payload_directory_is_refused_rather_than_guessed() {
+        let source = mirror("https://mirror.example", false);
+        let p = probe_mirror(&test_agent(), &source, "https://mirror.example", None);
+        assert!(!p.healthy());
+        assert!(p.error.is_some());
     }
 
     // ---- the download backend ----
