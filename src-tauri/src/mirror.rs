@@ -339,10 +339,9 @@ fn probe_agent() -> ureq::Agent {
         // runs again every time). The probe DERIVES every URL it starts from (`doc_url`/`blob_url`,
         // see `probe_mirror` below), but a mirror still chooses every `Location` it answers with —
         // so a hostile or compromised one can point the next hop at `http://`, `file://`, or a
-        // `\\host\share` UNC path. The last one is the one that matters
-        // most: Windows treats that shape as an implicit SMB target, and touching it is enough to
-        // leak this machine's NTLMv2 hash to whatever server answers, before a single byte of
-        // content is read.
+        // `\\host\share` UNC path. The last one is the one that matters most: Windows treats that
+        // shape as an implicit SMB target, and touching it is enough to leak this machine's NTLMv2
+        // hash to whatever server answers, before a single byte of content is read.
         .https_only(true)
         .build()
 }
@@ -505,7 +504,8 @@ fn probe_mirror(
     //    string fewer than the old release-index probe had to handle. What it does still choose is
     //    every `Location` it answers with, which is why this goes through the same guarded fetch as
     //    the manifest did — see `transport`'s module doc.
-    let resp = match transport::fetch(agent, &blob_url(url, payload.id(), sha256), |req, _so| {
+    let blob = blob_url(url, payload.id(), sha256);
+    let resp = match transport::fetch(agent, &blob, |req, _same_origin| {
         req.set("User-Agent", UA).set("Range", &format!("bytes=0-{}", PROBE_BYTES - 1))
     }) {
         Ok(r) => r,
