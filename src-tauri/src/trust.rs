@@ -134,9 +134,11 @@ impl std::fmt::Display for TrustError {
             }
             Self::BadSignature => write!(f, "the signature does not match the file"),
             Self::BadComment => write!(f, "the signature's trusted comment has been tampered with"),
+            // "document", not "manifest": the mirror list is neither, and these two refusals are
+            // the ones it shares with a manifest (see `accept_ident`).
             Self::WrongPayload { expected, found } => match found {
-                Some(got) => write!(f, "this is a {got:?} manifest, but {expected:?} was asked for"),
-                None => write!(f, "the manifest does not say which payload it is ({expected:?} was asked for)"),
+                Some(got) => write!(f, "this is a {got:?} document, but {expected:?} was asked for"),
+                None => write!(f, "the document does not say which payload it is ({expected:?} was asked for)"),
             },
             Self::StaleSerial { payload, found, floor } => match found {
                 Some(n) => write!(
@@ -144,7 +146,7 @@ impl std::fmt::Display for TrustError {
                     "this {payload} release is serial {n}, older than {floor}, which this machine \
                      has already accepted"
                 ),
-                None => write!(f, "this {payload} manifest carries no serial, so it cannot be shown to be current"),
+                None => write!(f, "this {payload} document carries no serial, so it cannot be shown to be current"),
             },
         }
     }
@@ -154,9 +156,12 @@ impl std::error::Error for TrustError {}
 
 /// Which signed payload a document is expected to describe.
 ///
-/// The format also defines `"mirrors"` for the published mirror list. There is deliberately no
-/// variant for it: nothing here reads one yet (that is the mirror phase's job), and an enum arm
-/// no code can produce is a claim this module does not back.
+/// NOT every one of these is a manifest, and `Mirrors` is why this enum is not named after one. The
+/// published mirror list is its own small format — `format`, not `schema`, with no files and no
+/// bundles (`phoenix-mirror-registry/generate_mirror_list.py` is the whole of it) — and what makes
+/// it a payload HERE is only that it is sealed by the same key and ordered by the same per-payload
+/// serial, which is exactly what `verify` and `accept_ident` are asked about. Nothing else in the
+/// format is shared, and nothing here needs it to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Payload {
     /// The dist repo — the shim and its game files.
@@ -165,15 +170,25 @@ pub enum Payload {
     Launcher,
     /// The base game.
     Game,
+    /// The published list of download mirrors. It installs nothing; what it changes is where every
+    /// FUTURE install comes from, and the launcher persists it — so a hostile answer is not a bad
+    /// download, it is a permanent rewrite of this machine's sources. That is the whole reason it
+    /// is signed and ratcheted like a payload. Read by `mirror::refresh` and nothing else.
+    Mirrors,
 }
 
 impl Payload {
-    /// The string a manifest's `payload_id` must carry to be this payload.
+    /// The string a signed document's `payload_id` must carry to be this payload.
+    ///
+    /// These are WIRE values shared with every producer (release-tooling's `PAYLOAD_IDS`, and the
+    /// mirror registry's `PAYLOAD_ID`); a typo here is not a bug that shows up as a bug, it is
+    /// every document of that kind quietly becoming unreadable.
     pub fn id(self) -> &'static str {
         match self {
             Self::Mod => "mod",
             Self::Launcher => "launcher",
             Self::Game => "game",
+            Self::Mirrors => "mirrors",
         }
     }
 
@@ -233,15 +248,33 @@ pub fn verify(data: &[u8], minisig: &str) -> Result<KeyId, TrustError> {
 /// establishes that we produced the bytes, this establishes that they are the bytes we wanted.
 /// Both have to pass, and neither implies the other.
 pub fn accept(payload: Payload, manifest: &Manifest, floor: u64) -> Result<u64, TrustError> {
-    if manifest.payload_id.as_deref() != Some(payload.id()) {
+    accept_ident(payload, manifest.payload_id.as_deref(), manifest.serial, floor)
+}
+
+/// `accept` over the two fields it actually reads, for a signed document that is NOT a manifest.
+///
+/// The mirror list is the caller (`mirror::signed`): a different format that shares none of a
+/// manifest's shape and all of its identity-and-freshness question. One function rather than two,
+/// so "a document must name its payload, and must not be older than this machine has already
+/// accepted" has exactly one implementation — a second copy would be free to disagree about the
+/// case that decides everything, which is the one where a field is ABSENT. Both `None`s below are
+/// refusals, and a reader that spelled either of them as a default would accept an unidentified or
+/// unorderable document as current.
+pub fn accept_ident(
+    payload: Payload,
+    payload_id: Option<&str>,
+    serial: Option<u64>,
+    floor: u64,
+) -> Result<u64, TrustError> {
+    if payload_id != Some(payload.id()) {
         return Err(TrustError::WrongPayload {
             expected: payload.id(),
-            found: manifest.payload_id.clone(),
+            found: payload_id.map(str::to_string),
         });
     }
     // `>=`, not `>`: the same release re-fetched (every check does exactly that) is the common
     // case, and refusing it would make the second check of any release fail.
-    match manifest.serial {
+    match serial {
         Some(n) if n >= floor => Ok(n),
         found => Err(TrustError::StaleSerial { payload: payload.id(), found, floor }),
     }
