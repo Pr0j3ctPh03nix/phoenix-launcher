@@ -191,19 +191,36 @@ jobs:
           # Same key as the mod and the game: PINNED in the launcher is ONE ring for every payload,
           # not one key per payload_id, so anything else is refused by every client.
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
+          # Minted per run and scoped to this repository — exactly the access needed to read its own
+          # releases for the serial below, and nothing else.
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          # 2,000,000 + the build counter — see release-tooling's manifest_schema.SERIAL_FLOOR,
-          # which is what actually enforces the floor now (dev/gen_launcher_manifest.py carries no
-          # format knowledge). Rises on every run, including a rebuild of the same tag, which a
-          # version-derived number cannot do.
+          set -euo pipefail
+          # WHICH number comes next is this producer's business, not the release format's: the format
+          # says only that a serial is a u64, and ordering is enforced by the launcher's own
+          # per-payload high-water mark. So the rule lives here rather than in shared tooling, and
+          # the launcher line is free to number differently from the mod's or the game's.
           #
-          # Added HERE rather than in `env:` because GitHub's expression language has no arithmetic
-          # operators at all: adding the offset inside an expression is a workflow PARSE error that
+          # Derived from what is actually PUBLISHED, not counted alongside it. The counter this
+          # replaces was 2,000,000 plus the build counter, which RESETS to 1 the day this file is
+          # renamed — landing under the ratchet every installed client already holds, where the
+          # update simply never appears and nothing reports an error.
+          #
+          # NO SEED PATH: this line already has releases, so failing to read the last serial is
+          # never a reason to start over at 1. Every failure below exits non-zero instead.
+          #
+          # Computed HERE rather than in `env:` because GitHub's expression language has no
+          # arithmetic operators at all: adding inside an expression is a workflow PARSE error that
           # rejects the whole file before any step runs. (Deliberately not spelled with the literal
           # expression syntax even in this comment — see the header: substitution happens before
           # bash sees the script, so an example written out here would itself be evaluated.)
-          serial=$(( 2000000 + GITHUB_RUN_NUMBER ))
+          asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+                    --jq '.assets[] | select(.name == "manifest.json") | .url')
+          [ -n "$asset" ] || { echo "the latest release carries no manifest.json"; exit 1; }
+          prev=$(gh api "$asset" -H "Accept: application/octet-stream" --jq '.serial')
+          case "$prev" in ''|*[!0-9]*) echo "published serial is not a number: '$prev'"; exit 1 ;; esac
+          serial=$(( prev + 1 ))
+          echo "published serial $prev -> this run publishes $serial"
           # No secret check here: seal refuses an unset key by itself, with the reason, and a
           # second copy of that rule is a second place for it to go stale.
           out=src-tauri/target/release
@@ -217,7 +234,9 @@ jobs:
           [ -f release_body.md ] && notes=(--notes-file release_body.md)
           # This repo's own discovery step (dev/): hashes the exe and builds ONE files[] entry
           # through release-tooling's build_manifest.py, which owns every format rule (schema,
-          # serial floor, envelope shape). This script only ever knows "hash an exe, name it".
+          # envelope shape, what a serial may BE). Which serial comes next is decided above, here,
+          # because that is a publishing decision rather than a format one. This script only ever
+          # knows "hash an exe, name it".
           python dev/gen_launcher_manifest.py \
             --version  "$TAG" \
             --serial   "$serial" \
