@@ -1149,7 +1149,8 @@ mod tests {
         );
         assert!(p.range_ok);
         assert_eq!(server.hits(bundle_path), 1);
-        assert_eq!(server.hits("/mod/releases.json"), 0, "no release index exists to ask for");
+        // the exact path the probe used to ask for, and the reason this test exists
+        assert_eq!(server.hits("/releases.json"), 0, "no release index exists to ask for");
     }
 
     /// SIZE, over a real transfer: the 24-byte file is the one a throttled link would serve
