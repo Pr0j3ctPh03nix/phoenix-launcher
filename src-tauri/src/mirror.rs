@@ -15,6 +15,7 @@
 //! asset and timing it, and the number that matters is throughput, not latency.
 
 use std::io::Read;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -1074,13 +1075,19 @@ pub struct Mirror {
     /// The payload directory: `trust::Payload::id()`.
     payload: &'static str,
     agent: ureq::Agent,
-    /// The `manifest.json` bytes `fetch_release` read to learn the version, kept so the immediately
-    /// following `manifest_of` download is not a second transfer of the same document.
-    ///
-    /// More than a saving: it is what makes the reported `tag_name` HONEST. The tag is derived from
-    /// this document, and this document is the one that then gets signature-checked and parsed — so
-    /// there is no window in which a mirror could name one release and serve another.
-    manifest: std::sync::Mutex<Option<Vec<u8>>>,
+    /// The VERIFIED document pair, fetched once and kept — see `documents`.
+    docs: std::sync::Mutex<Option<Arc<Documents>>>,
+}
+
+/// A mirror's release, as the two documents it consists of: the payload manifest and its detached
+/// signature.
+///
+/// Only ever produced by `Mirror::documents`, which verifies before it returns — so holding one of
+/// these IS the statement that these bytes carry a signature by a key we pinned. That is why the
+/// fields are private to this file and there is no constructor beside it.
+struct Documents {
+    manifest: Vec<u8>,
+    sig: String,
 }
 
 impl Mirror {
@@ -1098,12 +1105,17 @@ impl Mirror {
             base: base.trim_end_matches('/').to_string(),
             payload: payload.id(),
             agent,
-            manifest: std::sync::Mutex::new(None),
+            docs: std::sync::Mutex::new(None),
         }
     }
 
     fn doc_url(&self, name: &str) -> String {
         doc_url(&self.base, self.payload, name)
+    }
+
+    /// The name of the detached signature published beside the payload manifest.
+    fn sig_name() -> String {
+        format!("{}{}", crate::engine::MANIFEST_ASSET, crate::trust::SIG_SUFFIX)
     }
 
     fn blob_url(&self, sha256: &str) -> String {
@@ -1139,28 +1151,56 @@ impl Mirror {
         .map_err(net_err_fetch)
     }
 
-    /// The payload's manifest bytes, fetched once and remembered — see the `manifest` field.
-    fn manifest_bytes(&self) -> Result<Vec<u8>> {
-        if let Some(b) = self.manifest.lock().unwrap().as_ref() {
-            return Ok(b.clone());
-        }
+    /// One bounded document from the payload root.
+    ///
+    /// `take(max + 1)` rather than trusting Content-Length, exactly as github.rs does: the length
+    /// header is the peer's claim, and a host that intends to exhaust this process's memory is not
+    /// going to declare it.
+    fn read_doc(&self, name: &str, max: u64) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        // `take(max + 1)` rather than trusting Content-Length, exactly as github.rs does: the
-        // length header is the peer's claim, and a host that intends to exhaust this process's
-        // memory is not going to declare it.
-        self.get(&self.doc_url(crate::engine::MANIFEST_ASSET), None)?
+        self.get(&self.doc_url(name), None)?
             .into_reader()
-            .take(crate::trust::MAX_DOC_BYTES + 1)
+            .take(max + 1)
             .read_to_end(&mut buf)?;
-        if buf.len() as u64 > crate::trust::MAX_DOC_BYTES {
-            anyhow::bail!(
-                "{} is larger than the {} bytes allowed for it",
-                crate::engine::MANIFEST_ASSET,
-                crate::trust::MAX_DOC_BYTES
-            );
+        if buf.len() as u64 > max {
+            anyhow::bail!("{name} is larger than the {max} bytes allowed for it");
         }
-        *self.manifest.lock().unwrap() = Some(buf.clone());
         Ok(buf)
+    }
+
+    /// The payload's manifest and its detached signature, fetched once, VERIFIED before either is
+    /// looked at, and remembered.
+    ///
+    /// The check happens HERE, not in `fetch_release`, because this is where the bytes first exist:
+    /// `fetch_release` reads `version` out of the document to name the release, and reading
+    /// anything at all out of an unauthenticated document is the thing signing exists to stop. It
+    /// used to pull `version` out with a `serde_json::Value` before a single check had run, on the
+    /// least trusted input the launcher reads.
+    ///
+    /// It is also the only place that can cache the verified PAIR, which is what makes the tag this
+    /// backend reports and the manifest the installer later verifies provably the same bytes — and
+    /// what removes a second wire fetch of the signature as a side effect.
+    ///
+    /// Signature only, deliberately NOT `trust::accept`: the serial floor is a `Settings` value and
+    /// a `Mirror` has no settings. That split is right — "we produced these bytes" is a fact about
+    /// the document, and "this is the release you asked for, and it is not one we have already
+    /// moved past" is a fact about this machine. `engine::manifest_of` asks the second one, over
+    /// the very bytes this returns, and re-asks the first: one Ed25519 check over a ≤16 MiB
+    /// document is microseconds to a few milliseconds, and a backend that could tell the trust gate
+    /// to skip itself is exactly the seam an attacker wants. The double check is the cheaper of the
+    /// two options.
+    fn documents(&self) -> Result<Arc<Documents>> {
+        if let Some(d) = self.docs.lock().unwrap().as_ref() {
+            return Ok(d.clone());
+        }
+        let manifest = self.read_doc(crate::engine::MANIFEST_ASSET, crate::trust::MAX_DOC_BYTES)?;
+        let sig = sig_text(self.read_doc(&Self::sig_name(), crate::trust::MAX_SIG_BYTES)?)?;
+        crate::trust::verify(&manifest, &sig).map_err(anyhow::Error::new).with_context(|| {
+            format!("verifying the mirror's {}", crate::engine::MANIFEST_ASSET)
+        })?;
+        let docs = Arc::new(Documents { manifest, sig });
+        *self.docs.lock().unwrap() = Some(docs.clone());
+        Ok(docs)
     }
 }
 
@@ -1217,22 +1257,23 @@ impl Downloader for Mirror {
     /// UI showed me" gets a truthful answer from a mirror that has since moved on, rather than
     /// quietly installing a different one.
     fn fetch_release(&self, _repo: &str, tag: Option<&str>) -> Result<Release> {
-        let bytes = self.manifest_bytes()?;
-        let version = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|v| v.get("version")?.as_str().map(str::to_string))
-            .context("the mirror's manifest.json names no version")?;
+        let docs = self.documents()?;
+        // `Manifest::parse`, the STRICT reader, over bytes `documents` has already verified. The
+        // ad-hoc `serde_json::Value` read this replaces did neither: it ran a parser over an
+        // unauthenticated document, and it was a second, permissive reader of the one format that
+        // most needs exactly one. A document this reader refuses is a document the installer would
+        // refuse too, so refusing it here is the earlier half of the same answer.
+        let version = Manifest::parse(&docs.manifest)?.version;
         let tag_name = tag_of(&version);
         if let Some(want) = tag {
             if want != tag_name {
                 // A refusal about THIS source, not about the release: rooted at a status so the
-                // chain falls through to one that does serve it.
+                // walk falls through to one that does serve it.
                 return Err(anyhow::Error::new(NetKind::Status(404)).context(format!(
                     "the mirror serves {tag_name}, not {want}"
                 )));
             }
         }
-        let sig = format!("{}{}", crate::engine::MANIFEST_ASSET, crate::trust::SIG_SUFFIX);
         let doc = |name: &str, size: u64| Asset {
             name: name.to_string(),
             // Both empty, and never read: `url_of` derives every URL from the name. An asset this
@@ -1243,7 +1284,10 @@ impl Downloader for Mirror {
         };
         Ok(Release {
             tag_name,
-            assets: vec![doc(crate::engine::MANIFEST_ASSET, bytes.len() as u64), doc(&sig, 0)],
+            assets: vec![
+                doc(crate::engine::MANIFEST_ASSET, docs.manifest.len() as u64),
+                doc(&Self::sig_name(), docs.sig.len() as u64),
+            ],
             body: None,
             draft: false,
             prerelease: false,
@@ -1270,10 +1314,8 @@ impl Downloader for Mirror {
     /// ceiling is per-entry, not a constant — one number for a 2 KB text file and a multi-hundred-MB
     /// VPK would have to be the larger, which bounds nothing useful for the smaller.
     ///
-    /// The signature document is the one asset `fetch_release` sizes at 0, because its length is
-    /// not known until it is read; nothing reads it through here — the trust gate takes it through
-    /// `download_limited` under `trust::MAX_SIG_BYTES`, which is the bound that IS its caller's
-    /// knowledge — so a `download` of it refusing is the safe direction, not a gap.
+    /// Both release documents are sized by `fetch_release` from the bytes it has already read, so
+    /// this is exact for them too.
     fn download(&self, asset: &Asset) -> Result<Vec<u8>> {
         self.download_limited(asset, asset.size)
     }
@@ -1284,10 +1326,15 @@ impl Downloader for Mirror {
     /// the READ, not describe it afterwards. `download` above is this with the asset's own declared
     /// size as `max`, so the two cannot drift into two ways of reading a body.
     fn download_limited(&self, asset: &Asset, max: u64) -> Result<Vec<u8>> {
-        // The manifest is already in hand and already bounded (MAX_DOC_BYTES) — but the caller's
-        // own ceiling still applies, since it may be tighter than the one it was fetched under.
+        // BOTH release documents are already in hand and already bounded (`documents`) — and they
+        // are the verified pair, so the trust gate downstream is handed exactly the bytes the tag
+        // was read from rather than a second fetch that a host is free to answer differently. The
+        // caller's own ceiling still applies, since it may be tighter than the one they were
+        // fetched under.
         let buf = if asset.name == crate::engine::MANIFEST_ASSET {
-            self.manifest_bytes()?
+            self.documents()?.manifest.clone()
+        } else if asset.name == Self::sig_name() {
+            self.documents()?.sig.clone().into_bytes()
         } else {
             let mut buf = Vec::new();
             self.get(&self.url_of(&asset.name), None)?
@@ -2078,22 +2125,30 @@ mod tests {
         let _ = std::fs::remove_file(&dest);
     }
 
+    /// A mirror serving a payload: its manifest, and the signature beside it.
+    fn payload_server(doc: Vec<u8>, sig: Option<String>) -> crate::test_http::TestServer {
+        use crate::test_http::{Canned, TestServer};
+        TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/mod/manifest.json", Canned::body(doc.clone()));
+            if let Some(s) = sig.clone() {
+                routes.insert("/mod/manifest.json.minisig", Canned::body(s.into_bytes()));
+            }
+            routes
+        })
+    }
+
     /// A mirror has no release index to read a tag out of, so the release it reports is NAMED by
-    /// the manifest it serves — and by the very bytes that are then signature-checked, which is why
-    /// they are fetched once and kept rather than fetched twice. A tag it does not serve is refused
-    /// as a fact about this host (a status), so the chain moves on instead of installing something
-    /// the user never saw.
+    /// the manifest it serves — and by the very bytes that were signature-checked to get there,
+    /// which is why the pair is fetched once and kept rather than fetched twice. A tag it does not
+    /// serve is refused as a fact about this host (a status), so the walk moves on instead of
+    /// installing something the user never saw.
     #[test]
     fn a_mirror_names_its_release_from_the_manifest_it_will_be_verified_by() {
         use crate::downloader::Downloader;
-        use crate::test_http::{Canned, TestServer};
         let doc = br#"{"schema":2,"payload_id":"mod","version":"1.4.2","files":[]}"#.to_vec();
-        let expect = doc.clone();
-        let server = TestServer::start(move |_port| {
-            let mut routes = std::collections::HashMap::new();
-            routes.insert("/mod/manifest.json", Canned::body(expect));
-            routes
-        });
+        let sig = crate::trust::testing::test_sig(&doc);
+        let server = payload_server(doc.clone(), Some(sig.clone()));
         let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
 
         let release = m.fetch_release("ignored/repo", None).expect("the mirror's one release");
@@ -2101,11 +2156,19 @@ mod tests {
         let names: Vec<&str> = release.assets.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(names, ["manifest.json", "manifest.json.minisig"]);
 
-        // the document the trust gate downloads is the same one the tag was read from, and it did
-        // not cross the wire twice
+        // BOTH documents the trust gate downloads are the ones the tag was read from, and neither
+        // crossed the wire twice — which is what makes "the release this backend names" and "the
+        // release the installer verifies" the same bytes rather than two fetches a host is free to
+        // answer differently.
         let asset = release.asset("manifest.json").unwrap();
         assert_eq!(m.download_limited(asset, crate::trust::MAX_DOC_BYTES).unwrap(), doc);
+        let asset = release.asset("manifest.json.minisig").unwrap();
+        assert_eq!(
+            m.download_limited(asset, crate::trust::MAX_SIG_BYTES).unwrap(),
+            sig.into_bytes()
+        );
         assert_eq!(server.hits("/mod/manifest.json"), 1, "the manifest is fetched once");
+        assert_eq!(server.hits("/mod/manifest.json.minisig"), 1, "and so is its signature");
 
         // a tag this mirror does not serve is a refusal ABOUT THIS SOURCE, not about the release
         let err = m.fetch_release("ignored/repo", Some("v9.9.9")).unwrap_err();
@@ -2115,6 +2178,53 @@ mod tests {
         );
         // …and the tag it DOES serve resolves
         assert!(m.fetch_release("ignored/repo", Some("v1.4.2")).is_ok());
+    }
+
+    /// NO UNVERIFIED PARSE REMAINS. `fetch_release` reads `version` out of the manifest to name the
+    /// release; it used to do that with an ad-hoc `serde_json::Value` BEFORE any signature check,
+    /// over the least trusted document in the system. The document below is perfectly well-formed
+    /// JSON and a perfectly valid manifest — the only thing wrong with it is the signature — so a
+    /// reader that parsed first would answer "v1.4.2" and only notice afterwards.
+    ///
+    /// Nothing is cached either: a second call goes back to the wire rather than serving refused
+    /// bytes out of memory, which is what stops one bad answer sticking for the process's life.
+    #[test]
+    fn fetch_release_verifies_before_it_parses() {
+        use crate::downloader::Downloader;
+        let doc = br#"{"schema":2,"payload_id":"mod","version":"1.4.2","files":[]}"#.to_vec();
+        // a real signature over DIFFERENT bytes: the file is well-formed, it simply is not over this
+        let sig = crate::trust::testing::test_sig(b"some other document");
+        let server = payload_server(doc, Some(sig));
+        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+
+        let err = m.fetch_release("ignored/repo", None).unwrap_err();
+        assert!(
+            err.chain().any(|c| c.downcast_ref::<crate::minisig::SigError>().is_some()),
+            "expected the signature refusal, not a parse result: {err:#}"
+        );
+        assert!(
+            !err.chain().any(|c| c.downcast_ref::<serde_json::Error>().is_some()),
+            "the document is valid JSON — a serde error here would mean it was parsed first: {err:#}"
+        );
+
+        assert!(m.fetch_release("ignored/repo", None).is_err());
+        assert_eq!(server.hits("/mod/manifest.json"), 2, "refused bytes must not be remembered");
+    }
+
+    /// A payload with no signature beside it serves no release, and it is refused as a fact about
+    /// THIS HOST (a status) so the walk moves on. "Unsigned" is not a weaker state a backend gets
+    /// to fall back to — deleting one file would otherwise be all it took.
+    #[test]
+    fn a_mirror_that_publishes_no_signature_serves_no_release() {
+        use crate::downloader::Downloader;
+        let doc = br#"{"schema":2,"payload_id":"mod","version":"1.4.2","files":[]}"#.to_vec();
+        let server = payload_server(doc, None);
+        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let err = m.fetch_release("ignored/repo", None).unwrap_err();
+        assert!(
+            err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(404)))),
+            "a missing signature is this host failing to serve the release: {err:#}"
+        );
     }
 
     /// Every failure a mirror reports has to root a `NetKind`: source failover advances on
