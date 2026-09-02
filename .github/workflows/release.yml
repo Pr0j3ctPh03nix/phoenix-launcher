@@ -62,7 +62,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 0e3ad70c6f7cf608ccef833107562b1c771394ad
+          ref: 372fbace82ac673335350b59333ef7299469420d
           path: .tooling
 
       # The version lives in three files and the git tag, and self-update compares the TAG against
@@ -103,8 +103,19 @@ jobs:
       # build bundles. This payload's manifest indexes one loose exe, so nothing on the path
       # gen_launcher_manifest -> build_manifest -> manifest_schema -> seal -> phoenix_minisign
       # imports phxb at all.
+      #
+      # FROM THE PINNED CHECKOUT, NOT FROM AN INDEX. This job holds PHOENIX_SIGNING_KEY and
+      # cryptography is the code that key is handed to, so fetching it by name would leave one
+      # mutable reference in a job where every action is pinned to a commit SHA precisely to have
+      # none. release-tooling vendors the wheel for the interpreter this image ships (windows-2025:
+      # CPython 3.12) and `--no-index` keeps any index out of the run; from here on the job's only
+      # inputs are two git checkouts at pinned SHAs. See .tooling/wheels/README.md.
+      #
+      # "Could not find a version that satisfies the requirement ... (from versions: none)" here
+      # means the release-tooling SHA pinned above predates wheels/, or the image moved to a Python
+      # the vendored wheels do not cover — either way loudly, and before the key is read.
       - name: Install the signer's dependency
-        run: python -m pip install --disable-pip-version-check cryptography
+        run: python -m pip install --disable-pip-version-check --no-index --find-links .tooling/wheels cryptography
 
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
 
