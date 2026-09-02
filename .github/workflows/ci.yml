@@ -44,14 +44,18 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # Not optional here either: src-tauri/build.rs generates trust::PINNED from `.tooling/keys`
-      # and REFUSES to build without it, so both cargo steps below depend on this. Pinned to the
-      # same SHA release.yml uses — the rationale for fetching rather than vendoring, and for a SHA
-      # rather than a branch, is written out there.
+      # and REFUSES to build without it, so both cargo steps below depend on this. The rationale for
+      # fetching rather than vendoring, and for a SHA rather than a branch, is written out in
+      # release.yml.
+      #
+      # THE TWO PINS MOVE TOGETHER, in one commit: this ref decides which `keys/` gets compiled into
+      # the binary this workflow checks, and a check built on a different trust root than the
+      # release is a check of a different binary.
       - name: Fetch release tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 0e3ad70c6f7cf608ccef833107562b1c771394ad
+          ref: 372fbace82ac673335350b59333ef7299469420d
           path: .tooling
 
       # Pinned to the same version release.yml builds with, and for a second reason on top of that
@@ -92,8 +96,10 @@ jobs:
         run: bun dev/check_i18n.js
 
       # The engine's unit tests, including the vendored manifest conformance suite
-      # (src-tauri/manifest-fixtures/) — the reader's compatibility contract with the dist repo is
-      # only a contract if something checks it on every push.
+      # (src-tauri/manifest-fixtures/) — the reader's compatibility contract with the dist repo,
+      # checked by the two triggers above and nothing else: weekly, and whenever this workflow is
+      # run by hand. Nothing checks it per commit, so a break lands silently and waits for one of
+      # those (see the `on:` block) — run it by hand before tagging.
       #
       # --release ON PURPOSE: this workflow's cache holds release-profile dependency artifacts (the
       # tauri build below compiles the same profile). A plain `cargo test` would cold-compile a
