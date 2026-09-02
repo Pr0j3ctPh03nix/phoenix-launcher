@@ -258,10 +258,10 @@ fn end_measuring(asked: &HashSet<Option<String>>) {
 
 /// How a source is turned into a backend.
 ///
-/// A parameter rather than a call for one reason: the tests. Every production backend is an
-/// https-only agent no loopback listener can satisfy, and what a walk is about is the ORDER, not
-/// the transport — so a walk is exercised over in-memory backends and a known ranking, with no
-/// process state to take turns over.
+/// A parameter rather than a call for one reason: the tests. A production backend talks to a real
+/// host over a real network, and what a walk is about is the ORDER, not the transport — so a walk
+/// is exercised over in-memory backends and a known ranking, with no process state to take turns
+/// over.
 pub(crate) type Dial = Box<dyn Fn(&Source) -> Arc<dyn Downloader> + Send + Sync>;
 
 /// The BAKED default repo for a payload — what an override is an override of.
@@ -995,9 +995,9 @@ fn refresh_list(settings: &Settings) -> mirror::Refresh {
 }
 
 /// `refresh_list` over an already-decided `base`, with the fetch injected — the same seam as
-/// `Dial`, for the same reason: the real one is an https-only agent no loopback listener can
-/// satisfy, and what this function is about is which source is ASKED, what floor it is asked
-/// against, and what happens when it will not answer.
+/// `Dial`, for the same reason: the real one goes out to a real host, and what this function is
+/// about is which source is ASKED, what floor it is asked against, and what happens when it will
+/// not answer.
 fn refresh_list_with(
     settings: &Settings,
     base: mirror::Refresh,
@@ -1097,9 +1097,9 @@ fn scheduler() {
 
 #[cfg(test)]
 mod tests {
-    //! The walk and the schedule, over injected backends. Every production backend is an
-    //! https-only agent no loopback listener can reach, which is exactly why the dial is a
-    //! parameter: the rules below are about ORDER and RETRY, and they are transport-free.
+    //! The walk and the schedule, over injected backends. Every production backend goes out to a
+    //! real host, which is exactly why the dial is a parameter: the rules below are about ORDER
+    //! and RETRY, and they are transport-free.
     use super::*;
     use crate::downloader::fake::Fake;
     use crate::downloader::NetKind;

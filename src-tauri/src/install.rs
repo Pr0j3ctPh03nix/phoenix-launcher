@@ -2811,8 +2811,8 @@ mod tests {
     ///
     /// The ranking and the dial are both handed in — a `Wire` captures its ranking at open (see
     /// its field), so these tests need no process state and take no turns. The dial is injected
-    /// because every production backend is an https-only agent no loopback listener can satisfy,
-    /// and none of these tests is about transport.
+    /// because a production backend talks to a real host over a real network, and none of these
+    /// tests is about transport.
     fn wire_over<D: Downloader + 'static>(
         peers: Vec<Arc<D>>,
         payload: crate::trust::Payload,

@@ -3,9 +3,11 @@
 //! A mirror is a base URL serving a payload by CONTENT: `<url>/<payload>/manifest.json`, and the
 //! blobs that document names under `<url>/<payload>/blobs/<sha256>` (the layout, and why there is
 //! no tag directory in it, is `Mirror`'s doc; `doc_url`/`blob_url` build it for both the probe and
-//! the download backend). Mirrors are never authored by the user: they are published in a SIGNED
-//! `mirrors.json`. Believing that document is `signed`'s job, below — and it is the only door to
-//! it, because a list that is merely parsed rewrites this machine's download sources permanently.
+//! the download backend). That base URL may be `http://` as well as `https://` — nothing here
+//! trusts the transport (see `Mirror`'s doc and `transport::Schemes`). Mirrors are never authored
+//! by the user: they are published in a SIGNED `mirrors.json`. Believing that document is
+//! `signed`'s job, below — and it is the only door to it, because a list that is merely parsed
+//! rewrites this machine's download sources permanently.
 //!
 //! WHICH source is used, and in what order, is `source.rs`. This file owns the list and the
 //! backend; it decides nothing about routing.
@@ -27,7 +29,7 @@ use crate::downloader::{Asset, Downloader, NetKind, Release};
 use crate::github::Github;
 use crate::manifest::Manifest;
 use crate::source;
-use crate::transport::{self, FetchError};
+use crate::transport::{self, FetchError, Schemes};
 use crate::trust::Payload;
 
 const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
@@ -306,7 +308,7 @@ fn fetch_list_from(
 ) -> Result<Option<signed::SignedList>> {
     match source.key() {
         None => fetch_list_from_github(settings, floor),
-        Some(base) => fetch_list_from_mirror(&probe_agent(), base, floor),
+        Some(base) => fetch_list_from_mirror(base, floor),
     }
 }
 
@@ -350,20 +352,15 @@ fn fetch_list_from_github(settings: &Settings, floor: u64) -> Result<Option<sign
 /// `mirrors.json` on every run, so its absence means the host is broken, and one host that had not
 /// synced yet was enough to make the mirror set stop changing for everyone who reached it. Only
 /// GitHub gets to say "nothing is published"; a mirror only ever gets to fail.
-///
-/// The `agent` is a parameter for the same reason `probe_with`'s is: `probe_agent()` is https-only
-/// and a loopback listener cannot speak TLS, so the end-to-end tests below could not otherwise
-/// reach this. Production has exactly one caller and it passes `probe_agent()`.
-fn fetch_list_from_mirror(
-    agent: &ureq::Agent,
-    base: &str,
-    floor: u64,
-) -> Result<Option<signed::SignedList>> {
+fn fetch_list_from_mirror(base: &str, floor: u64) -> Result<Option<signed::SignedList>> {
+    let agent = probe_agent();
     // `Ok(None)` inside this closure is a 404 and nothing else: every other failure is an error, so
     // a host that answers oddly is never mistaken for one that answers "no".
     let get = |name: &str, max: u64| -> Result<Option<Vec<u8>>> {
         let url = root_url(base, name);
-        match transport::fetch(agent, &url, |req, _same_origin| req.set("User-Agent", UA)) {
+        match transport::fetch(&agent, &url, Schemes::HttpOrHttps, |req, _same_origin| {
+            req.set("User-Agent", UA)
+        }) {
             Ok(r) => Ok(Some(read_all(r, max)?)),
             Err(FetchError::Http(ureq::Error::Status(404, _))) => Ok(None),
             Err(e) => Err(anyhow::anyhow!("{base}: {}", short_fetch(e))),
@@ -576,6 +573,17 @@ mod signed {
     }
 }
 
+/// No `https_only` flag, deliberately: every mirror request goes through `transport::fetch` with
+/// `Schemes::HttpOrHttps`, which allows plain HTTP — a mirror is an ordinary static file host and
+/// its operator may not have a certificate — and refuses everything else on EVERY hop, including a
+/// step back down to http once a chain has been on https.
+///
+/// That the flag is gone is not a loosening of the guard that matters: the probe DERIVES every URL
+/// it starts from (`doc_url`/`blob_url`), but a mirror chooses every `Location` it answers with, and
+/// `transport::check_hop` still refuses `file://` and a UNC path (`\\host\share`) there — the last
+/// is the one that matters most, since Windows treats that shape as an implicit SMB target and
+/// touching it leaks this machine's NTLMv2 hash to whatever answers, before a byte of content is
+/// read.
 fn probe_agent() -> ureq::Agent {
     ureq::builder()
         .timeout_connect(CONNECT_TIMEOUT)
@@ -584,15 +592,6 @@ fn probe_agent() -> ureq::Agent {
         // 0, not a positive count: `transport::fetch` drives every hop itself — see its module doc
         // for why ureq's own auto-follow is not safe to hand a mirror's redirects to.
         .redirects(0)
-        // https-only, and re-checked on EVERY hop of a redirect chain, not just the URL we start
-        // with (each hop `transport::fetch` issues is its own fresh request, so this same check
-        // runs again every time). The probe DERIVES every URL it starts from (`doc_url`/`blob_url`,
-        // see `probe_with` below), but a mirror still chooses every `Location` it answers with —
-        // so a hostile or compromised one can point the next hop at `http://`, `file://`, or a
-        // UNC path (`\\host\share`). The last one is the one that matters most: Windows treats that
-        // shape as an implicit SMB target, and touching it is enough to leak this machine's NTLMv2
-        // hash to whatever server answers, before a single byte of content is read.
-        .https_only(true)
         .build()
 }
 
@@ -619,13 +618,6 @@ fn short(e: ureq::Error) -> String {
 ///
 /// `payload` is the caller's (`source::PROBE_PAYLOAD`) rather than a constant here: which tree a
 /// probe is timed through is a routing decision, and routing decisions live in `source.rs`.
-pub fn probe(base: &str, payload: Payload, now: u64) -> Measured {
-    probe_with(&probe_agent(), base, payload, now)
-}
-
-/// `probe` with the agent injected — `probe_agent()` is https-only and a loopback listener cannot
-/// speak TLS, so the end-to-end tests below could not otherwise reach this at all. Production has
-/// exactly one caller and it passes `probe_agent()`.
 ///
 /// NOTHING READ HERE IS VERIFIED, and nothing may come to depend on that changing. There is no
 /// signature check on this manifest — the install path fetches and verifies its own copy
@@ -635,7 +627,8 @@ pub fn probe(base: &str, payload: Payload, now: u64) -> Measured {
 /// `MAX_DOC_BYTES` for the manifest, `PROBE_BYTES` for the range, `PROBE_BUDGET` for the clock. A
 /// hostile mirror can spend this probe's few seconds and mislead its own ranking, which is all a
 /// source can ever do.
-fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Measured {
+pub fn probe(base: &str, payload: Payload, now: u64) -> Measured {
+    let agent = probe_agent();
     let mut m = Measured::blank(now);
 
     // 1. the manifest — the one document a mirror must serve for a payload, so an answer here is
@@ -643,9 +636,12 @@ fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Me
     //    there is no index, and no listable directory.
     let started = Instant::now();
     let manifest_url = doc_url(base, payload.id(), crate::engine::MANIFEST_ASSET);
-    let resp = match transport::fetch(agent, &manifest_url, |req, _same_origin| {
-        req.set("User-Agent", UA)
-    }) {
+    let resp = match transport::fetch(
+        &agent,
+        &manifest_url,
+        Schemes::HttpOrHttps,
+        |req, _same_origin| req.set("User-Agent", UA),
+    ) {
         Ok(r) => r,
         Err(e) => {
             let why = format!("{}: {}", crate::engine::MANIFEST_ASSET, short_fetch(e));
@@ -700,7 +696,7 @@ fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Me
     //    every `Location` it answers with, which is why this goes through the same guarded fetch as
     //    the manifest did — see `transport`'s module doc.
     let blob = blob_url(base, payload.id(), sha256);
-    let resp = match transport::fetch(agent, &blob, |req, _same_origin| {
+    let resp = match transport::fetch(&agent, &blob, Schemes::HttpOrHttps, |req, _same_origin| {
         req.set("User-Agent", UA).set("Range", &format!("bytes=0-{}", source::PROBE_BYTES - 1))
     }) {
         Ok(r) => r,
@@ -820,7 +816,10 @@ const DL_POOL_PER_HOST: usize = 12;
 ///
 /// Every request goes through `transport::fetch`, so ureq's own auto-follow is never handed a
 /// `Location` header this process did not write — see that module's doc for why. A mirror's index
-/// and every URL it names are the least trusted input the launcher reads.
+/// and every URL it names are the least trusted input the launcher reads. It goes through it with
+/// `Schemes::HttpOrHttps`: a mirror may be published on plain HTTP, and the transport is untrusted
+/// either way — the manifest is signed, every file is hashed, and the serial ratchets — but a chain
+/// that HAS reached https may never step back down to it, and no other scheme is reachable at all.
 pub struct Mirror {
     /// Base URL, normalized (no trailing slash) — `config::normalize_mirror_url`'s output, which
     /// is the only shape that ever reaches settings.
@@ -844,20 +843,14 @@ struct Documents {
 }
 
 impl Mirror {
+    /// The one constructor, used by production and by every end-to-end test alike — the agent used
+    /// to be injectable only because it was https-only and a loopback listener cannot speak TLS,
+    /// and `Schemes::HttpOrHttps` is exactly what removes that need.
     pub fn new(base: &str, payload: Payload) -> Self {
-        Self::with_agent(base, payload, download_agent())
-    }
-
-    /// `new` with the agent injected. In production `new` is its only caller, and there is exactly
-    /// one right agent. It is `pub(crate)` for the TESTS in other modules: `download_agent()` is
-    /// https-only and a loopback listener cannot speak TLS, so every end-to-end test of this
-    /// backend — here and in the modules that consume it, self-update among them — swaps the agent
-    /// and keeps every other field the real thing, the absence of anywhere to put a token included.
-    pub(crate) fn with_agent(base: &str, payload: Payload, agent: ureq::Agent) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
             payload: payload.id(),
-            agent,
+            agent: download_agent(),
             docs: std::sync::Mutex::new(None),
         }
     }
@@ -894,7 +887,7 @@ impl Mirror {
 
     /// One GET, redirects driven by `transport::fetch`, never carrying credentials.
     fn get(&self, url: &str, range: Option<&str>) -> Result<ureq::Response> {
-        transport::fetch(&self.agent, url, |req, _same_origin| {
+        transport::fetch(&self.agent, url, Schemes::HttpOrHttps, |req, _same_origin| {
             let req = req.set("User-Agent", UA);
             match range {
                 Some(v) => req.set("Range", v),
@@ -966,7 +959,6 @@ fn download_agent() -> ureq::Agent {
         .timeout_write(DL_IO_TIMEOUT)
         .max_idle_connections_per_host(DL_POOL_PER_HOST)
         .redirects(0)
-        .https_only(true)
         .build()
 }
 
@@ -987,7 +979,9 @@ fn net_err_fetch(e: FetchError) -> anyhow::Error {
             .context(format!("transport error from the mirror: {}", t.kind())),
         FetchError::TooManyRedirects => anyhow::Error::new(NetKind::Transport)
             .context(format!("too many redirects (max {})", transport::MAX_REDIRECTS)),
-        FetchError::BadRedirect(reason) => anyhow::Error::new(NetKind::Transport).context(reason),
+        FetchError::BadRedirect(reason) | FetchError::RefusedScheme(reason) => {
+            anyhow::Error::new(NetKind::Transport).context(reason)
+        }
     }
 }
 
@@ -1187,31 +1181,33 @@ mod tests {
         assert!(out.iter().any(Source::is_github), "and the built-in source is never in the list");
     }
 
-    /// A URL that fails the https-only check must be refused as an ordinary error, never a panic
-    /// — including the UNC shape (`\\host\share`), which Windows treats as an implicit SMB target
-    /// and would leak this machine's NTLMv2 hash to whatever answers there the moment it is
-    /// touched. Goes through `fetch_list_from_mirror` itself (not just `probe_agent` in
-    /// isolation), since that is the real call site a published mirror's base URL reaches — and
-    /// with the REAL agent, since `probe_agent`'s `https_only` flag IS the check under test.
+    /// A base URL outside the `{http, https}` allowlist must be refused as an ordinary error, never
+    /// a panic — including the UNC shape (`\\host\share`), which Windows treats as an implicit SMB
+    /// target and would leak this machine's NTLMv2 hash to whatever answers there the moment it is
+    /// touched. Goes through `fetch_list_from_mirror` itself, since that is the real call site a
+    /// published mirror's base URL reaches, and with the REAL agent it builds — the check is
+    /// `transport::check_hop`'s now, so no socket is opened for any of these.
+    ///
+    /// `http://` is deliberately NOT in this list any more: it is the shape this change exists to
+    /// allow, and `a_plain_http_mirror_serves_a_release_end_to_end` is where it is proven to work.
     #[test]
-    fn mirror_fetch_refuses_non_https_urls_cleanly() {
+    fn mirror_fetch_refuses_a_scheme_outside_the_allowlist() {
         for base in [
-            "http://mirror.example",
             "file:///etc/passwd",
+            "ftp://mirror.example",
             "\\\\attacker\\share",
             "//attacker/share",
         ] {
-            let result = fetch_list_from_mirror(&probe_agent(), base, 0);
+            let result = fetch_list_from_mirror(base, 0);
             assert!(result.is_err(), "expected {base} to be refused, got {result:?}");
         }
     }
 
     /// A redirect chain longer than `MAX_REDIRECTS` must fail cleanly rather than being followed
     /// forever — `transport::fetch`'s own hop count, proven over a genuine TCP round trip (there
-    /// is no way to prove this without one; see `test_http`'s doc comment). Built with
-    /// `.redirects(0)`, matching `probe_agent`'s real setting: production never lets ureq's OWN
-    /// auto-follow run at all (see `transport`'s module doc for why), so the cap enforced here is
-    /// `transport::fetch`'s loop, not ureq's.
+    /// is no way to prove this without one; see `test_http`'s doc comment). Over the REAL
+    /// `probe_agent()`, whose `.redirects(0)` is what leaves the cap to `transport::fetch`'s loop
+    /// rather than ureq's (see `transport`'s module doc for why ureq's must never run).
     #[test]
     fn mirror_fetch_refuses_a_redirect_chain_past_the_cap() {
         use crate::test_http::{Canned, TestServer};
@@ -1221,14 +1217,8 @@ mod tests {
             routes
         });
 
-        let agent = ureq::builder()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(IO_TIMEOUT)
-            .timeout_write(IO_TIMEOUT)
-            .redirects(0)
-            .build();
         let url = format!("http://127.0.0.1:{}/loop", server.port);
-        let err = transport::fetch(&agent, &url, |req, _same_origin| req)
+        let err = transport::fetch(&probe_agent(), &url, Schemes::HttpOrHttps, |req, _same_origin| req)
             .expect_err("an endless redirect must not be followed forever");
         assert!(matches!(err, FetchError::TooManyRedirects), "expected TooManyRedirects, got {err:?}");
     }
@@ -1277,7 +1267,7 @@ mod tests {
         let server = list_server(Some(doc.into_bytes()), Some(sig));
         let base = format!("http://127.0.0.1:{}", server.port);
 
-        let list = fetch_list_from_mirror(&test_agent(), &base, 0)
+        let list = fetch_list_from_mirror(&base, 0)
             .expect("a correctly signed list must verify")
             .expect("…and must never read as \"this host publishes no list\"");
         let urls: Vec<&str> = list.hosts().iter().map(|h| h.url.as_str()).collect();
@@ -1303,7 +1293,7 @@ mod tests {
 
         let server = list_server(Some(tampered.into_bytes()), Some(sig));
         let base = format!("http://127.0.0.1:{}", server.port);
-        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
+        let got = fetch_list_from_mirror(&base, 0);
         assert!(got.is_err(), "a rewritten host must be refused, got {got:?}");
     }
 
@@ -1389,13 +1379,13 @@ mod tests {
     fn a_mirror_without_mirrors_json_is_a_broken_host() {
         let bare = list_server(None, None); // 404s both
         let base = format!("http://127.0.0.1:{}", bare.port);
-        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
+        let got = fetch_list_from_mirror(&base, 0);
         assert!(got.is_err(), "a host that serves no list has failed, not answered: {got:?}");
 
         let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
         let server = list_server(Some(doc.into_bytes()), None); // the list, with no signature
         let base = format!("http://127.0.0.1:{}", server.port);
-        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
+        let got = fetch_list_from_mirror(&base, 0);
         assert!(got.is_err(), "an unsigned list must not pass for an absent one: {got:?}");
     }
 
@@ -1513,18 +1503,6 @@ mod tests {
 
     // ---- the probe, against the layout a mirror really serves ----
 
-    /// `probe_agent()` minus `https_only`, which a loopback listener cannot satisfy — the same
-    /// swap, for the same reason, as `test_mirror` below. Every other setting is the real one,
-    /// `redirects(0)` included, so `transport::fetch` still drives the chain.
-    fn test_agent() -> ureq::Agent {
-        ureq::builder()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(IO_TIMEOUT)
-            .timeout_write(IO_TIMEOUT)
-            .redirects(0)
-            .build()
-    }
-
     /// A manifest as a mirror serves it. Text rather than a hand-built struct so every test below
     /// goes through the real `Manifest::parse` — bundle invariants included, which is what makes a
     /// fixture that could not exist in a release fail here instead of quietly proving nothing.
@@ -1571,7 +1549,7 @@ mod tests {
         });
 
         let base = format!("http://127.0.0.1:{}", server.port);
-        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
+        let m = probe(&base, Payload::Mod, 1_000);
 
         assert!(m.error.is_none(), "a healthy mirror must not report one: {:?}", m.error);
         assert!(m.healthy());
@@ -1620,7 +1598,7 @@ mod tests {
         });
 
         let base = format!("http://127.0.0.1:{}", server.port);
-        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
+        let m = probe(&base, Payload::Mod, 1_000);
         assert!(m.healthy());
         assert_eq!(server.hits(loose_path), 0, "the small file must never be the measurement");
         assert_eq!(server.hits(bundle_path), 1);
@@ -1676,7 +1654,7 @@ mod tests {
         use crate::test_http::TestServer;
         let server = TestServer::start(|_port| std::collections::HashMap::new()); // 404s everything
         let base = format!("http://127.0.0.1:{}", server.port);
-        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
+        let m = probe(&base, Payload::Mod, 1_000);
         assert!(!m.healthy());
         assert!(m.bytes_per_sec.is_none() && m.latency_ms.is_none() && m.tag.is_none());
         let why = m.error.expect("a failed probe must say why");
@@ -1684,23 +1662,6 @@ mod tests {
     }
 
     // ---- the download backend ----
-
-    /// A `Mirror` over a plain-HTTP loopback server. `download_agent()` is https-only (proven
-    /// separately by `mirror_fetch_refuses_non_https_urls_cleanly`, over the same builder settings)
-    /// and a local listener cannot speak TLS, so the tests below swap the agent — every other field
-    /// is the real thing, including the fact that there is nowhere to put a token.
-    fn test_mirror(base: &str, payload: crate::trust::Payload) -> Mirror {
-        Mirror::with_agent(
-            base,
-            payload,
-            ureq::builder()
-                .timeout_connect(CONNECT_TIMEOUT)
-                .timeout_read(IO_TIMEOUT)
-                .timeout_write(IO_TIMEOUT)
-                .redirects(0) // transport::fetch drives the loop; matches download_agent()
-                .build(),
-        )
-    }
 
     /// WHAT A HOSTILE MIRROR IS ALLOWED TO WRITE INTO settings.json.
     ///
@@ -1728,7 +1689,7 @@ mod tests {
         });
 
         let base = format!("http://127.0.0.1:{}", server.port);
-        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
+        let m = probe(&base, Payload::Mod, 1_000);
 
         let why = m.error.expect("an unreadable manifest is a failed measurement");
         assert!(
@@ -1747,7 +1708,7 @@ mod tests {
     #[test]
     fn a_mirror_addresses_a_payload_by_hash_under_its_own_directory() {
         let hash = "a".repeat(64);
-        let m = test_mirror("https://mirror.example/phx/", crate::trust::Payload::Mod);
+        let m = Mirror::new("https://mirror.example/phx/", crate::trust::Payload::Mod);
         // the trailing slash is normalized away, so nothing downstream doubles a separator
         assert_eq!(m.doc_url("manifest.json"), "https://mirror.example/phx/mod/manifest.json");
         assert_eq!(
@@ -1766,7 +1727,7 @@ mod tests {
         assert!(!is_content_hash(&"a".repeat(63)));
 
         // every payload gets its own directory off the same base
-        let g = test_mirror("https://mirror.example/phx", crate::trust::Payload::Game);
+        let g = Mirror::new("https://mirror.example/phx", crate::trust::Payload::Game);
         assert_eq!(g.blob_url(&hash), format!("https://mirror.example/phx/game/blobs/{hash}"));
     }
 
@@ -1787,7 +1748,7 @@ mod tests {
             routes
         });
 
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Game);
+        let m = Mirror::new(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Game);
         let dest = std::env::temp_dir().join("phoenix-mirror-blob.bin");
         let _ = std::fs::remove_file(&dest);
         // exactly the asset install.rs synthesizes for a content-addressed source: the NAME is the
@@ -1828,7 +1789,7 @@ mod tests {
             routes.insert(long_path, Canned::body(long_body));
             routes
         });
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let m = Mirror::new(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
         // exactly what `install::Resolved::asset_for` synthesizes: the name is the hash, the size is
         // the manifest's declared size, and both URL fields are empty
         let asset = |name: &str| Asset {
@@ -1865,7 +1826,7 @@ mod tests {
             routes
         });
 
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let m = Mirror::new(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
         let dest = std::env::temp_dir().join("phoenix-mirror-resume.bin");
         std::fs::write(&dest, &content[..80]).unwrap();
         let asset = Asset {
@@ -1906,7 +1867,7 @@ mod tests {
         let doc = br#"{"schema":2,"payload_id":"mod","version":"1.4.2","files":[]}"#.to_vec();
         let sig = crate::trust::testing::test_sig(&doc);
         let server = payload_server(doc.clone(), Some(sig.clone()));
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let m = Mirror::new(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
 
         let release = m.fetch_release("ignored/repo", None).expect("the mirror's one release");
         assert_eq!(release.tag_name, "v1.4.2");
@@ -1952,7 +1913,7 @@ mod tests {
         // a real signature over DIFFERENT bytes: the file is well-formed, it simply is not over this
         let sig = crate::trust::testing::test_sig(b"some other document");
         let server = payload_server(doc, Some(sig));
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let m = Mirror::new(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
 
         let err = m.fetch_release("ignored/repo", None).unwrap_err();
         assert!(
@@ -1976,7 +1937,7 @@ mod tests {
         use crate::downloader::Downloader;
         let doc = br#"{"schema":2,"payload_id":"mod","version":"1.4.2","files":[]}"#.to_vec();
         let server = payload_server(doc, None);
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let m = Mirror::new(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
         let err = m.fetch_release("ignored/repo", None).unwrap_err();
         assert!(
             err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(404)))),
@@ -1992,7 +1953,7 @@ mod tests {
         use crate::downloader::Downloader;
         use crate::test_http::TestServer;
         let server = TestServer::start(|_port| std::collections::HashMap::new()); // 404s everything
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        let m = Mirror::new(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
         let err = m.fetch_release("r", None).unwrap_err();
         assert!(
             err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(404)))),
@@ -2000,7 +1961,7 @@ mod tests {
         );
 
         // nothing listening at all is the Transport case — the one the source walk falls through on
-        let dead = test_mirror("http://127.0.0.1:1", crate::trust::Payload::Mod);
+        let dead = Mirror::new("http://127.0.0.1:1", crate::trust::Payload::Mod);
         let err = dead.fetch_release("r", None).unwrap_err();
         assert!(
             err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Transport))),
@@ -2009,43 +1970,104 @@ mod tests {
     }
 
     /// The scheme check runs on every hop, not just the URL a caller starts with: a mirror can
-    /// answer its INDEX fine and then redirect an asset somewhere else entirely. This is also the
-    /// test that proves the fix for the panic `transport`'s module doc describes — a redirect
-    /// naming a scheme with no host (`file:///nope`) used to crash the process via ureq's own
-    /// auto-follow; routing every hop through `transport::fetch` (a fresh top-level `.call()` each
-    /// time, safely guarded by `Request::parse_url()`) is what turns that into an ordinary `Err`
-    /// (`InvalidUrl` — `parse_url` refuses the empty host before ever reaching the scheme check
-    /// `https_only` relies on; that check is what would fire for a well-formed http(s) URL, and is
-    /// exercised by the initial-URL test above). `https_only` itself needs TLS to exercise, which
-    /// this local plain-HTTP server has none of, but the empty-host check applies unconditionally,
-    /// so a `file://` Location still proves the RE-CHECK happens on the SECOND hop, which the
-    /// initial-URL test (`mirror_fetch_refuses_non_https_urls_cleanly`) cannot show by itself.
-    /// (A `\\host\share` Location does not serve this test — WHATWG URL joining normalizes its
-    /// backslashes into a protocol-relative `//host/share`, i.e. it becomes an ordinary
-    /// same-scheme redirect to a new HOST, not a scheme change; that shape is exactly what
-    /// `https_only` on the initial-URL tests already covers.)
+    /// answer its INDEX fine and then redirect an asset somewhere else entirely — and a plain-HTTP
+    /// mirror is exactly the origin from which that matters most, since the chain starts on a
+    /// transport anyone on the path can rewrite. This is also the test that proves the fix for the
+    /// panic `transport`'s module doc describes: a redirect naming a scheme with no host
+    /// (`file:///nope`) used to crash the process via ureq's own auto-follow, and the call
+    /// completing at all — Ok or Err — is half the proof.
+    ///
+    /// (A `\\host\share` Location does not serve this test: WHATWG URL joining normalizes its
+    /// backslashes into a protocol-relative `//host/share`, i.e. it becomes an ordinary same-scheme
+    /// redirect to a new HOST, not a scheme change. That shape is covered as an INITIAL url by
+    /// `mirror_fetch_refuses_a_scheme_outside_the_allowlist`.)
     #[test]
     fn mirror_fetch_refuses_a_bad_scheme_introduced_mid_chain() {
         use crate::test_http::{Canned, TestServer};
         let server = TestServer::start(|_port| {
             let mut routes = std::collections::HashMap::new();
-            routes.insert("/start", Canned::redirect("file:///nope"));
+            routes.insert("/to-file", Canned::redirect("file:///nope"));
+            routes.insert("/to-ftp", Canned::redirect("ftp://attacker.example/x"));
             routes
         });
-        let agent = ureq::builder()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout_read(IO_TIMEOUT)
-            .timeout_write(IO_TIMEOUT)
-            .redirects(0)
-            .build();
-        let url = format!("http://127.0.0.1:{}/start", server.port);
-        // The call itself completing (whether Ok or Err) is half the proof: the OLD code path
-        // (ureq's own `.redirects(N)` auto-follow) panicked the whole test process here instead.
-        let err = transport::fetch(&agent, &url, |req, _same_origin| req)
-            .expect_err("a redirect to a non-http(s) scheme must be refused, not followed");
-        match err {
-            FetchError::Http(e) => assert_eq!(e.kind(), ureq::ErrorKind::InvalidUrl),
-            other => panic!("expected Http(InvalidUrl), got {other:?}"),
+        for path in ["/to-file", "/to-ftp"] {
+            let url = format!("http://127.0.0.1:{}{path}", server.port);
+            let err = transport::fetch(&probe_agent(), &url, Schemes::HttpOrHttps, |req, _| req)
+                .expect_err("a redirect to a scheme outside the allowlist must not be followed");
+            assert!(matches!(err, FetchError::RefusedScheme(_)), "{path}: got {err:?}");
         }
+    }
+
+    /// AN HTTP MIRROR WORKS END TO END, through the production agent and the production backend —
+    /// the whole point of the allowlist. The release documents and a blob all come off a plain-HTTP
+    /// host, the manifest still has to verify to be believed, and no request carries a credential.
+    ///
+    /// Every other socket test in this file runs over http too, so they now all exercise this same
+    /// path; this one states it as the property rather than leaving it implied by the fixtures.
+    #[test]
+    fn a_plain_http_mirror_serves_a_release_end_to_end() {
+        use crate::downloader::{Asset, Downloader};
+        use crate::test_http::{Canned, TestServer};
+        let content = b"the payload bytes, over plain HTTP".to_vec();
+        let hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&content));
+        let doc = format!(
+            r#"{{"schema":2,"payload_id":"mod","version":"1.4.2","files":[{{"name":"a.bin","dest":"game/a.bin","sha256":"{hash}","size":{}}}]}}"#,
+            content.len()
+        )
+        .into_bytes();
+        let sig = crate::trust::testing::test_sig(&doc);
+        let blob_path: &'static str = Box::leak(format!("/mod/blobs/{hash}").into_boxed_str());
+        let (body, doc_bytes, sig_bytes) = (content.clone(), doc.clone(), sig.clone());
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/mod/manifest.json", Canned::body(doc_bytes.clone()));
+            routes.insert("/mod/manifest.json.minisig", Canned::body(sig_bytes.clone().into_bytes()));
+            routes.insert(blob_path, Canned::body(body.clone()));
+            routes
+        });
+
+        let base = format!("http://127.0.0.1:{}", server.port);
+        assert_eq!(normalize_mirror_url(&base).as_deref(), Some(base.as_str()), "a published shape");
+
+        let m = Mirror::new(&base, Payload::Mod);
+        let release = m.fetch_release("ignored/repo", None).expect("the mirror's one release");
+        assert_eq!(release.tag_name, "v1.4.2");
+        let asset = Asset {
+            name: hash.clone(),
+            url: String::new(),
+            browser_download_url: String::new(),
+            size: content.len() as u64,
+        };
+        assert_eq!(m.download(&asset).expect("the blob"), content);
+        // …and the probe measures the same host over the same transport
+        assert!(probe(&base, Payload::Mod, 1_000).healthy(), "an http mirror is a usable source");
+        for path in ["/mod/manifest.json", "/mod/manifest.json.minisig", blob_path] {
+            assert!(!server.saw_authorization(path), "{path}: a mirror has no credential to send");
+        }
+    }
+
+    /// A mirror may send a chain UP to https — that is the direction the rule permits, and refusing
+    /// it would break a host that simply redirects to its own TLS front. The hop is therefore
+    /// ATTEMPTED: nothing is listening on port 1, so what comes back is an ordinary transport
+    /// failure and never a `RefusedScheme`.
+    ///
+    /// The other direction cannot be scripted here — a chain has to COMPLETE a TLS hop to be on
+    /// https, and no loopback listener in this crate can speak it — so `https -> http` and
+    /// `http -> https -> http` are proven over `check_hop` itself, in transport.rs.
+    #[test]
+    fn an_http_mirror_may_send_the_chain_up_to_https() {
+        use crate::test_http::{Canned, TestServer};
+        let server = TestServer::start(|_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/up", Canned::redirect("https://127.0.0.1:1/dest"));
+            routes
+        });
+        let url = format!("http://127.0.0.1:{}/up", server.port);
+        let err = transport::fetch(&probe_agent(), &url, Schemes::HttpOrHttps, |req, _| req)
+            .expect_err("nothing is listening on port 1");
+        assert!(
+            matches!(err, FetchError::Http(ureq::Error::Transport(_))),
+            "the upgrade must be tried, not refused: {err:?}"
+        );
     }
 }

@@ -188,6 +188,11 @@ fn measured_compat<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Measured>, 
 /// Canonical form of a published mirror base URL, or None if it is not one. Everything downstream
 /// appends a path to this string, so a trailing slash and a missing scheme are the two ways an
 /// entry that looks fine silently never resolves.
+///
+/// The two schemes accepted here are the same two `transport::Schemes::HttpOrHttps` allows, and
+/// that is not a coincidence to be tidied away on either side: a base URL this admits but the
+/// transport refuses is a mirror that is published, ranked, and unreachable — with the refusal
+/// arriving per request, as a source failure, rather than where the list was read.
 pub fn normalize_mirror_url(url: &str) -> Option<String> {
     let u = url.trim().trim_end_matches('/');
     let rest = u.strip_prefix("https://").or_else(|| u.strip_prefix("http://"))?;

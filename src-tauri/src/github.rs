@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{Measured, Settings};
 use crate::downloader::{Asset, ChunkProgress, Downloader, NetKind, Release};
-use crate::transport::{self, FetchError};
+use crate::transport::{self, FetchError, Schemes};
 
 const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -56,6 +56,16 @@ pub struct Github {
     /// instead. See that module's doc comment for why ureq's own `.redirects(N)` is not safe to
     /// hand a `Location` header from a response this process did not write.
     agent: ureq::Agent,
+    /// The schemes every request this backend makes may reach: `HttpsOnly`, always, in production —
+    /// GitHub and its storage are https services, and `new` is the only place this is set.
+    ///
+    /// A field rather than a literal at the four call sites for two reasons. One backend cannot
+    /// then hold two policies, which a per-call argument would make a one-line mistake; and the
+    /// tests below, which drive the real code path over a loopback listener that cannot speak TLS,
+    /// swap it together with `agent` instead of being unable to reach the path at all. The policy
+    /// this pairs with — a mirror's — is stated at mirror.rs's own call sites, where every request
+    /// in the file shares it.
+    schemes: Schemes,
 }
 
 impl Github {
@@ -77,6 +87,7 @@ impl Github {
             lead_with_token: token.is_some(),
             authed: AtomicBool::new(false),
             agent: agent(),
+            schemes: Schemes::HttpsOnly,
         }
     }
 
@@ -238,13 +249,15 @@ fn agent() -> ureq::Agent {
         // for why ureq's own auto-follow is not safe to hand a redirect to.
         .redirects(0)
         .max_idle_connections_per_host(POOL_PER_HOST)
-        // https-only, and re-checked on EVERY hop `transport::fetch` issues, not just the URL we
-        // start with (each hop is its own fresh request, so this same check runs again every
-        // time): an asset's `url`/`browser_download_url` is response content (see
-        // `downloader::Asset`), so a redirect to `http://`, `file://` or a `\\host\share` UNC path
-        // must be refused before this process ever touches it — the last shape is the one that
-        // matters most, since Windows treats it as an implicit SMB target and touching it alone
-        // leaks this machine's NTLMv2 hash to whatever answers there.
+        // The scheme policy for everything that goes through `transport::fetch` is `Github`'s
+        // `schemes` field, checked per hop there. This flag is what covers the ONE request that
+        // deliberately does not — `asset_response`'s authenticated first hop, issued on this agent
+        // directly — and it is kept for every other request too, as a second lock that cannot
+        // disagree with the first: an asset's `url`/`browser_download_url` is response content (see
+        // `downloader::Asset`), so `http://`, `file://` or a `\\host\share` UNC path must be
+        // refused before this process ever touches it. The last shape is the one that matters most,
+        // since Windows treats it as an implicit SMB target and touching it alone leaks this
+        // machine's NTLMv2 hash to whatever answers there.
         .https_only(true)
         .build()
 }
@@ -293,8 +306,10 @@ fn net_err_redacted(e: FetchError, what: &str) -> anyhow::Error {
             .context(format!("transport error fetching {what} from storage: {}", t.kind())),
         FetchError::TooManyRedirects => anyhow::Error::new(NetKind::Transport)
             .context(format!("too many redirects fetching {what} from storage")),
-        FetchError::BadRedirect(reason) => anyhow::Error::new(NetKind::Transport)
-            .context(format!("{reason} fetching {what} from storage")),
+        FetchError::BadRedirect(reason) | FetchError::RefusedScheme(reason) => {
+            anyhow::Error::new(NetKind::Transport)
+                .context(format!("{reason} fetching {what} from storage"))
+        }
     }
 }
 
@@ -306,7 +321,9 @@ fn net_err_fetch(e: FetchError) -> anyhow::Error {
         FetchError::Http(inner) => net_err(inner),
         FetchError::TooManyRedirects => anyhow::Error::new(NetKind::Transport)
             .context(format!("too many redirects (max {})", transport::MAX_REDIRECTS)),
-        FetchError::BadRedirect(reason) => anyhow::Error::new(NetKind::Transport).context(reason),
+        FetchError::BadRedirect(reason) | FetchError::RefusedScheme(reason) => {
+            anyhow::Error::new(NetKind::Transport).context(reason)
+        }
     }
 }
 
@@ -330,9 +347,12 @@ fn asset_response(gh: &Github, asset: &Asset, range: Option<String>) -> Result<u
     // `browser_download_url` rides free CDN bandwidth and no API rate budget), so a backend that
     // simply had a token must not spend it on every file.
     let Some(t) = gh.upfront() else {
-        return transport::fetch(&gh.agent, &asset.browser_download_url, |req, _same_origin| {
-            with_range(req.set("User-Agent", UA))
-        })
+        return transport::fetch(
+            &gh.agent,
+            &asset.browser_download_url,
+            gh.schemes,
+            |req, _same_origin| with_range(req.set("User-Agent", UA)),
+        )
         .map_err(net_err_fetch);
     };
     // First hop, explicit and NOT run through `transport::fetch`: it is the only request that may
@@ -361,8 +381,10 @@ fn asset_response(gh: &Github, asset: &Asset, range: Option<String>) -> Result<u
             // time-limited read capability, and a raw transport error would carry the URL it was
             // fetching — which would put that capability in the UI's detail line and in any log
             // the user pastes into a bug report.
-            transport::fetch(&gh.agent, &loc, |req, _same_origin| with_range(req.set("User-Agent", UA)))
-                .map_err(|e| net_err_redacted(e, &asset.name))
+            transport::fetch(&gh.agent, &loc, gh.schemes, |req, _same_origin| {
+                with_range(req.set("User-Agent", UA))
+            })
+            .map_err(|e| net_err_redacted(e, &asset.name))
         }
         Ok(r) => bail!("asset download returned HTTP {}", r.status()),
         Err(e) => Err(net_err(e)),
@@ -375,7 +397,7 @@ impl Downloader for Github {
         let url = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
         self.with_credentials(|token| {
             let resp =
-                transport::fetch(&self.agent, &url, |req, same_origin| {
+                transport::fetch(&self.agent, &url, self.schemes, |req, same_origin| {
                     self.api_headers(req, same_origin, token)
                 })
                 .map_err(net_err_fetch)?;
@@ -389,7 +411,7 @@ impl Downloader for Github {
         let url = api_url(repo, tag);
         self.with_credentials(|token| {
             let resp =
-                transport::fetch(&self.agent, &url, |req, same_origin| {
+                transport::fetch(&self.agent, &url, self.schemes, |req, same_origin| {
                     self.api_headers(req, same_origin, token)
                 })
                 .map_err(net_err_fetch)?;
@@ -449,9 +471,11 @@ mod tests {
 
     /// Same settings `agent()` builds, minus `https_only`: the redirect-chain and
     /// authorization-header tests below script a chain over a local plain-HTTP listener, which
-    /// cannot speak TLS. `https_only` is proven separately, against the REAL `agent()` builder, by
-    /// `github_agent_refuses_non_https_urls_cleanly` — the hop cap and the auth-header policy are
-    /// independent checks from the scheme one, so testing them apart from it is not a gap.
+    /// cannot speak TLS. Those tests pass `Schemes::HttpOrHttps` for the same reason — what they
+    /// prove (the hop cap, the auth-header policy, the per-hop re-check) is independent of WHICH
+    /// schemes are allowed, and GitHub's own `HttpsOnly` is proven separately by
+    /// `the_github_policy_refuses_http_before_a_socket_is_opened` and by transport.rs's
+    /// own table.
     fn test_agent() -> ureq::Agent {
         ureq::builder()
             .timeout_connect(CONNECT_TIMEOUT)
@@ -461,14 +485,16 @@ mod tests {
             .build()
     }
 
-    /// A URL that fails the https-only check must be refused as an ordinary error, never a panic
-    /// — including the UNC shape (`\\host\share`), which Windows treats as an implicit SMB target
-    /// and would leak this machine's NTLMv2 hash to whatever answers there the moment it is
+    /// A URL outside what this backend may reach must be refused as an ordinary error, never a
+    /// panic — including the UNC shape (`\\host\share`), which Windows treats as an implicit SMB
+    /// target and would leak this machine's NTLMv2 hash to whatever answers there the moment it is
     /// touched. `asset.url`/`asset.browser_download_url` are response content (`downloader::Asset`
     /// derives `Deserialize` with no scheme restriction of its own), so this is exactly the shape
-    /// `asset_response` hands to `agent()` without further checking — the https-only flag on the
-    /// agent IS the check. Goes through the real `agent()` builder, since that is what every
-    /// request in this file uses.
+    /// `asset_response` hands to the agent.
+    ///
+    /// Against the AGENT, through the real `agent()` builder: its `https_only` flag is the check
+    /// that covers `asset_response`'s authenticated first hop, which is the one request in this
+    /// file that does not go through `transport::fetch` and so is not covered by `schemes`.
     #[test]
     fn github_agent_refuses_non_https_urls_cleanly() {
         let a = agent();
@@ -483,6 +509,31 @@ mod tests {
         }
     }
 
+    /// GITHUB IS HTTPS-ONLY ON EVERY HOP, now that a mirror is not. The policy is the `schemes`
+    /// field, applied by `transport::fetch` to each hop before it is issued — so an `http://` asset
+    /// URL is refused without a socket being opened at all. Only the FIRST hop can be shown here:
+    /// under this policy a chain never reaches a plain-HTTP listener to be redirected from, so the
+    /// per-hop half is proven over `check_hop` itself, in transport.rs.
+    #[test]
+    fn the_github_policy_refuses_http_before_a_socket_is_opened() {
+        let gh = Github::new(None);
+        assert_eq!(gh.schemes, Schemes::HttpsOnly, "production has exactly one value");
+
+        // The initial URL — an asset whose `browser_download_url` a release index named. Nothing
+        // listens on port 1, which is the point of using it: under this policy the URL is refused
+        // before a socket is opened at all.
+        let url = "http://127.0.0.1:1/asset";
+        let err = transport::fetch(&test_agent(), url, gh.schemes, |req, _| req)
+            .expect_err("a plain-HTTP asset URL is not something this backend may fetch");
+        assert!(matches!(err, FetchError::RefusedScheme(_)), "got {err:?}");
+        // …while a MIRROR's policy would let the same URL be TRIED — it fails as an ordinary
+        // transport error (nothing is listening), never as a refusal. That is the whole of the
+        // difference between the two policies.
+        let err = transport::fetch(&test_agent(), url, Schemes::HttpOrHttps, |req, _| req)
+            .expect_err("nothing is listening on port 1");
+        assert!(matches!(err, FetchError::Http(ureq::Error::Transport(_))), "got {err:?}");
+    }
+
     /// A redirect chain longer than `MAX_REDIRECTS` must fail cleanly rather than being followed
     /// forever — `transport::fetch`'s own hop count, proven over a genuine TCP round trip (see
     /// `test_http`'s doc comment for why a mock can't stand in for this).
@@ -495,7 +546,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{}/loop", server.port);
-        let err = transport::fetch(&test_agent(), &url, |req, _same_origin| req)
+        let err = transport::fetch(&test_agent(), &url, Schemes::HttpOrHttps, |req, _same_origin| req)
             .expect_err("must not follow forever");
         assert!(matches!(err, FetchError::TooManyRedirects), "expected TooManyRedirects, got {err:?}");
     }
@@ -504,11 +555,10 @@ mod tests {
     /// process — the exact bug `transport`'s module doc describes: ureq's own `.redirects(N)`
     /// auto-follow PANICS on this shape (`unit.rs::connect_inner`'s `host_str().unwrap()`), which
     /// is why `agent()` is built `.redirects(0)` and every hop instead goes through
-    /// `transport::fetch`'s own loop, whose `agent.get(...).call()` per hop is guarded by ureq's
-    /// `Request::parse_url()` (an empty host there is a clean `InvalidUrl`, not a panic — that
-    /// guard is what fires here, before the request ever reaches the scheme-allowlist check
-    /// `https_only` relies on for a well-formed http(s) URL). This test completing at all (Ok or
-    /// Err) is half the proof.
+    /// `transport::fetch`'s own loop. The refusal now comes from `check_hop`, which runs BEFORE the
+    /// hop is issued, so the target is never handed to ureq at all — a strictly earlier refusal
+    /// than the `InvalidUrl` that ureq's `Request::parse_url()` used to answer with here. This test
+    /// completing at all (Ok or Err) is half the proof.
     #[test]
     fn github_agent_refuses_a_bad_scheme_introduced_mid_chain() {
         let server = TestServer::start(|_port| {
@@ -517,12 +567,9 @@ mod tests {
             routes
         });
         let url = format!("http://127.0.0.1:{}/start", server.port);
-        let err = transport::fetch(&test_agent(), &url, |req, _same_origin| req)
+        let err = transport::fetch(&test_agent(), &url, Schemes::HttpOrHttps, |req, _same_origin| req)
             .expect_err("a redirect to a non-http(s) scheme must be refused, not followed");
-        match err {
-            FetchError::Http(e) => assert_eq!(e.kind(), ureq::ErrorKind::InvalidUrl),
-            other => panic!("expected Http(InvalidUrl), got {other:?}"),
-        }
+        assert!(matches!(err, FetchError::RefusedScheme(_)), "expected a scheme refusal, got {err:?}");
     }
 
     /// The property item 3 exists for: a bearer token minted for this host must never be replayed
@@ -553,6 +600,7 @@ mod tests {
         transport::fetch(
             &test_agent(),
             &format!("http://127.0.0.1:{}/same", same_host_server.port),
+            Schemes::HttpOrHttps,
             |req, same_origin| gh.api_headers(req, same_origin, gh.upfront()),
         )
         .expect("same-host redirect should succeed");
@@ -564,6 +612,7 @@ mod tests {
         transport::fetch(
             &test_agent(),
             &format!("http://127.0.0.1:{}/cross", cross_host_server.port),
+            Schemes::HttpOrHttps,
             |req, same_origin| gh.api_headers(req, same_origin, gh.upfront()),
         )
         .expect("cross-host redirect should still succeed, just without the token");
@@ -605,11 +654,12 @@ mod tests {
             }
         });
 
-        // `test_agent()`, not `Github::new(None)`: the real `agent()` is https-only and this
-        // server is a plain-HTTP loopback listener, which cannot speak TLS. The cap under test is
-        // a read-length bound, independent of the scheme check that refuses `http://` in
-        // production (proven separately by `github_agent_refuses_non_https_urls_cleanly`).
-        let gh = Github { agent: test_agent(), ..Github::new(None) };
+        // `test_agent()` and `HttpOrHttps`, not `Github::new(None)`: both halves of the real
+        // backend's scheme policy refuse `http://`, and this server is a plain-HTTP loopback
+        // listener, which cannot speak TLS. The cap under test is a read-length bound, independent
+        // of the scheme check (proven separately by `github_agent_refuses_non_https_urls_cleanly`
+        // and `the_github_policy_refuses_http_before_a_socket_is_opened`).
+        let gh = Github { agent: test_agent(), schemes: Schemes::HttpOrHttps, ..Github::new(None) };
         let asset = Asset {
             name: "endless".into(),
             url: String::new(),

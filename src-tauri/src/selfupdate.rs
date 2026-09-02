@@ -1203,16 +1203,10 @@ mod tests {
             routes.insert(blob_path, Canned::body(blob));
             routes
         });
-        // `download_agent()` is https-only and a loopback listener cannot speak TLS — the same swap
-        // mirror.rs's own tests make, with every other field the real thing
-        let agent = ureq::builder()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(Duration::from_secs(5))
-            .timeout_write(Duration::from_secs(5))
-            .redirects(0)
-            .build();
+        // The REAL backend over a plain-HTTP loopback listener: a mirror may be published on http
+        // (`transport::Schemes::HttpOrHttps`), so nothing has to be swapped out to reach it.
         let base = format!("http://127.0.0.1:{}", server.port);
-        (server, crate::mirror::Mirror::with_agent(&base, Payload::Launcher, agent), hash)
+        (server, crate::mirror::Mirror::new(&base, Payload::Launcher), hash)
     }
 
     /// The two shapes the launcher exe resolves to, from ONE signed manifest entry: on a
