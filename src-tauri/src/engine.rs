@@ -499,11 +499,22 @@ pub fn fetch_notes_history(
 /// same build and must not disagree about what to call it.
 /// Drafts and prereleases are excluded here for the same reason as in `fetch_notes_history`: this
 /// page must not offer a version `launcher_check` will never see.
-pub fn launcher_notes_history(repo: &str, releases: &[Release]) -> NotesCache {
+pub fn launcher_notes_history(
+    dl: &dyn Downloader,
+    repo: &str,
+    releases: &[Release],
+) -> NotesCache {
     let published = || releases.iter().filter(|r| r.is_published());
     let entries = published()
         .filter_map(|r| {
-            let notes = r.body.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+            // Through the BACKEND, not `r.body`: a mirror publishes no release index, so its notes
+            // live in a file it has to be asked for. A failure there is "no notes" — one release
+            // whose text could not be fetched must not sink the whole history.
+            let text = dl.notes(r).ok().flatten()?;
+            let notes = text.trim();
+            if notes.is_empty() {
+                return None;
+            }
             Some(NotesEntry {
                 tag: r.tag_name.clone(),
                 version: r.tag_name.trim_start_matches('v').to_string(),
@@ -1016,6 +1027,13 @@ mod tests {
         assert_eq!(cache.latest_tag, "", "nor may it date the cache");
     }
 
+    /// A backend that carries the body inside its release index — GitHub's shape, and the trait's
+    /// default answer. A mirror's is exercised where a mirror is (mirror.rs); what these tests are
+    /// about is which releases reach the history and how they are ordered.
+    fn indexed() -> Fake {
+        Fake::new("v0", r#"{"version":"0","files":[]}"#, vec![])
+    }
+
     fn launcher_rel(tag: &str, body: Option<&str>) -> Release {
         Release {
             tag_name: tag.into(),
@@ -1034,7 +1052,7 @@ mod tests {
             launcher_rel("v1.2.8", None),            // no body at all
             launcher_rel("1.2.7", Some("plain")),    // a tag without the "v" still reports a version
         ];
-        let c = launcher_notes_history("o/r", &rels);
+        let c = launcher_notes_history(&indexed(), "o/r", &rels);
 
         assert_eq!(c.repo, "o/r");
         // newest first, the listing's own order, with the note-less releases dropped
@@ -1046,7 +1064,7 @@ mod tests {
         // no notes must not silently date the cache to the one below it
         assert_eq!(c.latest_tag, "v1.3.0");
 
-        assert_eq!(launcher_notes_history("o/r", &[]).latest_tag, "");
+        assert_eq!(launcher_notes_history(&indexed(), "o/r", &[]).latest_tag, "");
     }
 
     #[test]
@@ -1057,7 +1075,7 @@ mod tests {
         pre.prerelease = true;
         let rels = vec![draft, pre, launcher_rel("v1.8.0", Some("shipped"))];
 
-        let c = launcher_notes_history("o/r", &rels);
+        let c = launcher_notes_history(&indexed(), "o/r", &rels);
         assert_eq!(c.entries.len(), 1);
         assert_eq!(c.entries[0].tag, "v1.8.0");
         // and the key dates to the newest PUBLISHED release, which is what /releases/latest —

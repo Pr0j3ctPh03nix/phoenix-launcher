@@ -126,8 +126,16 @@ pub fn available(
         tag: release.tag_name.clone(),
         version,
         current: current.to_string(),
-        // an empty release body is "no notes", not an empty section in the UI
-        notes: release.body.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string),
+        // Through the BACKEND: GitHub carries the body in the release index, a mirror publishes
+        // it as a file. An empty one is "no notes", not an empty section in the UI — and a notes
+        // fetch that FAILS is the same thing here, because a launcher update is not withheld on
+        // account of its changelog.
+        notes: dl
+            .notes(release)
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     }))
 }
 

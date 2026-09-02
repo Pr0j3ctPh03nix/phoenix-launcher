@@ -32,10 +32,11 @@ pub struct Asset {
 pub struct Release {
     pub tag_name: String,
     pub assets: Vec<Asset>,
-    /// The release description. It is the LAUNCHER's "What's new" — both the pending-update
-    /// banner (selfupdate.rs) and the launcher history page (`engine::launcher_notes_history`)
-    /// render it. The dist repo's comes from its manifests instead. Absent or JSON `null` both
-    /// land as None.
+    /// The release description, as a GitHub release index carries it. Read through
+    /// `Downloader::notes`, never directly: a mirror publishes no index and answers that question
+    /// from a file instead, and a caller that reached for this field would silently get nothing
+    /// from every mirror. The dist repo's own notes come from its manifests instead. Absent or
+    /// JSON `null` both land as None.
     #[serde(default)]
     pub body: Option<String>,
     /// Unpublished. Only ever visible to a token with push access; absent from an anonymous
@@ -110,6 +111,20 @@ pub trait Downloader: Send + Sync {
     }
     /// A release by tag (or the latest).
     fn fetch_release(&self, repo: &str, tag: Option<&str>) -> Result<Release>;
+    /// The release's NOTES — the "What's new" text a user reads about it.
+    ///
+    /// A method rather than a `Release` field, and that is the whole point: on GitHub the body
+    /// arrives inside the release index and is free, while a mirror publishes no index at all and
+    /// has to be asked. Filling it in at `fetch_release` would put that request on the CHECK and
+    /// INSTALL paths, which never show notes — one bounded round trip per release open, on the
+    /// slow links this whole feature exists for, for a string nobody is reading.
+    ///
+    /// `None` is "this release has no notes", which is an answer: a mirror's sync pass writes the
+    /// file even when the body is empty, so its absence is not one and is reported as an error by
+    /// the backend that knows the difference.
+    fn notes(&self, release: &Release) -> Result<Option<String>> {
+        Ok(release.body.clone())
+    }
     /// All releases, newest first.
     fn fetch_releases(&self, repo: &str) -> Result<Vec<Release>>;
     /// A whole asset in memory (small files, e.g. manifest.json).
