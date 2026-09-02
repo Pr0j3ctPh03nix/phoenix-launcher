@@ -216,14 +216,19 @@ fn begin_measuring(want: &HashSet<Option<String>>) {
     notify();
 }
 
-/// A measuring pass has finished: nothing is in flight, and the red rows it was asked about are a
-/// settled question again — `failed` is what a walk reported, and the pass has just re-asked every
-/// source directly.
-fn end_measuring() {
+/// A measuring pass has finished: nothing is in flight, and the sources it ASKED are a settled
+/// question again.
+///
+/// Only those. `failed` is what a walk reported — "this source failed an operation in this
+/// process" — and a pass answers that by going and asking. A pass that measured a subset (the
+/// scheduler's hourly retry of failures, which deliberately leaves healthy sources alone) has said
+/// nothing about the rest, so clearing their rows would drop a red mark for a source nobody
+/// re-asked and nothing has heard from since.
+fn end_measuring(asked: &HashSet<Option<String>>) {
     {
         let mut reg = REGISTRY.lock().unwrap();
         reg.measuring.clear();
-        reg.failed.clear();
+        reg.failed.retain(|k| !asked.contains(k));
     }
     notify();
 }
@@ -695,7 +700,7 @@ fn measure(settings: &Settings, mut sources: Vec<Source>, want: &HashSet<Option<
     for (&i, m) in jobs.iter().zip(taken) {
         sources[i].measured = Some(m);
     }
-    end_measuring();
+    end_measuring(want);
     sources
 }
 
@@ -801,18 +806,6 @@ fn sort(sources: &mut [Source]) {
 /// from the ACTIVE source, failing over: a source that cannot serve the list is a source failure
 /// like any other, and when every one of them is spent the existing list simply stands.
 fn refresh_list(settings: &Settings) -> mirror::Refresh {
-    refresh_list_with(settings, &|existing, source| {
-        mirror::refresh_from(settings, existing, source)
-    })
-}
-
-/// `refresh_list` with the fetch injected — the same seam as `Dial`, for the same reason: the real
-/// one is an https-only agent no loopback listener can satisfy, and what this function is about is
-/// which source is ASKED and what happens when it will not answer.
-fn refresh_list_with(
-    settings: &Settings,
-    fetch: &dyn Fn(&[Source], &Source) -> mirror::Refresh,
-) -> mirror::Refresh {
     let base = match mirror::bootstrap(settings) {
         // Adopted but NOT persisted: step 7 writes once, with whatever the refresh below concludes
         // and the higher of the two accepted serials. What adopting buys is that the freshly baked
@@ -823,13 +816,33 @@ fn refresh_list_with(
         }
         None => mirror::unchanged(&settings.sources),
     };
+    refresh_list_with(settings, base, &|existing, source, floor| {
+        mirror::refresh_from(settings, existing, source, floor)
+    })
+}
+
+/// `refresh_list` over an already-decided `base`, with the fetch injected — the same seam as
+/// `Dial`, for the same reason: the real one is an https-only agent no loopback listener can
+/// satisfy, and what this function is about is which source is ASKED, what floor it is asked
+/// against, and what happens when it will not answer.
+fn refresh_list_with(
+    settings: &Settings,
+    base: mirror::Refresh,
+    fetch: &dyn Fn(&[Source], &Source, u64) -> mirror::Refresh,
+) -> mirror::Refresh {
+    // `base.floor`, NOT the settings': a bootstrap has accepted a list at serial N and deliberately
+    // not persisted it yet, so the settings still say 0 — and a fetch checked against 0 would take
+    // a validly-signed OLDER list on top of the baked one, keep ITS hosts (`then` takes the later
+    // sources) and persist them under a floor of N. A rollback on the one document that decides
+    // where every future download comes from, on exactly the first run the bootstrap exists for.
+    let floor = base.floor(settings);
     // The SAME walk every other read takes (`each_source`): mark, advance, retry. A source that
     // cannot serve the list is a source failure like any other, which cannot turn a refusal into an
     // application — `mirror::apply` still leaves the list exactly as it was — only into another
     // attempt at another host. `Refresh` carries its failure in a field rather than a `Result`, so
     // the two are bridged here and nowhere else.
     let asked = each_source(&ranking(), &mut HashSet::new(), |source| {
-        let attempt = fetch(&base.sources, source);
+        let attempt = fetch(&base.sources, source, floor);
         match &attempt.error {
             None => Ok(attempt),
             Some(why) => Err(anyhow::anyhow!("{why}")),
@@ -1183,7 +1196,8 @@ mod tests {
         // the first two refuse it — a tampered document and a stale serial land in exactly the
         // same place as a host that could not be reached, which is the point
         let published = vec![Source::default(), Source::at("https://published")];
-        let out = refresh_list_with(&settings, &|current, source| {
+        let base = mirror::unchanged(&existing);
+        let out = refresh_list_with(&settings, base, &|current, source, _floor| {
             asked.lock().unwrap().push(source.url.clone());
             match source.key() {
                 Some("https://b") => mirror::unchanged(&published),
@@ -1204,7 +1218,8 @@ mod tests {
         assert!(snapshot().failed.contains(&None), "the sources that refused it are reported");
 
         // every copy refused: silence. The list stands and the reason is REPORTED, not acted on.
-        let out = refresh_list_with(&settings, &|current, source| {
+        let base = mirror::unchanged(&existing);
+        let out = refresh_list_with(&settings, base, &|current, source, _floor| {
             let mut r = mirror::unchanged(current);
             r.error = Some(format!("{:?} refused it", source.key()));
             r
@@ -1212,6 +1227,91 @@ mod tests {
         assert_eq!(out.sources, existing, "a refusal everywhere leaves the list exactly as it was");
         assert!(out.error.is_some());
         assert!(snapshot().refresh_error.is_some(), "…and the status block says why");
+    }
+
+    /// A pass settles only the sources it ASKED.
+    ///
+    /// `failed` is what a walk reported — "this source failed an operation in this process" — and
+    /// the only thing that answers it is going and asking again. The scheduler's hourly retry
+    /// measures a SUBSET on purpose (a healthy source is never re-timed on a timer), so clearing
+    /// every row would drop a red mark for a source nobody re-asked and nothing has heard from
+    /// since: a reporting claim the launcher has no evidence for.
+    #[test]
+    fn a_measuring_pass_settles_only_the_sources_it_asked() {
+        let _t = turn();
+        let sources = vec![Source::default(), Source::at("https://a"), Source::at("https://b")];
+        adopt(&sources);
+        {
+            let mut reg = REGISTRY.lock().unwrap();
+            reg.failed = sources.iter().map(key_of).collect();
+        }
+
+        end_measuring(&HashSet::from([Some("https://a".to_string())]));
+
+        let snap = snapshot();
+        assert!(
+            !snap.failed.contains(&Some("https://a".to_string())),
+            "the source the pass asked is a settled question again"
+        );
+        assert!(
+            snap.failed.contains(&None) && snap.failed.contains(&Some("https://b".to_string())),
+            "…and the ones it did not ask keep the row they earned: {:?}",
+            snap.failed
+        );
+        assert!(snap.measuring.is_empty(), "and nothing is left in flight");
+    }
+
+    /// THE FIRST-RUN ROLLBACK. A baked bootstrap ACCEPTS a list at serial N and is deliberately not
+    /// persisted until the one write at the end of the sequence — so `settings.serial_floor` is
+    /// still 0 while the launch goes on to fetch the published list.
+    ///
+    /// A fetch checked against that 0 accepts a validly-signed OLDER list, and `Refresh::then`
+    /// keeps the LATER sources with the HIGHER serial: the machine ends up believing the older
+    /// list's hosts under a floor claiming N, which is precisely the rollback the ratchet exists to
+    /// refuse — on the one document that decides where every future download comes from, on exactly
+    /// the run the bootstrap exists for.
+    #[test]
+    fn a_fetched_list_older_than_the_baked_one_is_refused_on_first_run() {
+        let _t = turn();
+        let existing = vec![Source::default()];
+        adopt(&existing);
+        // a fresh machine: nothing persisted, so the settings floor is 0
+        let settings = Settings { sources: existing.clone(), ..Settings::default() };
+        assert_eq!(settings.serial_floor(Payload::Mirrors), 0);
+
+        // …on top of a bootstrap that has accepted a list at 5
+        let seen = Mutex::new(Vec::<u64>::new());
+        let refuse_below_floor = |current: &[Source], _source: &Source, floor: u64| {
+            seen.lock().unwrap().push(floor);
+            let mut r = mirror::unchanged(current);
+            if 4 < floor {
+                r.error = Some("serial 4 is below the floor".into());
+            }
+            r
+        };
+        let out =
+            refresh_list_with(&settings, mirror::accepted_at(&existing, 5), &refuse_below_floor);
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [5],
+            "the fetch is checked against the floor the BOOTSTRAP established, not the settings' 0"
+        );
+        // the older list is refused, so it is silence: the baked hosts stand
+        assert!(out.error.is_some());
+        assert!(
+            out.sources.iter().any(|s| s.key() == Some("https://baked.example")),
+            "a refusal leaves the accepted list exactly as it was: {:?}",
+            out.sources
+        );
+
+        // and a list that DOES clear the floor is applied on top, as before
+        let published = vec![Source::default(), Source::at("https://newer.example")];
+        let out = refresh_list_with(&settings, mirror::accepted_at(&existing, 5), &|_c, _s, _f| {
+            mirror::unchanged(&published)
+        });
+        assert_eq!(out.sources, published);
+        assert!(out.error.is_none());
     }
 
     /// A clock moved BACKWARDS must not make everything look due — that would re-time the world on

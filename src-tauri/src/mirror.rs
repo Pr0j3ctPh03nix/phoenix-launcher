@@ -94,6 +94,22 @@ impl Refresh {
         }
     }
 
+    /// The floor a list fetched ON TOP of this refresh has to clear.
+    ///
+    /// The higher of what settings record and what this refresh has ALREADY ACCEPTED, and the
+    /// second half is the whole reason this exists. A baked bootstrap accepts a list at serial N
+    /// and is deliberately not persisted until step 7, so `settings.serial_floor` is still 0 for
+    /// the rest of the launch — and a fetch verified against 0 would accept a validly-signed OLDER
+    /// list on top of it, take its hosts (`then` keeps the LATER sources), and persist them under a
+    /// floor of N. A rollback, on the one document that decides where every future download comes
+    /// from, on exactly the first run the bootstrap exists for.
+    ///
+    /// The serial itself stays private: what leaves here is a floor to check against, never a
+    /// number a caller could persist.
+    pub fn floor(&self, settings: &Settings) -> u64 {
+        settings.serial_floor(Payload::Mirrors).max(self.serial.unwrap_or(0))
+    }
+
     /// Persist a refresh: the sources it concluded AND the serial of the list they came from, in
     /// one settings write.
     ///
@@ -159,8 +175,16 @@ pub fn unchanged(existing: &[Source]) -> Refresh {
 /// The error arm is a SOURCE failure: the caller marks that source and moves to the next. That
 /// cannot turn a refusal into an application — `apply` still leaves the list exactly as it was —
 /// only into another attempt at another host.
-pub fn refresh_from(settings: &Settings, existing: &[Source], source: &Source) -> Refresh {
-    let floor = settings.serial_floor(Payload::Mirrors);
+///
+/// `floor` is the caller's (`Refresh::floor`), not `settings.serial_floor` read here: a launch can
+/// have ACCEPTED a baked list it has not persisted yet, and reading the settings would check the
+/// fetched document against a floor that predates it.
+pub fn refresh_from(
+    settings: &Settings,
+    existing: &[Source],
+    source: &Source,
+    floor: u64,
+) -> Refresh {
     apply(existing, fetch_list_from(settings, source, floor))
 }
 
@@ -182,6 +206,43 @@ pub fn bootstrap(settings: &Settings) -> Option<Refresh> {
     let (doc, sig) = BAKED?;
     let applied = apply(&settings.sources, signed::verify(doc, sig, 0).map(Some));
     applied.error.is_none().then_some(applied)
+}
+
+/// A refresh that ACCEPTED a published list at `serial`, built through the ordinary door
+/// (`signed::verify` then `apply`).
+///
+/// Test-only, and it exists for `source`'s tests rather than this file's: the state that matters is
+/// "a list has been accepted and not yet persisted", which in production only a BAKED bootstrap
+/// produces — and whether a build baked anything is decided by `PHOENIX_MIRRORS_DIR`, so a test
+/// that needed one could only run in half of the two build modes this feature has.
+#[cfg(test)]
+pub(crate) fn accepted_at(existing: &[Source], serial: u64) -> Refresh {
+    let doc = list_doc("mirrors", serial, &entry("phx-baked", "https://baked.example", r#"["mod"]"#));
+    let sig = crate::trust::testing::test_sig(doc.as_bytes());
+    let applied = apply(existing, signed::verify(doc.as_bytes(), &sig, 0).map(Some));
+    assert!(applied.error.is_none(), "the fixture must be a document this reader accepts");
+    applied
+}
+
+/// The document exactly as `generate_mirror_list.py` renders it — the producer's literal field
+/// names, values and framing, never a Rust struct serialized back out. That is what makes the tests
+/// able to notice a cross-repo rename: `"payload_id": "mirrors"` here is compared against
+/// `Payload::Mirrors.id()` by the code under test, so a typo on either side fails in the suite
+/// rather than in the field, where the symptom would be a mirror list nobody can read and no error
+/// anywhere.
+#[cfg(test)]
+fn list_doc(payload_id: &str, serial: u64, mirrors: &str) -> String {
+    format!(
+        "{{\n  \"format\": 1,\n  \"payload_id\": \"{payload_id}\",\n  \"serial\": {serial},\n  \
+         \"signed_at\": \"2026-09-01T11:00:00Z\",\n  \"mirrors\": [{mirrors}]\n}}\n"
+    )
+}
+
+/// One registration. `payloads` is raw array text so a test can publish one the format does not
+/// describe.
+#[cfg(test)]
+fn entry(name: &str, url: &str, payloads: &str) -> String {
+    format!(r#"{{"base_url": "{url}", "name": "{name}", "country": "FI", "payloads": {payloads}}}"#)
 }
 
 /// Merge the published mirror list into the existing one, PRESERVING ORDER AND MEASUREMENTS.
@@ -1184,25 +1245,6 @@ mod tests {
 
     /// Every payload the format defines, as the producer spells them.
     const ALL: &str = r#"["mod", "launcher", "game"]"#;
-
-    /// The document exactly as `generate_mirror_list.py` renders it — the producer's literal field
-    /// names, values and framing, never a Rust struct serialized back out. That is what makes these
-    /// tests able to notice a cross-repo rename: `"payload_id": "mirrors"` here is compared against
-    /// `Payload::Mirrors.id()` by the code under test, so a typo on either side fails below rather
-    /// than in the field, where the symptom would be a mirror list nobody can read and no error
-    /// anywhere.
-    fn list_doc(payload_id: &str, serial: u64, mirrors: &str) -> String {
-        format!(
-            "{{\n  \"format\": 1,\n  \"payload_id\": \"{payload_id}\",\n  \"serial\": {serial},\n  \
-             \"signed_at\": \"2026-09-01T11:00:00Z\",\n  \"mirrors\": [{mirrors}]\n}}\n"
-        )
-    }
-
-    /// One registration. `payloads` is raw array text so a test can publish one the format does not
-    /// describe.
-    fn entry(name: &str, url: &str, payloads: &str) -> String {
-        format!(r#"{{"base_url": "{url}", "name": "{name}", "country": "FI", "payloads": {payloads}}}"#)
-    }
 
     /// A mirror serving the two documents at its ROOT — either of them optional, so a test can omit
     /// the signature or the list itself.
