@@ -140,9 +140,9 @@ fn generate_pinned_keys() -> Vec<minisig::TrustedKey> {
 ///
 /// Everything checkable is checked, against the same reader the runtime uses and the same keys it
 /// will use: the signature (`minisig::verify` over the ring just generated), the format number, the
-/// payload id, and the presence of an integer serial. `mirror::signed::verify` re-checks all four
-/// at runtime — this is not a substitute for that gate, it is the difference between a bad list
-/// failing a build and a bad list shipping as silence.
+/// payload id, and a serial of at least 1. `mirror::signed::verify` re-checks all four at runtime —
+/// this is not a substitute for that gate, it is the difference between a bad list failing a build
+/// and a bad list shipping as silence.
 fn generate_baked_mirrors(keys: &[minisig::TrustedKey]) {
     println!("cargo:rerun-if-env-changed={MIRRORS_DIR_ENV}");
     let out = PathBuf::from(std::env::var_os("OUT_DIR").expect("cargo sets OUT_DIR"))
@@ -191,8 +191,19 @@ fn generate_baked_mirrors(keys: &[minisig::TrustedKey]) {
     if parsed.get("payload_id").and_then(serde_json::Value::as_str) != Some(MIRRORS_PAYLOAD_ID) {
         complain(&format!("it does not identify itself as the {MIRRORS_PAYLOAD_ID:?} payload"));
     }
-    if parsed.get("serial").and_then(serde_json::Value::as_u64).is_none() {
-        complain("it carries no integer serial, so nothing can order it against a later list");
+    // At least 1, not merely present. Zero is the one serial that verifies at runtime and then
+    // cannot ratchet — `Settings::advance_serial` moves only on a strict increase, so a list
+    // accepted at 0 leaves the anti-rollback floor at 0 forever, and that same floor is what tells
+    // `mirror::bootstrap` this machine has never accepted a list. `mirror::signed::verify` refuses
+    // one; refusing it HERE as well is the difference between a bad list being inert in the field
+    // and a bad list never being baked into a binary at all.
+    match parsed.get("serial").and_then(serde_json::Value::as_u64) {
+        None => complain("it carries no integer serial, so nothing can order it against a later list"),
+        Some(0) => complain(
+            "it carries serial 0, which no client can ratchet forward from — the registry never \
+             mints one, and the runtime reader refuses one",
+        ),
+        Some(_) => {}
     }
 
     write(format!(

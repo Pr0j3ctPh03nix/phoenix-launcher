@@ -192,7 +192,8 @@ pub fn refresh_from(
 ///
 /// "First run" is `serial_floor(Mirrors) == 0`, and it needs no new field: the floor already
 /// records "this machine has ever accepted a mirror list", which is exactly the question. (It is
-/// also why the registry must never mint serial 0.) The document goes through `signed::verify`
+/// also why a list at serial 0 is refused outright — see `signed::verify`, which enforces that
+/// rather than trusting the registry never to mint one.) The document goes through `signed::verify`
 /// against that same floor and is ratcheted by `persist` like any other accepted list, so a baked
 /// list applies exactly once and a machine that has since taken a newer one never sees it.
 ///
@@ -528,6 +529,24 @@ mod signed {
         let serial =
             trust::accept_ident(Payload::Mirrors, parsed.payload_id.as_deref(), parsed.serial, floor)
                 .map_err(anyhow::Error::new)?;
+        // SERIAL 0 IS NOT A SERIAL, and this is where that is decided rather than assumed.
+        //
+        // A zero verifies (`accept_ident` compares `>= floor`, and a fresh machine's floor is 0),
+        // applies, and then cannot ratchet: `advance_serial` moves only on a strict increase, so
+        // the floor stays 0 forever. Both things that read the floor then quietly stop working —
+        // `bootstrap` re-applies the BAKED list on every launch, undoing the guarantee that a
+        // verified EMPTY list is not resurrected by a later run, and the anti-rollback ratchet
+        // never engages at all. Neither has a symptom.
+        //
+        // The producer's rule is that seeding a first serial is a hand-run dispatch that never
+        // mints 0 (`build.rs` refuses one too, so a bad list cannot even be baked). That rule used
+        // to live only in prose across two repos; a cross-repo invariant nothing checks is exactly
+        // what this reader refuses to leave open elsewhere, so it is checked here.
+        if serial == 0 {
+            anyhow::bail!(
+                "the mirror list carries serial 0, which no client can order a later list against"
+            );
+        }
 
         // ONE bad entry refuses the WHOLE document rather than being dropped. This list is signed,
         // so a malformed entry cannot be an attacker's doing — it is our own producer having
@@ -1353,6 +1372,35 @@ mod tests {
             ),
             "expected a stale-serial refusal, got: {err:#}"
         );
+    }
+
+    /// SERIAL 0 IS REFUSED, however good its signature is.
+    ///
+    /// It is the one serial that verifies and then cannot ratchet: `advance_serial` moves on a
+    /// strict increase, so a list accepted at 0 leaves the floor at 0 — and the floor is also what
+    /// `bootstrap` reads as "this machine has never accepted a list". So a zero would re-apply the
+    /// baked hosts on every launch (undoing a verified EMPTY list, the one outcome `apply`'s three
+    /// arms exist to protect) and leave the rollback ratchet permanently disengaged, both silently.
+    /// The producer promises never to mint one; this is that promise checked where the document is
+    /// read, because the launcher does not act on cross-repo promises nothing verifies.
+    #[test]
+    fn a_mirror_list_at_serial_zero_is_refused() {
+        let doc = list_doc("mirrors", 0, &entry("phx-fi-1", "https://fi1.example", ALL));
+        let err = verify_signed(&doc, 0).expect_err("serial 0 cannot be ordered against anything");
+        assert!(
+            format!("{err:#}").contains("serial 0"),
+            "the refusal has to name what is wrong with it: {err:#}"
+        );
+        // …and it is refused as a REFUSAL, which `apply` turns into silence: the list a machine
+        // already has is left exactly as it was, never replaced by an unorderable one.
+        let existing = vec![Source::default(), Source::at("https://kept.example")];
+        let out = apply(&existing, verify_signed(&doc, 0).map(Some));
+        assert_eq!(out.sources, existing);
+        assert!(out.error.is_some());
+
+        // one above it is an ordinary first list
+        let doc = list_doc("mirrors", 1, &entry("phx-fi-1", "https://fi1.example", ALL));
+        assert_eq!(verify_signed(&doc, 0).expect("serial 1 is a serial").serial(), 1);
     }
 
     /// A MIRROR WITHOUT `mirrors.json` IS A BROKEN HOST — and this deliberately INVERTS what this
