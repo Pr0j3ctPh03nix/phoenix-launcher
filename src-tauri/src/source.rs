@@ -92,7 +92,8 @@ const PROBE_PAYLOAD: Payload = Payload::Mod;
 struct Registry {
     /// Ranked, fastest-healthy first — the order settings are persisted in.
     sources: Vec<Source>,
-    /// Index into `sources`. Never out of range.
+    /// Index into `sources`. Never out of range, structurally: `adopt` refuses an empty ranking
+    /// and `mark` leaves the index alone when it cannot find the key.
     active: usize,
     /// Failed an operation in THIS process. Cleared by a completed measuring pass and by start.
     failed: HashSet<Option<String>>,
@@ -162,7 +163,16 @@ pub fn snapshot() -> Snapshot {
 }
 
 /// Take `sources` as the ranking this process uses, and start at its head.
+///
+/// An EMPTY slice is ignored, and that is what makes `active`'s "never out of range" an invariant
+/// rather than a claim: `active = 0` indexes nothing in an empty list, and every producer of a
+/// ranking already guarantees a non-empty one (`migrate` restores the built-in entry, `rebuild`
+/// re-inserts it). So an empty one can only be a caller mistake, and adopting it would leave the
+/// launcher with no source to walk at all — strictly worse than keeping the ranking it had.
 pub fn adopt(sources: &[Source]) {
+    if sources.is_empty() {
+        return;
+    }
     {
         let mut reg = REGISTRY.lock().unwrap();
         reg.sources = sources.to_vec();
@@ -204,6 +214,10 @@ fn mark(key: Option<&str>, failed: bool) {
     {
         let mut reg = REGISTRY.lock().unwrap();
         let owned = key.map(str::to_string);
+        // Only when the key is one of ours. A walk captured its ranking before a refresh replaced
+        // the list, so the source it is reporting may no longer be in it — and the honest answer
+        // then is that the marker has not moved, never an index into a list that has changed
+        // under it.
         if let Some(i) = reg.sources.iter().position(|s| s.url == owned) {
             reg.active = i;
         }
@@ -915,8 +929,12 @@ fn refresh_list_with(
 /// thread: boot must not wait on the network, and nothing on screen depends on it.
 pub fn start() {
     let settings = Settings::load();
+    // No `failed.clear()` here: `failed` is runtime-only and this runs once per process, so the
+    // set is already empty — the line only ever looked like it was doing something. And if it ever
+    // weren't empty, clearing it without `notify()` would leave the pushed view claiming red rows
+    // the registry no longer holds. What answers a red row is a measuring pass (`end_measuring`),
+    // which is the one thing that has been and asked.
     adopt(&settings.sources);
-    REGISTRY.lock().unwrap().failed.clear();
     std::thread::spawn(move || {
         let outcome = refresh_and_measure(&settings);
         let _ = outcome.persist();
@@ -1132,6 +1150,33 @@ mod tests {
         let mut none = vec![Source::default(), Source::at("https://a.example")];
         sort(&mut none);
         assert!(none[0].is_github(), "a stable sort cannot invent a preference");
+    }
+
+    /// `active` IS IN RANGE BY CONSTRUCTION, and this is the only way it could stop being.
+    ///
+    /// `adopt` sets the marker to the head of what it was handed, so an empty ranking would leave
+    /// it pointing at nothing — and every producer of a ranking already refuses to make an empty
+    /// one (`migrate` restores the built-in entry, `rebuild` re-inserts it), which makes an empty
+    /// slice a caller's mistake and not an answer. Ignoring it keeps the last ranking, which is
+    /// strictly better than a launcher with nowhere to download from. `mark` is the other half:
+    /// a key that is not in the list moves nothing.
+    #[test]
+    fn adopt_never_leaves_the_registry_without_a_source() {
+        let _t = turn();
+        let sources = vec![Source::default(), Source::at("https://a.example")];
+        adopt(&sources);
+        report_active(Some("https://a.example"));
+        assert_eq!(snapshot().active, 1);
+
+        adopt(&[]);
+        let snap = snapshot();
+        assert_eq!(snap.sources, sources, "an empty ranking is not a ranking");
+        assert_eq!(snap.active, 1, "…so nothing about the marker changed either");
+
+        // and a source that is not in the list leaves the marker where it was
+        report_active(Some("https://gone.example"));
+        assert_eq!(snapshot().active, 1);
+        assert!(snapshot().active < snapshot().sources.len(), "never out of range");
     }
 
     /// REQUIREMENT 4's trigger, all three parts: a source with no settled answer starts a pass,
