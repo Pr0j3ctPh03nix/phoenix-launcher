@@ -58,10 +58,11 @@ pub async fn release_notes(
 /// every launch and records the tag it saw, so a cached history that names the same tag is
 /// provably current.
 ///
-/// Read through the ACTIVE SOURCE like everything else, and what that buys is not failover so much
-/// as an answer at all: a client that cannot reach GitHub has no release index to list, and its
-/// mirror publishes exactly one release. So on a mirror this history is the CURRENT release alone —
-/// which is what there is, and better than the honest error it used to be.
+/// Read through the ACTIVE SOURCE like everything else, but it is a GITHUB view: these notes are
+/// the release DESCRIPTIONS, and only a release index carries those. A mirror publishes none, so on
+/// one this history is empty and what a user there reads about the release being offered is the
+/// update banner, whose text comes out of the manifest that release signed. An archive built from
+/// prose a third-party host hands over is not one the launcher will render as its own changelog.
 #[tauri::command]
 pub async fn launcher_notes(
     state: tauri::State<'_, Arc<AppState>>,
@@ -82,7 +83,7 @@ pub async fn launcher_notes(
                 // cheap.
                 source::with_active_dl(&settings, &repo, Payload::Launcher, |dl| {
                     let releases = dl.fetch_releases(&repo)?;
-                    Ok(engine::launcher_notes_history(dl, &repo, &releases))
+                    Ok(engine::launcher_notes_history(&repo, &releases))
                 })
             },
         )

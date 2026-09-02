@@ -48,9 +48,11 @@ const state = {
   tokenClear: false,   // "Clear" was pressed: the saved token is removed on save
 };
 
-// ---- markdown-lite: the notes are trusted (our own manifest) but escape anyway, then apply the
+// ---- markdown-lite: every string rendered here comes from one of OUR OWN manifests — the update
+// banner's out of a signature-checked one, the archive pages' out of the same documents read
+// without the check (engine::fetch_notes_history) — so it is trusted, and escaped anyway. Then the
 // changelog subset: headings, bullet + ordered lists, ``` fences, **bold**, *italic*, `code`,
-// [links](https://вЂ¦). No raw HTML from the source ever reaches innerHTML; links go through the
+// [links](https://…). No raw HTML from the source ever reaches innerHTML; links go through the
 // open_url command (http/https only). ----
 function escHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");

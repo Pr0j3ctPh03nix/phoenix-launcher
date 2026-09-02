@@ -35,15 +35,6 @@ const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 /// The published mirror list, as a release asset and at every mirror's root.
 pub const MIRRORS_ASSET: &str = "mirrors.json";
 
-/// The release notes a mirror publishes beside a payload: the GitHub release body of the release
-/// its manifest came from, verbatim, written by the host's sync pass on every run.
-const NOTES_ASSET: &str = "notes.md";
-
-/// Ceiling on those notes. Unsigned DISPLAY TEXT, at exactly the trust level GitHub's own release
-/// body has — so what this bounds is not belief, it is memory: a megabyte is already far past any
-/// changelog anyone will read, and the read happens against the least trusted host in the system.
-const NOTES_MAX_BYTES: u64 = 1 << 20;
-
 /// Ceiling on the published `mirrors.json`, wherever it is read from.
 ///
 /// An entry is a couple of hundred bytes, so a megabyte is already thousands of them — and it is a
@@ -1064,30 +1055,6 @@ impl Downloader for Mirror {
         Ok(vec![self.fetch_release(repo, None)?])
     }
 
-    /// The release notes this host publishes beside the payload, or `None` if it publishes none.
-    ///
-    /// A 404 is `None` and not a failure: a release genuinely without notes is an ordinary release,
-    /// and refusing to show an update because its changelog is missing would be absurd. Every other
-    /// failure is an error, so a host answering oddly is never mistaken for one answering "none".
-    ///
-    /// UNSIGNED, deliberately, and at exactly the trust level GitHub's release body already has:
-    /// it is prose shown to a human and no hash, path or version is ever taken from it. The
-    /// frontend renders it through the same markdown path as GitHub's, which builds DOM nodes and
-    /// parses no HTML.
-    fn notes(&self, _release: &Release) -> Result<Option<String>> {
-        let url = self.doc_url(NOTES_ASSET);
-        let resp = match transport::fetch(&self.agent, &url, |req, _same_origin| {
-            req.set("User-Agent", UA)
-        }) {
-            Ok(r) => r,
-            Err(FetchError::Http(ureq::Error::Status(404, _))) => return Ok(None),
-            Err(e) => return Err(net_err_fetch(e)),
-        };
-        let text = String::from_utf8(read_all(resp, NOTES_MAX_BYTES)?)
-            .with_context(|| format!("{NOTES_ASSET} is not UTF-8"))?;
-        Ok(Some(text))
-    }
-
     /// A whole asset in memory, bounded at the size the CALLER declared for it — `asset.size`.
     ///
     /// On this backend that field is never a release index's claim, because there is no release
@@ -1968,47 +1935,6 @@ mod tests {
         );
         // …and the tag it DOES serve resolves
         assert!(m.fetch_release("ignored/repo", Some("v1.4.2")).is_ok());
-    }
-
-    /// A mirror publishes no release index, so the "What's new" text a GitHub release carries in
-    /// its `body` is a FILE here — written by the host's sync pass on every run, beside the payload
-    /// it describes.
-    ///
-    /// A 404 is `None`: a release genuinely without notes is an ordinary release, and refusing to
-    /// show an update because its changelog is missing would be absurd. It is also NOT fetched with
-    /// the release — `Downloader::notes` is a method precisely so the check and install paths,
-    /// which never show notes, do not pay a round trip per release open for a string nobody is
-    /// reading.
-    #[test]
-    fn a_mirror_serves_the_release_notes_beside_the_payload() {
-        use crate::downloader::Downloader;
-        use crate::test_http::{Canned, TestServer};
-        let doc = br#"{"schema":2,"payload_id":"mod","version":"1.4.2","files":[]}"#.to_vec();
-        let sig = crate::trust::testing::test_sig(&doc);
-        let (body, expect) = (doc.clone(), sig.clone());
-        let server = TestServer::start(move |_port| {
-            let mut routes = std::collections::HashMap::new();
-            routes.insert("/mod/manifest.json", Canned::body(body.clone()));
-            routes.insert("/mod/manifest.json.minisig", Canned::body(expect.clone().into_bytes()));
-            routes.insert("/mod/notes.md", Canned::body(b"#### Added
-- a thing
-".to_vec()));
-            routes
-        });
-        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
-        let release = m.fetch_release("ignored/repo", None).expect("the mirror's one release");
-
-        assert_eq!(server.hits("/mod/notes.md"), 0, "opening a release must not fetch its notes");
-        assert_eq!(m.notes(&release).unwrap().as_deref(), Some("#### Added
-- a thing
-"));
-        assert_eq!(server.hits("/mod/notes.md"), 1);
-
-        // a host that publishes none answers "none" — not a failure, and not an empty section
-        let bare = payload_server(doc, Some(sig));
-        let m = test_mirror(&format!("http://127.0.0.1:{}", bare.port), crate::trust::Payload::Mod);
-        let release = m.fetch_release("ignored/repo", None).unwrap();
-        assert_eq!(m.notes(&release).unwrap(), None);
     }
 
     /// NO UNVERIFIED PARSE REMAINS. `fetch_release` reads `version` out of the manifest to name the

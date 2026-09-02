@@ -55,7 +55,9 @@ pub struct Available {
     pub version: String,
     /// This build's version, so the UI can render "1.2.1 -> 1.3.0" without a second call.
     pub current: String,
-    /// The GitHub release description, if it has one.
+    /// The release's "What's new" text, out of the SIGNED manifest — the same document the version
+    /// above is read from. `None` for a release whose manifest carries none, and for the legacy
+    /// shape that carries no manifest at all.
     pub notes: Option<String>,
 }
 
@@ -112,13 +114,11 @@ pub fn available(
     release: &Release,
 ) -> Result<Option<Available>> {
     let current = env!("CARGO_PKG_VERSION");
-    let signed = match release.asset(engine::MANIFEST_ASSET) {
-        // Bad signature, unknown key, wrong payload, stale serial — a release we do not have, and
-        // a fact about the SOURCE serving it, so it propagates and the walk moves on.
-        Some(_) => Some(engine::manifest_of(settings, dl, release, Payload::Launcher)?.version),
-        None => None,
+    let signed = signed_manifest(settings, dl, release)?;
+    let version = match &signed {
+        Some(m) => m.version.clone(),
+        None => release.tag_name.trim_start_matches('v').to_string(),
     };
-    let version = signed.unwrap_or_else(|| release.tag_name.trim_start_matches('v').to_string());
     if !version_lt(current, &version) {
         return Ok(None);
     }
@@ -126,17 +126,39 @@ pub fn available(
         tag: release.tag_name.clone(),
         version,
         current: current.to_string(),
-        // Through the BACKEND: GitHub carries the body in the release index, a mirror publishes
-        // it as a file. An empty one is "no notes", not an empty section in the UI — and a notes
-        // fetch that FAILS is the same thing here, because a launcher update is not withheld on
-        // account of its changelog.
-        notes: dl
-            .notes(release)
-            .ok()
-            .flatten()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty()),
+        // OUT OF THE SIGNED DOCUMENT, like the version beside it. This is prose the launcher
+        // renders as its own changelog, in a banner that says a new launcher is available, with
+        // links it will open in the user's browser — so it comes from the one place a source
+        // cannot rewrite. An empty one is "no notes", not an empty section in the UI, and a
+        // release without a changelog is an ordinary release: nothing here withholds an update
+        // over its notes.
+        notes: signed
+            .as_ref()
+            .and_then(|m| m.notes.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     }))
+}
+
+/// The release's SIGNED manifest, or `None` when it publishes none.
+///
+/// THE one place the two shapes of a launcher release are told apart, so everything downstream
+/// follows this single answer rather than asking the question again: which version is being
+/// offered, what its notes say, and which entry names the exe to run. `resolve`'s legacy branch is
+/// exactly the `None` here — read its doc for why that branch exists and what closes it.
+///
+/// A refusal — bad signature, unknown key, wrong payload, stale serial — is a release we do not
+/// have, and a fact about the SOURCE serving it, so it propagates and the walk moves on.
+fn signed_manifest(
+    settings: &Settings,
+    dl: &dyn Downloader,
+    release: &Release,
+) -> Result<Option<Manifest>> {
+    match release.asset(engine::MANIFEST_ASSET) {
+        Some(_) => Ok(Some(engine::manifest_of(settings, dl, release, Payload::Launcher)?)),
+        None => Ok(None),
+    }
 }
 
 /// A verified launcher binary, staged beside the running one and ready to be swapped in.
@@ -582,13 +604,40 @@ mod tests {
         assert_eq!(a.current, env!("CARGO_PKG_VERSION"));
     }
 
+    /// THE NOTES COME FROM THE SIGNED DOCUMENT, and from nowhere else.
+    ///
+    /// They are rendered as the launcher's own changelog, inside a banner whose chrome says a new
+    /// launcher is available, with links the launcher itself opens in the user's browser. The
+    /// release BODY is a string whoever serves the release writes, and on a mirror that is a third
+    /// party who registered by pull request — so it is not what the banner shows, however good it
+    /// looks. A blank one is "no notes" rather than an empty section, as before.
     #[test]
-    fn blank_release_body_is_not_notes() {
-        assert!(offered("v999.0.0", Some("  \n ")).unwrap().notes.is_none());
+    fn the_offered_notes_come_from_the_signed_manifest() {
+        let offered_with = |notes: serde_json::Value, body: Option<&str>| {
+            let doc = serde_json::json!({
+                "schema": 2, "payload_id": "launcher", "serial": 3, "version": "999.0.0",
+                "notes": notes, "files": []
+            })
+            .to_string();
+            let dl = crate::downloader::fake::Fake::new("v999.0.0", &doc, vec![]);
+            let mut rel = dl.fetch_release("r", None).unwrap();
+            rel.body = body.map(str::to_string);
+            available(&Settings::default(), &dl, &rel).unwrap().expect("999.0.0 is an upgrade")
+        };
+
         assert_eq!(
-            offered("v999.0.0", Some(" fixed stuff ")).unwrap().notes.as_deref(),
-            Some("fixed stuff")
+            offered_with(serde_json::json!("### Fixed\n- a thing"), None).notes.as_deref(),
+            Some("### Fixed\n- a thing")
         );
+        assert!(offered_with(serde_json::json!("  \n "), None).notes.is_none(), "blank is none");
+        // …and the body is not a fallback: a signed document that carries no notes has none, even
+        // when the source has plenty to say for itself.
+        assert!(
+            offered_with(serde_json::Value::Null, Some("### Click here for free hats")).notes.is_none(),
+            "the release body is not where the banner's text comes from"
+        );
+        // the legacy shape carries no manifest at all, so it carries no notes either
+        assert!(offered("v999.0.0", Some(" fixed stuff ")).unwrap().notes.is_none());
     }
 
     #[test]
