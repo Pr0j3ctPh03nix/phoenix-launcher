@@ -3687,7 +3687,8 @@ mod tests {
         // ...while the foreign file is preserved, not destroyed
         assert_eq!(std::fs::read(dir.join(VANILLA_DIR).join("game/dota/stale.vpk")).unwrap(), b"old");
         // and the next plan is clean — no permanent pending-remove loop
-        let chk = crate::engine::check(&settings(&dir), dl.as_ref(), None).unwrap();
+        let rel = dl.fetch_release("r", None).unwrap();
+        let chk = crate::engine::check(&settings(&dir), dl.as_ref(), &rel).unwrap();
         assert_eq!(chk.changes(), 0, "plan must not re-flag the removed file");
 
         // uninstall reverts to what was there before us: the preserved file comes back
@@ -3738,7 +3739,8 @@ mod tests {
         assert_eq!(st.restored, vec!["game/dota/sound.vpk".to_string()]);
 
         // the next plan is CLEAN — the restored original must not re-flag as Remove
-        let chk = crate::engine::check(&settings(&dir), dl2.as_ref(), None).unwrap();
+        let rel = dl2.fetch_release("r", None).unwrap();
+        let chk = crate::engine::check(&settings(&dir), dl2.as_ref(), &rel).unwrap();
         assert_eq!(chk.changes(), 0, "restored original re-flagged: {:?}", chk.files);
 
         // a no-op re-install (the heal path) carries the record instead of dropping it
@@ -3747,7 +3749,8 @@ mod tests {
             InstalledState::load(&dir).unwrap().restored,
             vec!["game/dota/sound.vpk".to_string()]
         );
-        let chk = crate::engine::check(&settings(&dir), dl2.as_ref(), None).unwrap();
+        let rel = dl2.fetch_release("r", None).unwrap();
+        let chk = crate::engine::check(&settings(&dir), dl2.as_ref(), &rel).unwrap();
         assert_eq!(chk.changes(), 0);
 
         // uninstall leaves the stock file exactly where the restore put it

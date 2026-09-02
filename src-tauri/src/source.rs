@@ -258,26 +258,54 @@ fn end_measuring(asked: &HashSet<Option<String>>) {
 
 /// How a source is turned into a backend.
 ///
-/// A parameter rather than a call, for two callers that cannot use the real one: the tests (every
-/// production backend is an https-only agent no loopback listener can satisfy, and what a walk is
-/// about is the ORDER, not the transport) and the debug CLI's `--repo`/`--game-repo`, which pin a
-/// run to GitHub because a repo override is meaningful to nothing else — a mirror is addressed by
-/// payload directory, so there is nothing for a repo name to override and routing it at one would
-/// serve some other repo's tree.
+/// A parameter rather than a call for one reason: the tests. Every production backend is an
+/// https-only agent no loopback listener can satisfy, and what a walk is about is the ORDER, not
+/// the transport — so a walk is exercised over in-memory backends and a known ranking, with no
+/// process state to take turns over.
 pub(crate) type Dial = Box<dyn Fn(&Source) -> Arc<dyn Downloader> + Send + Sync>;
 
-/// The production dial: GitHub for the urlless entry, a `Mirror` for everything else.
+/// The BAKED default repo for a payload — what an override is an override of.
 ///
-/// THIS IS THE ONE PLACE the launcher acts on "every mirror carries every payload". A published
-/// list says nothing about which trees a host holds and the client asks nothing about it, so a
-/// per-payload routing rule — if one is ever wanted — comes back through here and nowhere else.
-fn dial_for(settings: &Settings, repo: &str, payload: Payload) -> Dial {
+/// Read from `config`'s constants rather than from the settings' accessors on purpose: the
+/// accessors answer "which repo is configured", and the question here is whether that is still the
+/// one this build was made to talk to.
+fn default_repo(payload: Payload) -> &'static str {
+    match payload {
+        Payload::Mod => config::DEFAULT_REPO,
+        Payload::Launcher => config::DEFAULT_LAUNCHER_REPO,
+        Payload::Game => config::DEFAULT_GAME_REPO,
+        Payload::Mirrors => config::DEFAULT_MIRRORS_REPO,
+    }
+}
+
+/// How an operation reaches its backends: the dial, and the ranking it walks. Both, because a repo
+/// override decides both.
+///
+/// The dial itself is THE ONE PLACE the launcher acts on "every mirror carries every payload". A
+/// published list says nothing about which trees a host holds and the client asks nothing about it,
+/// so a per-payload routing rule — if one is ever wanted — comes back through here and nowhere else.
+///
+/// A REPO THE BAKED DEFAULT DOES NOT NAME COLLAPSES THE RANKING TO GITHUB ALONE. Only GitHub is
+/// addressed by repo; a mirror is addressed by payload directory, so there is nothing there for a
+/// repo name to override — `Mirror::fetch_release` ignores the parameter entirely. Left in the
+/// ranking, a mirror would answer a 404 from the overridden repo with the DEFAULT tree out of its
+/// own `mod/` directory, and the launcher would install a payload from a repo the user did not
+/// name. Signed, so not a trust break, and only reachable by hand-editing settings.json or through
+/// the debug CLI's `--repo`/`--game-repo` — but "the answer came from somewhere else entirely" is
+/// not a thing an override may quietly mean. This rule used to live in `cli.rs`, applied on two of
+/// its three paths and nowhere in the GUI; here it is on every read either makes.
+fn dial_for(settings: &Settings, repo: &str, payload: Payload) -> (Dial, Vec<Source>) {
+    let ranking = match repo == default_repo(payload) {
+        true => ranking(),
+        false => vec![Source::default()],
+    };
     let settings = settings.clone();
     let repo = repo.to_string();
-    Box::new(move |s: &Source| match s.key() {
+    let dial: Dial = Box::new(move |s: &Source| match s.key() {
         None => Arc::new(Github::for_repo(&settings, &repo)) as Arc<dyn Downloader>,
         Some(url) => Arc::new(Mirror::new(url, payload)),
-    })
+    });
+    (dial, ranking)
 }
 
 /// Is this a fact about the SOURCE, or about US? Only the second ends a walk early.
@@ -305,7 +333,8 @@ pub fn with_active<T>(
     tag: Option<&str>,
     op: impl Fn(&dyn Downloader, &Release) -> Result<T>,
 ) -> Result<T> {
-    walk(&dial_for(settings, repo, payload), &ranking(), repo, tag, op)
+    let (dial, ranking) = dial_for(settings, repo, payload);
+    walk(&dial, &ranking, repo, tag, op)
 }
 
 /// `with_active` with the dial and the ranking injected — see `Dial`. `pub(crate)` for the tests
@@ -520,7 +549,8 @@ pub struct Wire {
 impl Wire {
     /// Open the best source that can serve `repo` at `tag`.
     pub fn open(settings: &Settings, repo: &str, payload: Payload, tag: Option<&str>) -> Result<Self> {
-        Self::with_dial(dial_for(settings, repo, payload), ranking(), settings, repo, payload, tag)
+        let (dial, ranking) = dial_for(settings, repo, payload);
+        Self::with_dial(dial, ranking, settings, repo, payload, tag)
     }
 
     /// `open` with the dial and the ranking injected — see `Dial`. The tests hand it both, which is
@@ -1178,6 +1208,41 @@ mod tests {
         let mut none = vec![Source::default(), Source::at("https://a.example")];
         sort(&mut none);
         assert!(none[0].is_github(), "a stable sort cannot invent a preference");
+    }
+
+    /// A REPO OVERRIDE IS A GITHUB-ONLY RUN, and there is one rule for it.
+    ///
+    /// A mirror is addressed by payload directory and ignores `repo` outright, so a mirror left in
+    /// the ranking would answer the overridden repo's 404 with the DEFAULT tree from its own
+    /// directory — an install from a repo nobody named. The ranking therefore collapses to the
+    /// built-in entry, for every payload and both callers (the debug CLI's flags and a hand-edited
+    /// settings.json), rather than being derived again by whoever happens to be opening a wire.
+    #[test]
+    fn a_repo_the_build_does_not_name_never_dials_a_mirror() {
+        let _t = turn();
+        adopt(&[Source::default(), Source::at("https://m1.example"), Source::at("https://m2.example")]);
+        let settings = Settings::default();
+
+        let (_, ranked) = dial_for(&settings, config::DEFAULT_REPO, Payload::Mod);
+        assert_eq!(ranked.len(), 3, "the default repo walks the whole ranking");
+
+        for (repo, payload) in [
+            ("someone/else", Payload::Mod),
+            ("someone/game", Payload::Game),
+            ("someone/launcher", Payload::Launcher),
+        ] {
+            let (_, ranked) = dial_for(&settings, repo, payload);
+            assert_eq!(ranked, vec![Source::default()], "{repo} is a GitHub-only run");
+        }
+
+        // …and each payload is measured against ITS OWN default, not the mod repo's
+        for (repo, payload) in [
+            (config::DEFAULT_GAME_REPO, Payload::Game),
+            (config::DEFAULT_LAUNCHER_REPO, Payload::Launcher),
+            (config::DEFAULT_MIRRORS_REPO, Payload::Mirrors),
+        ] {
+            assert_eq!(dial_for(&settings, repo, payload).1.len(), 3, "{repo} is not an override");
+        }
     }
 
     /// `active` IS IN RANGE BY CONSTRUCTION, and this is the only way it could stop being.

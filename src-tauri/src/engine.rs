@@ -743,18 +743,17 @@ pub fn evaluate(settings: &Settings, tag_name: &str, manifest: &Manifest) -> Res
     })
 }
 
-/// Read-only check against ONE backend: resolve the release, verify its manifest, evaluate it.
+/// Read-only check of ONE already-opened release: verify its manifest, evaluate it.
 ///
-/// Callers are the debug-only CLI and the test suite. The GUI's `check` command does the same three
-/// steps through `source::with_active`, so a source that refuses the manifest fails over — which is
-/// exactly the difference between the two, and why this one takes a `&dyn Downloader` rather than
-/// pretending to be the model. Release builds compile neither caller, so the release-only dead-code
-/// silence below is accurate, and a debug build still warns if this ever becomes genuinely unused.
+/// It takes the release rather than resolving one, so it composes with a walk: both callers (the
+/// debug-only CLI and the test suite) get it handed to them by whatever opened the source, and the
+/// trust gate below stays INSIDE that walk — a source whose manifest is refused fails over instead
+/// of ending the check, exactly as the GUI's `check` command does with the same two steps. Release
+/// builds compile neither caller, so the release-only dead-code silence below is accurate, and a
+/// debug build still warns if this ever becomes genuinely unused.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
-pub fn check(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Result<CheckResult> {
-    let release =
-        dl.fetch_release(&settings.source_repo, tag).context("fetching the release")?;
-    let manifest = manifest_of(settings, dl, &release, Payload::Mod)?;
+pub fn check(settings: &Settings, dl: &dyn Downloader, release: &Release) -> Result<CheckResult> {
+    let manifest = manifest_of(settings, dl, release, Payload::Mod)?;
     evaluate(settings, &release.tag_name, &manifest)
 }
 
@@ -784,7 +783,8 @@ mod tests {
             &format!(r#"{{ "schema": {future}, "version": "9.9.9", "files": [] }}"#),
             vec![],
         );
-        let err = check(&settings, &too_new, None).unwrap_err();
+        let rel = |d: &Fake| d.fetch_release("r", None).unwrap();
+        let err = check(&settings, &too_new, &rel(&too_new)).unwrap_err();
         let refused = err
             .chain()
             .find_map(|c| c.downcast_ref::<UnsupportedSchema>())
@@ -793,9 +793,9 @@ mod tests {
 
         // a supported schema, and a legacy manifest with no `schema` key at all, both pass
         let ok = Fake::new("v1.0.0", r#"{ "schema": 2, "version": "1.0.0", "files": [] }"#, vec![]);
-        assert!(check(&settings, &ok, None).is_ok());
+        assert!(check(&settings, &ok, &rel(&ok)).is_ok());
         let legacy = Fake::new("v1.0.0", r#"{ "version": "1.0.0", "files": [] }"#, vec![]);
-        assert!(check(&settings, &legacy, None).is_ok());
+        assert!(check(&settings, &legacy, &rel(&legacy)).is_ok());
     }
 
     /// The gate itself: a release whose manifest is not signed by a key we pin is not a release

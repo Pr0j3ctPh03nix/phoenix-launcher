@@ -4,14 +4,11 @@
 //! variable, because a second source of one is what let a stale value outrank the baked one.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::config::{Settings, Source};
-use crate::downloader::Downloader;
 use crate::engine::{self, Action};
-use crate::github::Github;
 use crate::source::{self, Wire};
 use crate::trust::Payload;
 use crate::{install, manifest};
@@ -101,29 +98,19 @@ pub fn run_sources(flags: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// A wire pinned to GITHUB, for the headless commands.
-///
-/// A repo override is meaningful to nothing else: a mirror is addressed by PAYLOAD DIRECTORY, so
-/// there is nothing for a repo name to override, and routing one at a mirror would quietly serve
-/// some other repo's tree under the name the operator typed. The GUI never overrides a repo and
-/// never takes this path.
-fn github_wire(settings: &Settings, repo: &str, payload: Payload, tag: Option<&str>) -> Result<Wire> {
-    let (owned, name) = (settings.clone(), repo.to_string());
-    Wire::with_dial(
-        Box::new(move |_| Arc::new(Github::for_repo(&owned, &name)) as Arc<dyn Downloader>),
-        vec![Source::default()],
-        settings,
-        repo,
-        payload,
-        tag,
-    )
-}
-
 pub fn run_check(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
-    // Pinned to GitHub for the same reason `github_wire` is: `--repo` is a GitHub-only override.
-    let dl = Github::for_repo(&settings, &settings.source_repo);
-    let r = engine::check(&settings, &dl, tag.as_deref())?;
+    // THROUGH THE MODEL, like every other read. `--repo` needs no special handling here any more:
+    // an overridden repo collapses the ranking to GitHub inside `source::dial_for`, which is the
+    // one place that rule now lives — this command used to apply it, `run_install` used to apply
+    // it unconditionally, and the GUI never applied it at all.
+    let r = source::with_active(
+        &settings,
+        &settings.source_repo,
+        Payload::Mod,
+        tag.as_deref(),
+        |dl, release| engine::check(&settings, dl, release),
+    )?;
     println!("Release {} (version {}) | changes {}", r.tag, r.version, r.changes());
     for f in &r.files {
         let s = match f.action {
@@ -141,7 +128,7 @@ pub fn run_check(flags: &[String]) -> Result<()> {
 
 pub fn run_install(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
-    let wire = github_wire(&settings, &settings.source_repo, Payload::Mod, tag.as_deref())?;
+    let wire = Wire::open(&settings, &settings.source_repo, Payload::Mod, tag.as_deref())?;
     let r = install::install(&settings, &wire, None, None, None)?;
     println!("Installed {}: wrote {}, removed {}", r.version, r.written.len(), r.removed.len());
     // headless: warm the customization cache synchronously (the GUI runs this detached)
@@ -160,16 +147,12 @@ pub fn run_uninstall(flags: &[String]) -> Result<()> {
 
 /// The base game's wire and manifest, headless.
 ///
-/// The SOURCE MODEL unless a repo was overridden — the game repo is public and a mirror serves it
-/// like any other payload, so there is no reason for the headless path to see a different set of
-/// sources from the GUI. `--game-repo` is the exception and pins to GitHub, because that is the
-/// only backend a repo name means anything to (see `github_wire`).
-fn game_wire(settings: &Settings, flags: &[String]) -> Result<(Wire, manifest::Manifest)> {
-    let pinned = flags.iter().any(|f| f == "--game-repo");
-    let wire = match pinned {
-        true => github_wire(settings, settings.game_repo(), Payload::Game, None)?,
-        false => Wire::open(settings, settings.game_repo(), Payload::Game, None)?,
-    };
+/// The SOURCE MODEL, always — the game repo is public and a mirror serves it like any other
+/// payload, so there is no reason for the headless path to see a different set of sources from the
+/// GUI. `--game-repo` needs no branch here: an overridden repo is a GitHub-only run wherever it is
+/// opened from, and `source::dial_for` is where that is decided.
+fn game_wire(settings: &Settings) -> Result<(Wire, manifest::Manifest)> {
+    let wire = Wire::open(settings, settings.game_repo(), Payload::Game, None)?;
     let manifest = wire.manifest()?;
     Ok((wire, manifest))
 }
@@ -177,7 +160,7 @@ fn game_wire(settings: &Settings, flags: &[String]) -> Result<(Wire, manifest::M
 pub fn run_game_install(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let game_dir = settings.resolve_game_dir()?;
-    let (wire, manifest) = game_wire(&settings, flags)?;
+    let (wire, manifest) = game_wire(&settings)?;
     let r = install::install_base(&game_dir, &wire, &manifest, None, None, None)?;
     println!(
         "Base game {} ({}): wrote {} ({} MB), up-to-date {}, skipped {}",
@@ -194,7 +177,7 @@ pub fn run_game_install(flags: &[String]) -> Result<()> {
 pub fn run_game_verify(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let game_dir = settings.resolve_game_dir()?;
-    let (_wire, manifest) = game_wire(&settings, flags)?;
+    let (_wire, manifest) = game_wire(&settings)?;
     let statuses = install::base_plan(&game_dir, &manifest, None, "verify", None)?;
     let mut differing = 0;
     for s in &statuses {
