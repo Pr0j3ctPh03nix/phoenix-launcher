@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use tauri::Emitter;
 
-use crate::cmd::{open_all, open_repo, AppState, CachedManifest, Opened};
+use crate::cmd::{AppState, CachedManifest};
 use crate::config::Settings;
 use crate::engine;
-use crate::github::Github;
 use crate::install::{self, BaseAction};
 use crate::manifest::Manifest;
+use crate::source::{self, Wire};
 use crate::trust::Payload;
 use crate::views::{
     CmdError, FileStateView, GameInstallView, GamePlanView, GameTargetView, GameVerifyView,
@@ -74,10 +74,7 @@ pub async fn game_plan(
         let _op = st.begin_op("game plan")?;
         let settings = Settings::load();
         let dir = PathBuf::from(target);
-        let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest =
-            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
-                .map_err(CmdError::from)?;
+        let manifest = game_manifest(&settings).map_err(CmdError::from)?;
         // Planning an EMPTY folder is instant, but the user may well pick one that already holds
         // a game — then this hashes gigabytes. Emit ticks so the dialog reports progress instead
         // of showing a motionless spinner for minutes, and honour a cancel: closing the dialog
@@ -128,15 +125,14 @@ pub async fn game_install(
         let _op = st.begin_op("game download")?;
         let settings = Settings::load();
         let dir = PathBuf::from(&target);
-        let (chain, manifest) = open_game(&settings)?;
-        let origins: Vec<install::Origin> = chain.iter().map(Opened::origin).collect();
+        let (wire, manifest) = open_game(&settings)?;
 
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
         };
         let report = install::install_base(
             &dir,
-            &origins,
+            &wire,
             &manifest,
             Some(&emit),
             Some(&st.game_cancel),
@@ -148,11 +144,11 @@ pub async fn game_install(
         // leaves the UI pointed at the right folder (showing Install as the next step)
         Settings::update(|s| s.game_dir = Some(dir.clone())).map_err(CmdError::from)?;
 
-        // chain the shim: its own repo, its own credentials
+        // chain the shim: its own repo, its own wire
         let settings = Settings::load();
-        let shim_dl = Github::for_repo(&settings, &settings.source_repo);
-        let shim =
-            install::install(&settings, &shim_dl, None, Some(&emit), Some(&st.game_cancel), None);
+        let shim = Wire::open(&settings, &settings.source_repo, Payload::Mod, None).and_then(
+            |wire| install::install(&settings, &wire, Some(&emit), Some(&st.game_cancel), None),
+        );
         let shim_version = match shim {
             Ok(r) => {
                 *st.manifest_cache.lock().unwrap() = Some(CachedManifest {
@@ -163,8 +159,10 @@ pub async fn game_install(
                 // warm optional content detached, exactly like a normal apply
                 tauri::async_runtime::spawn_blocking(|| {
                     let settings = Settings::load();
-                    let dl = Github::for_repo(&settings, &settings.source_repo);
-                    install::warm_cache(&settings, &dl);
+                    let opened = Wire::open(&settings, &settings.source_repo, Payload::Mod, None);
+                    if let Ok(wire) = opened {
+                        install::warm_cache(&settings, &wire);
+                    }
                 });
                 Some(r.version)
             }
@@ -209,7 +207,7 @@ pub async fn game_repair(
         let _op = st.begin_op("game repair")?;
         let settings = Settings::load();
         let dir = settings.resolve_game_dir().map_err(CmdError::from)?;
-        let (chain, manifest) = open_game(&settings)?;
+        let (wire, manifest) = open_game(&settings)?;
 
         // Pins FIRST, and only then the writes. If the order were reversed a failure mid-download
         // would lose the "leave these alone" half of the answer, and the retry would open with the
@@ -238,13 +236,12 @@ pub async fn game_repair(
             });
         }
 
-        let origins: Vec<install::Origin> = chain.iter().map(Opened::origin).collect();
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
         };
         let report = install::install_base(
             &dir,
-            &origins,
+            &wire,
             &manifest,
             Some(&emit),
             Some(&st.game_cancel),
@@ -280,10 +277,7 @@ pub async fn game_delete_extras(
         let _op = st.begin_op("delete extras")?;
         let settings = Settings::load();
         let dir = settings.resolve_game_dir().map_err(CmdError::from)?;
-        let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest =
-            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
-                .map_err(CmdError::from)?;
+        let manifest = game_manifest(&settings).map_err(CmdError::from)?;
         // The same claimed-set the verify used, rebuilt: whatever the shim accounts for is not an
         // extra and must stay unreachable from here even if the UI thought otherwise.
         let mut claimed: HashSet<String> = manifest.files.iter().map(|f| f.dest.clone()).collect();
@@ -314,9 +308,8 @@ pub async fn phoenix_keep(
         // Intact-ness is judged against the SHIM manifest here; unreachable means we cannot tell,
         // and a pin on a file that turns out to be intact is harmless (it matches, so it never
         // reports as a difference in the first place).
-        let dl = Github::for_repo(&settings, &settings.source_repo);
         let resolved: Option<std::collections::HashMap<String, String>> =
-            engine::fetch(&settings, &dl, None).ok().map(|(_, m)| {
+            shim_manifest(&settings).ok().map(|m| {
                 engine::resolve(&m, &settings.selections)
                     .into_iter()
                     .map(|f| (f.dest, f.sha256))
@@ -372,10 +365,7 @@ pub async fn your_files(
                 dir.display()
             )));
         }
-        let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest =
-            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
-                .map_err(CmdError::from)?;
+        let manifest = game_manifest(&settings).map_err(CmdError::from)?;
         let identity = install::build_identity(&dir, &manifest);
         if identity == install::BuildIdentity::Unknown {
             return Err(CmdError::from(format!(
@@ -526,10 +516,7 @@ pub async fn game_verify(
                 format!("{} does not look like a game folder (no game/dota inside)", dir.display())
             }));
         }
-        let (dl, release) = open_repo(settings.game_repo(), &settings).map_err(CmdError::from)?;
-        let manifest =
-            engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Game)
-                .map_err(CmdError::from)?;
+        let manifest = game_manifest(&settings).map_err(CmdError::from)?;
 
         // Which build is this? Decided BEFORE the plan, not after: hashing a full install is
         // minutes of work, and if the answer is "we cannot tell" none of that work can be acted
@@ -652,41 +639,33 @@ pub async fn game_verify(
     .map_err(CmdError::task)?
 }
 
-/// The base game's whole DOWNLOAD chain, plus the manifest.
+/// The shim's manifest, read through the active source. One document, no bytes.
+fn shim_manifest(settings: &Settings) -> anyhow::Result<Manifest> {
+    source::with_active(settings, &settings.source_repo, Payload::Mod, None, |dl, release| {
+        engine::manifest_of(settings, dl, release, Payload::Mod)
+    })
+}
+
+/// The base game's manifest, read through the active source. One document, no bytes — which is
+/// what the read-only commands (plan, verify, your_files, delete_extras) want, and why they do not
+/// open a `Wire`.
+fn game_manifest(settings: &Settings) -> anyhow::Result<Manifest> {
+    source::with_active(settings, settings.game_repo(), Payload::Game, None, |dl, release| {
+        engine::manifest_of(settings, dl, release, Payload::Game)
+    })
+}
+
+/// The base game's download wire, plus the manifest it will be verified against.
 ///
-/// Every source that answered, in priority order, each carrying its OWN asset list — an asset one
-/// source will not serve advances to the next (`install::Origin`), and a release index published by
-/// one host can never be used to address another. The manifest is read from the first, which is the
-/// source `open_repo` would have picked on its own.
-///
-/// The read-only commands (plan, verify, your_files, delete_extras) deliberately do NOT use this:
-/// they need one manifest and no bytes, so they stay on `open_repo` and pay one round trip.
-fn open_game(settings: &Settings) -> Result<(Vec<Opened>, Manifest), CmdError> {
-    let mut chain = open_all(settings.game_repo(), settings).map_err(CmdError::from)?;
-    let manifest = {
-        let head = &chain[0]; // open_all never returns an empty chain
-        engine::manifest_of(settings, head.dl.as_ref(), &head.release, Payload::Game)
-            .map_err(CmdError::from)?
-    };
-    // The file assets may live sharded across prereleases (GitHub caps 1000 assets/release), so
-    // each source's list is folded into itself — per source, because the shards are that source's.
-    for (i, opened) in chain.iter_mut().enumerate() {
-        let merged = engine::merged_game_release(
-            opened.dl.as_ref(),
-            settings.game_repo(),
-            opened.release.clone(),
-        );
-        match merged {
-            Ok(m) => opened.release = m,
-            // The source the manifest came from must be able to list its own assets — that failure
-            // is the user's answer, exactly as it was before there was a chain. A FALLBACK that
-            // cannot simply keeps the release it already answered with, and the asset preflight
-            // decides what it can still address.
-            Err(e) if i == 0 => return Err(CmdError::from(e)),
-            Err(_) => {}
-        }
-    }
-    Ok((chain, manifest))
+/// The wire is what makes a 7.9 GiB run survive one host going dark mid-download: an asset the
+/// current source will not serve fails it over and is asked of the next, pinned to the same
+/// release. Shard folding happens per source inside `Wire::open`, because the shards are that
+/// source's and a release index published by one host can never address another.
+fn open_game(settings: &Settings) -> Result<(Wire, Manifest), CmdError> {
+    let wire =
+        Wire::open(settings, settings.game_repo(), Payload::Game, None).map_err(CmdError::from)?;
+    let manifest = wire.manifest().map_err(CmdError::from)?;
+    Ok((wire, manifest))
 }
 
 /// The shim's own differences, as files-view rows, plus every dest it accounts for.
@@ -700,8 +679,7 @@ fn shim_plan(
     settings: &Settings,
     game_dir: &std::path::Path,
 ) -> Option<(Vec<FileStateView>, Vec<String>)> {
-    let dl = Github::for_repo(settings, &settings.source_repo);
-    let (_release, manifest) = engine::fetch(settings, &dl, None).ok()?;
+    let manifest = shim_manifest(settings).ok()?;
     let resolved = engine::resolve(&manifest, &settings.selections);
     let prev = crate::state::InstalledState::load(game_dir);
     let statuses = engine::plan(game_dir, &resolved, prev.as_ref(), &manifest.remove);

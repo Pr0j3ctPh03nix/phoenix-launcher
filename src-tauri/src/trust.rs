@@ -126,7 +126,7 @@ pub enum Payload {
     /// The published list of download mirrors. It installs nothing; what it changes is where every
     /// FUTURE install comes from, and the launcher persists it — so a hostile answer is not a bad
     /// download, it is a permanent rewrite of this machine's sources. That is the whole reason it
-    /// is signed and ratcheted like a payload. Read by `mirror::refresh` and nothing else.
+    /// is signed and ratcheted like a payload. Read by `mirror`'s list machinery and nothing else.
     Mirrors,
 }
 
@@ -145,21 +145,6 @@ impl Payload {
         }
     }
 
-    /// `id` read back — for the one place a payload arrives as a STRING rather than as a choice
-    /// this build made: the `payloads` a mirror advertises in the signed list.
-    ///
-    /// `Mirrors` is deliberately not an answer. It is a document a mirror serves at its ROOT, not a
-    /// payload tree under `<base>/<payload>/`, so a list naming it would describe a directory that
-    /// exists on no mirror. `None` is also how a payload kind added after this release reads, and
-    /// the caller skips it rather than inventing a path for it.
-    pub fn from_id(id: &str) -> Option<Self> {
-        match id {
-            "mod" => Some(Self::Mod),
-            "launcher" => Some(Self::Launcher),
-            "game" => Some(Self::Game),
-            _ => None,
-        }
-    }
 }
 
 // There is deliberately NO build-time serial floor. One existed (PHOENIX_MIN_SERIAL_*, baked per

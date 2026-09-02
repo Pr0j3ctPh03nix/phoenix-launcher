@@ -30,6 +30,8 @@ mod manifest;
 mod minisig;
 mod mirror;
 mod selfupdate;
+// The download-source model: the ranking, the walk, and the wire a long download rides.
+mod source;
 mod state;
 mod steaminf;
 // Test-only shared HTTP/1.1 test server for github.rs/mirror.rs redirect-chain unit tests — see
@@ -42,6 +44,7 @@ mod verify;
 mod views;
 
 use std::sync::Arc;
+use tauri::Emitter;
 use tauri_plugin_window_state::StateFlags;
 
 fn run_gui() {
@@ -59,6 +62,17 @@ fn run_gui() {
                 .build(),
         )
         .manage(Arc::new(cmd::AppState::default()))
+        // The source model comes up HERE, not from the frontend: a webview that fails to load must
+        // not be what decides whether sources get resolved. The sink is installed first, so the
+        // very first thing `start` does — adopting the last ranking — is already observable.
+        .setup(|app| {
+            let handle = app.handle().clone();
+            source::on_change(move || {
+                let _ = handle.emit("sources-changed", cmd::sources::view());
+            });
+            source::start();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             cmd::settings::get_settings,
             cmd::settings::save_settings,
@@ -67,11 +81,7 @@ fn run_gui() {
             cmd::settings::set_animations,
             cmd::settings::set_selection,
             cmd::settings::game_dir_status,
-            cmd::mirrors::set_mirror_enabled,
-            cmd::mirrors::set_selected_source,
-            cmd::mirrors::set_auto_pick_best,
-            cmd::mirrors::sweep_mirrors,
-            cmd::mirrors::auto_sweep_mirrors,
+            cmd::sources::download_sources,
             cmd::update::check,
             cmd::update::local_check,
             cmd::update::replan,
@@ -129,7 +139,7 @@ fn cli_dispatch() -> Option<anyhow::Result<()>> {
         Some("uninstall") => cli::run_uninstall(&args[1..]),
         Some("game-install") => cli::run_game_install(&args[1..]),
         Some("game-verify") => cli::run_game_verify(&args[1..]),
-        Some("sweep") => cli::run_sweep(&args[1..]),
+        Some("sources") => cli::run_sources(&args[1..]),
         _ => return None, // not a CLI invocation — the caller opens the window
     })
 }

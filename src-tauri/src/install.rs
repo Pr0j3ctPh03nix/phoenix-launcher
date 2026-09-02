@@ -27,8 +27,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 use crate::config::Settings;
-use crate::downloader::{Asset, Downloader, NetKind, Release};
+use crate::downloader::NetKind;
 use crate::manifest::{Bundle, FileEntry, Manifest};
+use crate::source::{Resolved, Wire};
 use crate::state::{InstalledFile, InstalledState};
 use crate::{engine, fslock, verify};
 
@@ -147,14 +148,16 @@ struct CommitJob<'a> {
 /// rather than standing in for one.
 pub fn install(
     settings: &Settings,
-    dl: &dyn Downloader,
-    tag: Option<&str>,
+    wire: &Wire,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
     only: Option<&HashSet<String>>,
 ) -> Result<InstallReport> {
     let game_dir = settings.resolve_game_dir()?;
-    let (release, manifest) = engine::fetch(settings, dl, tag)?;
+    // The wire opened a release and pinned its tag; the manifest is read THROUGH it, so a source
+    // that refuses the trust gate fails over instead of ending the install.
+    let release = wire.release();
+    let manifest = wire.manifest()?;
 
     // Prior state distinguishes our files from genuine pre-existing ones, and carries the legacy
     // winmm_orig.dll lineage forward (see WINMM_ORIG).
@@ -246,12 +249,7 @@ pub fn install(
     let staging = game_dir.join(STAGING_DIR);
     let _ = std::fs::remove_dir_all(&staging);
     std::fs::create_dir_all(&staging).context("creating the staging directory")?;
-    // One source: the shim payload is a handful of assets (one bundle), and which source serves it
-    // was already decided by `cmd::open_repo`'s own failover — a second release fetch per remaining
-    // source, on every apply, would buy per-asset failover for a download that is over in seconds.
-    // The base game, where a run is ~136 bundles and hours long, is the case that needs it and
-    // `install_base` takes the whole chain.
-    obtain_all(&cache, &[Origin::new(dl, &release)], &to_write, &manifest, progress, cancel)?;
+    obtain_all(&cache, wire, &to_write, &manifest, progress, cancel)?;
 
     // --- phase 1b: stage locally (same volume, so the phase-2 move is atomic) ---
     let mut staged: Vec<(&FileEntry, PathBuf)> = Vec::new();
@@ -505,81 +503,6 @@ fn transient_net_failure(e: &anyhow::Error) -> bool {
     })
 }
 
-/// One place a payload can be fetched from: a backend, plus the release whose asset list its
-/// entry NAMES resolve against.
-///
-/// Callers hand a SLICE of these, in priority order, and an asset that a source cannot deliver
-/// advances to the next one (see `obtain_to_cache`). A single-source run is the one-element case
-/// and pays nothing for the machinery. The two are paired in one value because they must not drift:
-/// resolving an entry against a release some OTHER source published would hand this source a URL
-/// it never advertised.
-///
-/// A content-addressed backend (`Downloader::content_addressed`) ignores the release entirely — its
-/// entries are addressed by hash — but still carries one, because it is what names the release
-/// (`tag_name`) that was opened.
-pub struct Origin<'a> {
-    pub dl: &'a dyn Downloader,
-    pub release: &'a Release,
-}
-
-impl<'a> Origin<'a> {
-    pub fn new(dl: &'a dyn Downloader, release: &'a Release) -> Self {
-        Self { dl, release }
-    }
-}
-
-/// An `Origin` with its asset lookup table built — the form the download pool uses. The index is
-/// built once for the whole pool rather than per job: thousands of jobs against a release carrying
-/// thousands of assets would otherwise be a linear scan each.
-///
-/// `pub(crate)` because `asset_for` is THE rule for turning a manifest entry into the asset a given
-/// source can serve, and self-update needs the same answer for the launcher exe: a second copy of
-/// "name on GitHub, hash on a mirror" in selfupdate.rs would be free to drift from this one, and
-/// the symptom would be a launcher that installs from one source and 404s on the other.
-pub(crate) struct Resolved<'a> {
-    dl: &'a dyn Downloader,
-    /// Empty for a content-addressed backend, which has no release index to build one from.
-    index: HashMap<&'a str, &'a Asset>,
-    by_hash: bool,
-}
-
-impl<'a> Resolved<'a> {
-    pub(crate) fn of(origin: &Origin<'a>) -> Self {
-        let by_hash = origin.dl.content_addressed();
-        Self {
-            dl: origin.dl,
-            index: if by_hash { HashMap::new() } else { origin.release.asset_index() },
-            by_hash,
-        }
-    }
-
-    /// The fetchable asset for a payload entry, or None when this source cannot address it at all.
-    ///
-    /// A content-addressed backend has no list to look in: the entry's HASH is its address, so the
-    /// asset is SYNTHESIZED with `name` set to that hash. That is the contract
-    /// `Downloader::content_addressed` documents, and the backend reads `name` back as the hash.
-    /// A name-addressed one looks the manifest's `name` up in its own release.
-    ///
-    /// Owned rather than borrowed because the two arms cannot return the same thing; an `Asset` is
-    /// three strings and this happens once per download attempt, not per chunk.
-    pub(crate) fn asset_for(&self, name: &str, sha256: &str, size: u64) -> Option<Asset> {
-        if self.by_hash {
-            return Some(Asset {
-                name: sha256.to_string(),
-                url: String::new(),
-                browser_download_url: String::new(),
-                size,
-            });
-        }
-        self.index.get(name).map(|a| (*a).clone())
-    }
-
-    /// Could this source deliver `name` at all? The preflight's question — see `install_base`.
-    fn carries(&self, name: &str) -> bool {
-        self.by_hash || self.index.contains_key(name)
-    }
-}
-
 /// How one source's attempt at an asset ended.
 ///
 /// `Rejected` and `Unreachable` both advance to the next source and differ in exactly one thing:
@@ -775,13 +698,13 @@ impl<'a> WireIndex<'a> {
 /// COMPLETED jobs while `item`/`bytes` track whichever asset ticked most recently.
 fn obtain_all(
     cache: &Path,
-    origins: &[Origin],
+    wire: &Wire,
     to_write: &[&FileEntry],
     manifest: &Manifest,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
 ) -> Result<()> {
-    obtain_all_tagged(cache, origins, to_write, manifest, progress, "install", cancel)
+    obtain_all_tagged(cache, wire, to_write, manifest, progress, "install", cancel)
 }
 
 /// `obtain_all` with the progress `op` tag and an external cancel flag injected — the base-game
@@ -791,7 +714,7 @@ fn obtain_all(
 #[allow(clippy::too_many_arguments)]
 fn obtain_all_tagged(
     cache: &Path,
-    origins: &[Origin],
+    wire: &Wire,
     to_write: &[&FileEntry],
     manifest: &Manifest,
     progress: engine::Progress,
@@ -820,9 +743,6 @@ fn obtain_all_tagged(
     // members of a bundle whose other two thousand still have to be sized to be skipped over
     let sizes: HashMap<&str, u64> = manifest.payload_entries().map(|(_, s, z)| (s, z)).collect();
 
-    // one lookup table PER SOURCE for the whole pool: thousands of jobs against a release carrying
-    // thousands of assets would otherwise be a linear scan each
-    let sources: Vec<Resolved> = origins.iter().map(Resolved::of).collect();
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
     let abort = AtomicBool::new(false); // cheap flag mirrored from first_err, checked per chunk
@@ -851,7 +771,7 @@ fn obtain_all_tagged(
                 // bundle ticks as ONE item under its asset name — fanning every packed chunk to
                 // two thousand member dests would multiply the event stream by the member count
                 // for no information.
-                let (items, wire): (Vec<&str>, u64) = match job {
+                let (items, wire_cost): (Vec<&str>, u64) = match job {
                     Acq::Raw { sha256, size, .. } => (dests_of[sha256].clone(), *size),
                     Acq::Bundle { bundle, .. } => (vec![bundle.name.as_str()], bundle.psize),
                     Acq::Empty { .. } => (Vec::new(), 0),
@@ -871,7 +791,7 @@ fn obtain_all_tagged(
                     }
                 };
                 if !items.is_empty() {
-                    tick(done.load(Ordering::Relaxed), 0, wire, false);
+                    tick(done.load(Ordering::Relaxed), 0, wire_cost, false);
                 }
                 let mut last = 0u64;
                 let mut chunk = |d: u64, t: Option<u64>| {
@@ -885,12 +805,12 @@ fn obtain_all_tagged(
                     // would mute the bar until the old mark was re-passed.
                     if d.abs_diff(last) >= PROGRESS_GRAIN || t == Some(d) {
                         last = d;
-                        tick(done.load(Ordering::Relaxed), d, t.unwrap_or(wire), false);
+                        tick(done.load(Ordering::Relaxed), d, t.unwrap_or(wire_cost), false);
                     }
                     true
                 };
                 let mut keep_going = || !(abort.load(Ordering::Relaxed) || cancelled());
-                match obtain_acq(cache, &sources, job, &sizes, &mut chunk, &mut keep_going) {
+                match obtain_acq(cache, wire, job, &sizes, &mut chunk, &mut keep_going) {
                     Ok(()) => {
                         let d = done.fetch_add(1, Ordering::Relaxed) + 1;
                         match job {
@@ -967,7 +887,7 @@ fn obtain_all_tagged(
 /// decode (which must stay off the byte accounting — its progress is not wire progress).
 fn obtain_acq(
     cache: &Path,
-    sources: &[Resolved],
+    wire: &Wire,
     acq: &Acq,
     sizes: &HashMap<&str, u64>,
     chunk: crate::downloader::ChunkProgress,
@@ -976,7 +896,7 @@ fn obtain_acq(
     match acq {
         Acq::Empty { sha256 } => materialize_empty(cache, sha256).map(drop),
         Acq::Raw { name, sha256, size } => {
-            obtain_to_cache(cache, sources, name, sha256, *size, chunk, keep_going).map(drop)
+            obtain_to_cache(cache, wire, name, sha256, *size, chunk, keep_going).map(drop)
         }
         Acq::Bundle { bundle, wanted } => {
             // One flow decodes a given bundle at a time, process-wide: obtain_to_cache guards
@@ -998,7 +918,7 @@ fn obtain_acq(
             // the cache only after psize + psha256 check out — nothing unverified is decoded
             let packed = obtain_to_cache(
                 cache,
-                sources,
+                wire,
                 &bundle.name,
                 &bundle.psha256,
                 bundle.psize,
@@ -1175,10 +1095,10 @@ impl Drop for Inflight {
 }
 
 /// Path to a verified cache entry for an asset: cache hit, else streaming download + verify, from
-/// the first of `sources` that can deliver it.
+/// whichever source the wire is on — and the next one if that fails.
 fn obtain_to_cache(
     cache: &Path,
-    sources: &[Resolved],
+    wire: &Wire,
     name: &str,
     sha256: &str,
     size: u64,
@@ -1208,17 +1128,23 @@ fn obtain_to_cache(
     }
     let tmp = cache.join(format!("{sha256}.part"));
 
-    // Walk the sources. An asset that one source cannot deliver moves to the next; only when every
-    // source is spent does the run fail. Which is the difference between a 7.9 GiB base install
-    // dying on one bad asset and finishing from a mirror.
-    let mut last: Option<anyhow::Error> = None;
-    for source in sources {
+    // Walk the wire. An asset the current source cannot deliver FAILS THAT SOURCE OVER and is
+    // asked of the next; only when the ranking is spent does the run fail. That is the difference
+    // between a 7.9 GiB base install dying on one bad asset and finishing from a mirror.
+    //
+    // The generation is what keeps eight workers from causing eight failovers: it is read with the
+    // source and handed back with the failure, and `Wire::fail` ignores a report against a
+    // generation somebody has already moved past — that worker simply re-reads and retries against
+    // whatever is current now.
+    let mut last;
+    loop {
         // An abort landing between sources is still an abort: advancing here would restart a
         // cancelled install against the next mirror.
         if !keep_going() {
             return Err(anyhow!("download aborted"));
         }
-        match attempt_source(source, &tmp, name, sha256, size, chunk, keep_going) {
+        let (gen, source, _release) = wire.current();
+        match attempt_source(&source, &tmp, name, sha256, size, chunk, keep_going) {
             SourceEnd::Done => {
                 return std::fs::rename(&tmp, &cpath)
                     .map(|()| cpath)
@@ -1246,12 +1172,13 @@ fn obtain_to_cache(
                 last = Some(e);
             }
         }
+        if wire.fail(gen).is_err() {
+            return Err(match last {
+                Some(e) => e.context(format!("downloading {name}: every download source failed")),
+                None => anyhow!("no download source is configured"),
+            });
+        }
     }
-    Err(match (last, sources.len()) {
-        (Some(e), n) if n > 1 => e.context(format!("downloading {name} from all {n} sources")),
-        (Some(e), _) => e,
-        (None, _) => anyhow!("no download source is configured"),
-    })
 }
 
 /// One source's whole attempt at one asset: resume, retry with backoff, verify. Returns HOW it
@@ -1265,7 +1192,7 @@ fn attempt_source(
     chunk: crate::downloader::ChunkProgress,
     keep_going: &mut dyn FnMut() -> bool,
 ) -> SourceEnd {
-    let dl = source.dl;
+    let dl = source.dl();
     let Some(asset) = source.asset_for(name, sha256, size) else {
         // Nothing this source can even address — a permanent fact about IT, not about the release.
         return SourceEnd::Unreachable(anyhow!("the release has no asset named {name}"));
@@ -1436,13 +1363,13 @@ pub fn cancel_warm() {
 /// so the shell can run it DETACHED after `install` returns — optional content, possibly
 /// hundreds of MB, must never hold the install result hostage. Entirely best-effort: any
 /// failure just means on-demand download later.
-pub fn warm_cache(settings: &Settings, dl: &dyn Downloader) {
+pub fn warm_cache(settings: &Settings, wire: &Wire) {
     // captured before any work: every check below asks "has anyone cancelled since I started",
     // so a cancel can never be lost and a later install never resurrects this run
     let epoch = WARM_EPOCH.load(Ordering::Relaxed);
     let cancelled = || WARM_EPOCH.load(Ordering::Relaxed) != epoch;
     let Ok(game_dir) = settings.resolve_game_dir() else { return };
-    let Ok((release, manifest)) = engine::fetch(settings, dl, None) else { return };
+    let Ok(manifest) = wire.manifest() else { return };
     if cancelled() {
         return;
     }
@@ -1450,7 +1377,7 @@ pub fn warm_cache(settings: &Settings, dl: &dyn Downloader) {
     if std::fs::create_dir_all(&cache).is_err() {
         return;
     }
-    prefetch_all(&cache, dl, &release, &manifest, &cancelled);
+    prefetch_all(&cache, wire, &manifest, &cancelled);
     if !cancelled() {
         prune_cache(&cache, &manifest);
     }
@@ -1461,14 +1388,10 @@ pub fn warm_cache(settings: &Settings, dl: &dyn Downloader) {
 /// entries warm by the bundle, through the same job builder the install uses.
 fn prefetch_all(
     cache: &Path,
-    dl: &dyn Downloader,
-    release: &Release,
+    wire: &Wire,
     manifest: &Manifest,
     cancelled: &dyn Fn() -> bool,
 ) {
-    // One source: a warm is optional content fetched in the background, so the source the caller
-    // already opened is the only one worth spending a round trip on.
-    let sources = [Resolved::of(&Origin::new(dl, release))];
     let sizes: HashMap<&str, u64> = manifest.payload_entries().map(|(_, s, z)| (s, z)).collect();
     let Ok(acqs) = build_acqs(&manifest.bundles, manifest.payload_entries()) else { return };
     for acq in acqs {
@@ -1481,7 +1404,7 @@ fn prefetch_all(
         // huge optional asset finish downloading first.
         let _ = obtain_acq(
             cache,
-            &sources,
+            wire,
             &acq,
             &sizes,
             &mut |_, _| !cancelled(),
@@ -2666,11 +2589,10 @@ fn ensure_disk_space(need: u64, free: Option<u64>) -> Result<()> {
 /// them the same operation. Interruption at ANY point is recoverable by running again: completed
 /// files hash-match and skip, interrupted downloads resume from their .part, the cache survives.
 ///
-/// `origins` are the download sources in priority order — see `Origin`. The first is the one the
-/// manifest was opened from (it names the release); the rest are fallbacks an individual asset
-/// advances to when it cannot be had from an earlier one. This is where per-asset failover earns
-/// its keep: the base game is ~136 bundles and 7.9 GiB, so one asset a source will not serve used
-/// to end the whole run.
+/// `wire` is the source this run is pulling from, swappable under the pool: an asset the current
+/// source will not serve fails it over and is asked of the next, pinned to the same release. This
+/// is where failover earns its keep — the base game is ~136 bundles and 7.9 GiB, so one asset one
+/// host will not serve used to end the whole run.
 ///
 /// `only` restricts the write set to those dests — a PARTIAL repair, which is what the files view
 /// sends when the user has spared some files. Two things about it are load-bearing:
@@ -2687,18 +2609,15 @@ fn ensure_disk_space(need: u64, free: Option<u64>) -> Result<()> {
 ///     the caller is expected to drop the pin afterwards.
 pub fn install_base(
     game_dir: &Path,
-    origins: &[Origin],
+    wire: &Wire,
     manifest: &Manifest,
     progress: engine::Progress,
     cancel: Option<&AtomicBool>,
     only: Option<&HashSet<String>>,
 ) -> Result<BaseReport> {
-    // The first origin is the one the caller opened the manifest from, so it is what NAMES this
-    // release; the others are fallbacks for bytes, never for identity.
-    let release = origins
-        .first()
-        .map(|o| o.release)
-        .context("no download source was opened for the base game")?;
+    // The wire's release NAMES this run; every source it later swaps to is opened for that same
+    // tag, so identity comes from the manifest already verified and only the bytes move.
+    let release = wire.release();
     // cancellable from the first file: repairing a live folder hashes it before a byte is
     // downloaded, and a Cancel that only took effect once the download started sat inert for
     // minutes on exactly the screen that shows a Stop button
@@ -2746,18 +2665,19 @@ pub fn install_base(
     // array surfaced only after thousands of files and gigabytes, dressed up as a transient
     // download failure. Milliseconds here, hours saved there.
     //
-    // "No source", not "not the first source": with a chain, an asset one release omits is exactly
-    // what failover exists to survive. And a CONTENT-ADDRESSED source (`content_addressed`) has no
-    // release index at all, so it can only ever answer "addressable" — with one in the chain this
-    // check weakens to that, and whether the blob is really there is learned when it is fetched.
-    // That is the honest limit of a preflight against a backend that publishes no index.
-    let addressable: Vec<Resolved> = origins.iter().map(Resolved::of).collect();
+    // The CURRENT source, and only it: a later one is opened for the same release, so an asset
+    // this one omits is exactly what failover exists to survive — refusing the run up front on its
+    // behalf would refuse a run the next source could finish. And a CONTENT-ADDRESSED source
+    // (`content_addressed`) has no release index at all, so it can only ever answer "addressable";
+    // whether the blob is really there is learned when it is fetched. That is the honest limit of
+    // a preflight against a backend that publishes no index.
+    let addressable = wire.current().1;
     let missing: Vec<&str> = {
         let mut seen = HashSet::new();
         acqs.iter()
             .filter_map(Acq::asset_name)
             .filter(|name| seen.insert(*name))
-            .filter(|name| !addressable.iter().any(|s| s.carries(name)))
+            .filter(|name| !addressable.carries(name))
             .collect()
     };
     if !missing.is_empty() {
@@ -2795,7 +2715,7 @@ pub fn install_base(
     let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
     std::fs::create_dir_all(&cache).context("creating the asset cache")?;
     let fe_only: Vec<&FileEntry> = to_write.iter().map(|(fe, _)| *fe).collect();
-    obtain_all_tagged(&cache, origins, &fe_only, manifest, progress, "game", cancel)?;
+    obtain_all_tagged(&cache, wire, &fe_only, manifest, progress, "game", cancel)?;
 
     // the game may have started during a multi-GB download — re-probe before touching anything
     probe_writable(game_dir, rels.iter())?;
@@ -2851,7 +2771,9 @@ mod tests {
     //! downloader fake — no network, no real game folder.
     use super::*;
     use crate::downloader::fake::Fake;
+    use crate::downloader::{Asset, Downloader, Release};
     use sha2::Digest;
+    use std::sync::Arc;
 
     fn sha(b: &[u8]) -> String {
         hex::encode(sha2::Sha256::digest(b))
@@ -2866,6 +2788,59 @@ mod tests {
 
     fn settings(dir: &Path) -> Settings {
         Settings { game_dir: Some(dir.to_path_buf()), ..Default::default() }
+    }
+
+    /// A test double as the download path holds one: SHARED, so the test can still read its
+    /// counters after a `Wire` has taken it. The concrete type survives — a `Wire` coerces it at
+    /// the call, and a test that wants `dl.calls` still has something to ask.
+    fn arc<D: Downloader + 'static>(dl: D) -> Arc<D> {
+        Arc::new(dl)
+    }
+
+    /// A wire over the given backends, in that order — what these tests used to spell as a slice of
+    /// `Origin`s.
+    ///
+    /// The ranking and the dial are both handed in — a `Wire` captures its ranking at open (see
+    /// its field), so these tests need no process state and take no turns. The dial is injected
+    /// because every production backend is an https-only agent no loopback listener can satisfy,
+    /// and none of these tests is about transport.
+    fn wire_over<D: Downloader + 'static>(
+        peers: Vec<Arc<D>>,
+        payload: crate::trust::Payload,
+    ) -> Wire {
+        use crate::config::Source;
+        let sources: Vec<Source> = (0..peers.len())
+            .map(|i| match i {
+                0 => Source::default(),
+                _ => Source::at(format!("https://s{i}.example")),
+            })
+            .collect();
+        let by_key: HashMap<Option<String>, Arc<dyn Downloader>> = sources
+            .iter()
+            .map(|s| s.url.clone())
+            .zip(peers.into_iter().map(|p| p as Arc<dyn Downloader>))
+            .collect();
+        Wire::with_dial(
+            Box::new(move |s: &Source| by_key[&s.url].clone()),
+            sources,
+            &Settings::default(),
+            "r",
+            payload,
+            None,
+        )
+        .expect("the first source opens")
+    }
+
+    fn mod_wire<D: Downloader + 'static>(dl: Arc<D>) -> Wire {
+        wire_over(vec![dl], crate::trust::Payload::Mod)
+    }
+
+    fn game_wire<D: Downloader + 'static>(dl: Arc<D>) -> Wire {
+        wire_over(vec![dl], crate::trust::Payload::Game)
+    }
+
+    fn game_wire2<D: Downloader + 'static>(a: Arc<D>, b: Arc<D>) -> Wire {
+        wire_over(vec![a, b], crate::trust::Payload::Game)
     }
 
     fn file_json(name: &str, dest: &str, bytes: &[u8]) -> serde_json::Value {
@@ -2889,8 +2864,8 @@ mod tests {
     fn fresh_install_writes_only_the_manifests_files() {
         let dir = tempdir("fresh");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         assert_eq!(r.written.len(), 2);
         assert_eq!(std::fs::read(dir.join("game/bin/win64/winmm.dll")).unwrap(), b"dll");
@@ -2913,8 +2888,8 @@ mod tests {
     fn a_legacy_winmm_orig_survives_an_update_and_is_collected_by_uninstall() {
         let dir = tempdir("legacy-winmm");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         // stage what an older launcher would have left behind
         std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
@@ -2924,8 +2899,8 @@ mod tests {
 
         // an update lands (v2 changes a.vpk), then a no-op install on top of it
         let m2 = m.replace("\"version\": \"1.0.0\"", "\"version\": \"1.0.1\"");
-        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll"), ("a.vpk", b"vpk")]);
-        install(&settings(&dir), &dl2, None, None, None, None).unwrap();
+        let dl2 = arc(Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll"), ("a.vpk", b"vpk")]));
+        install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap();
         assert!(
             InstalledState::load(&dir).unwrap().winmm_orig_created,
             "the lineage flag must survive an update"
@@ -2949,8 +2924,8 @@ mod tests {
     fn a_manifest_remove_retires_the_legacy_winmm_orig_for_good() {
         let dir = tempdir("winmm-remove");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         // what an older launcher left behind
         std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
@@ -2968,8 +2943,8 @@ mod tests {
             "remove": [ { "dest": WINMM_ORIG } ]
         })
         .to_string();
-        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll"), ("a.vpk", b"vpk")]);
-        let r = install(&settings(&dir), &dl2, None, None, None, None).unwrap();
+        let dl2 = arc(Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll"), ("a.vpk", b"vpk")]));
+        let r = install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap();
 
         assert!(r.removed.contains(&WINMM_ORIG.to_string()), "the removal ran: {:?}", r.removed);
         assert!(!dir.join(WINMM_ORIG).exists(), "and the file is gone");
@@ -3041,7 +3016,7 @@ mod tests {
     fn a_full_length_part_is_discarded_instead_of_resumed_forever() {
         let dir = tempdir("poisoned-part");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
         let cache = dir.join(CACHE_DIR);
         std::fs::create_dir_all(&cache).unwrap();
         // a leftover .part as long as the finished asset (a completed transfer whose rename into
@@ -3049,7 +3024,7 @@ mod tests {
         let part = cache.join(format!("{}.part", sha(b"dll")));
         std::fs::write(&part, b"XXX").unwrap();
 
-        let r = install(&settings(&dir), &dl, None, None, None, None);
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None);
         assert!(r.is_ok(), "install must recover from a full-length .part: {r:?}");
         assert_eq!(std::fs::read(dir.join("game/bin/win64/winmm.dll")).unwrap(), b"dll");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3062,7 +3037,8 @@ mod tests {
     fn a_lost_state_file_does_not_turn_our_own_file_into_a_vanilla_original() {
         let dir = tempdir("lost-state");
         let (m1, assets1) = basic_release();
-        install(&settings(&dir), &Fake::new("v1.0.0", &m1, assets1), None, None, None, None).unwrap();
+        install(&settings(&dir), &mod_wire(arc(Fake::new("v1.0.0", &m1, assets1))), None, None, None)
+            .unwrap();
         // the state file is lost (AV cleanup, a tidy-up, or the corrupt-state quarantine)
         std::fs::remove_file(InstalledState::path(&dir)).unwrap();
 
@@ -3075,8 +3051,8 @@ mod tests {
             ]
         })
         .to_string();
-        let dl2 = Fake::new("v2.0.0", &m2, vec![("winmm.dll", b"dll2"), ("a.vpk", b"vpk")]);
-        install(&settings(&dir), &dl2, None, None, None, None).unwrap();
+        let dl2 = arc(Fake::new("v2.0.0", &m2, vec![("winmm.dll", b"dll2"), ("a.vpk", b"vpk")]));
+        install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap();
 
         assert!(
             !dir.join(VANILLA_DIR).join("game/bin/win64/winmm.dll").exists(),
@@ -3094,13 +3070,13 @@ mod tests {
     fn noop_install_heals_a_missing_state_file() {
         let dir = tempdir("heal");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         // lose the state file — the folder is now "up to date but not installed"
         std::fs::remove_file(InstalledState::path(&dir)).unwrap();
         assert!(InstalledState::load(&dir).is_none());
 
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert!(r.written.is_empty() && r.removed.is_empty());
         assert_eq!(r.up_to_date, 2);
         // healed: state rewritten. winmm_orig already existed, and with the state lost we can no
@@ -3124,15 +3100,15 @@ mod tests {
             ]
         })
         .to_string();
-        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]);
+        let dl = arc(Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]));
 
         let mut s = settings(&dir);
         s.selections.insert("fx".into(), serde_json::json!(true));
-        install(&s, &dl, None, None, None, None).unwrap();
+        install(&s, &mod_wire(dl.clone()), None, None, None).unwrap();
         assert!(dir.join("game/dota/fx.vpk").exists());
 
         s.selections.insert("fx".into(), serde_json::json!(false));
-        let r = install(&s, &dl, None, None, None, None).unwrap();
+        let r = install(&s, &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(r.removed, vec!["game/dota/fx.vpk".to_string()]);
         assert!(!dir.join("game/dota/fx.vpk").exists());
         let st = InstalledState::load(&dir).unwrap();
@@ -3152,14 +3128,14 @@ mod tests {
             ]
         })
         .to_string();
-        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]);
+        let dl = arc(Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]));
         let s = settings(&dir);
-        install(&s, &dl, None, None, None, None).unwrap();
+        install(&s, &mod_wire(dl.clone()), None, None, None).unwrap();
 
         // install itself no longer prefetches the disabled toggle's asset...
         assert!(!dir.join(CACHE_DIR).join(sha(b"fx")).exists());
         // ...the detached warm does
-        warm_cache(&s, &dl);
+        warm_cache(&s, &mod_wire(dl.clone()));
         assert!(dir.join(CACHE_DIR).join(sha(b"fx")).exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3168,8 +3144,8 @@ mod tests {
     fn uninstall_reverts_to_stock() {
         let dir = tempdir("uninstall");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         let r = uninstall(&settings(&dir)).unwrap();
         assert_eq!(r.deleted.len(), 2);
@@ -3192,8 +3168,8 @@ mod tests {
         std::fs::write(dir.join("game/dota/a.vpk"), b"STOCK ORIGINAL").unwrap();
 
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         // shim in place, original preserved
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
@@ -3222,8 +3198,8 @@ mod tests {
         std::fs::write(dir.join("game/dota/a.vpk"), b"vpk").unwrap();
 
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap(); // no-op heal: adopts both
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap(); // no-op heal: adopts both
 
         let r = uninstall(&settings(&dir)).unwrap();
         assert!(r.deleted.iter().any(|d| d == "game/dota/a.vpk"));
@@ -3241,9 +3217,9 @@ mod tests {
                          "sha256": "ff".repeat(32), "size": 3 } ]
         })
         .to_string();
-        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]);
+        let dl = arc(Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]));
 
-        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        assert!(install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).is_err());
         assert!(!dir.join("game/dota/a.vpk").exists());
         assert!(InstalledState::load(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3262,9 +3238,9 @@ mod tests {
             names.iter().map(|n| (format!("{n}.vpk"), n.as_bytes().to_vec())).collect();
         let assets: Vec<(&str, &[u8])> =
             owned.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
-        let dl = Fake::new("v1.0.0", &m, assets);
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
 
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(r.written.len(), 8);
         for n in names {
             assert_eq!(std::fs::read(dir.join(format!("game/dota/{n}.vpk"))).unwrap(), n.as_bytes());
@@ -3323,19 +3299,19 @@ mod tests {
             "files": [ file_json("big.vpk", "game/dota/big.vpk", &big) ]
         })
         .to_string();
-        let dl = CutOnce {
+        let dl = arc(CutOnce {
             inner: Fake::new("v1.0.0", &m, vec![("big.vpk", &big)]),
             cut: 40_000,
             failed: false.into(),
-        };
+        });
 
         // first run: dies mid-download, touches nothing but the resumable .part
-        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        assert!(install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).is_err());
         assert!(!dir.join("game/dota/big.vpk").exists());
         assert!(dir.join(CACHE_DIR).join(format!("{}.part", sha(&big))).exists());
 
         // second run: resumes the .part (asserted inside CutOnce) and completes
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3408,15 +3384,15 @@ mod tests {
                          "sha256": sha(&declared), "size": declared.len() } ]
         })
         .to_string();
-        let dl = Overflowing {
+        let dl = arc(Overflowing {
             inner: Fake::new("v1.0.0", &m, vec![("a.vpk", &declared)]),
             body: hostile,
             chunk: 16,
             calls: 0.into(),
             last_written: 0.into(),
-        };
+        });
 
-        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        let e = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap_err();
         let msg = format!("{e:#}");
         assert!(msg.contains("more than the signed"), "expected the size-cap refusal, got: {msg}");
         assert!(!msg.contains("aborted"), "must not read as an ordinary cancel: {msg}");
@@ -3506,21 +3482,21 @@ mod tests {
                          "sha256": sha(&content), "size": content.len() } ]
         })
         .to_string();
-        let dl = ResumingToCap {
+        let dl = arc(ResumingToCap {
             inner: Fake::new("v1.0.0", &m, vec![("a.vpk", &content)]),
             body: content.clone(),
             cut: 200,
             chunk: 37, // does not divide the remainder evenly, so the last tick lands off-grid
             calls: 0.into(),
             failed: false.into(),
-        };
+        });
 
         // an abort with no NetKind is not retried within one run (same as `CutOnce`'s test), so
         // the interruption and the resume are two separate `install()` calls, exactly as a real
         // dropped connection and a later relaunch would be
-        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        assert!(install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).is_err());
         assert!(!dir.join("game/dota/a.vpk").exists());
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(r.written, vec!["game/dota/a.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), content);
         assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "attempt one drops, attempt two resumes and finishes");
@@ -3579,14 +3555,14 @@ mod tests {
         use crate::downloader::NetKind;
         let dir = tempdir("retry-500");
         let (m, assets) = one_file_release();
-        let dl = Flaky {
+        let dl = arc(Flaky {
             inner: Fake::new("v1.0.0", &m, assets),
             fail: 2.into(),
             kind: Some(NetKind::Status(500)),
             calls: 0.into(),
-        };
+        });
         // two flakes, then success — the user must never have seen an error
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 3);
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"vpk");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3598,26 +3574,26 @@ mod tests {
         // a 404 is a fact about the request — retrying re-asks a settled question
         let dir = tempdir("retry-404");
         let (m, assets) = one_file_release();
-        let dl = Flaky {
+        let dl = arc(Flaky {
             inner: Fake::new("v1.0.0", &m, assets),
             fail: 99.into(),
             kind: Some(NetKind::Status(404)),
             calls: 0.into(),
-        };
-        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        });
+        assert!(install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).is_err());
         assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
 
         // an abort (cancel, sibling failure) is an instruction — retrying fights the user
         let dir = tempdir("retry-abort");
         let (m, assets) = one_file_release();
-        let dl = Flaky {
+        let dl = arc(Flaky {
             inner: Fake::new("v1.0.0", &m, assets),
             fail: 99.into(),
             kind: None,
             calls: 0.into(),
-        };
-        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        });
+        assert!(install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).is_err());
         assert_eq!(dl.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3637,19 +3613,19 @@ mod tests {
             "files": [ file_json("big.vpk", "game/dota/big.vpk", &payload) ]
         })
         .to_string();
-        let dl = Flaky {
+        let dl = arc(Flaky {
             inner: Fake::new("v1.0.0", &m, vec![("big.vpk", &payload)]),
             fail: 0.into(),
             kind: None,
             calls: 0.into(),
-        };
+        });
         // a resumable prefix of the right shape and the wrong bytes — zeros, as an unflushed
         // tail reads back
         let cache = dir.join(CACHE_DIR);
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join(format!("{}.part", sha(&payload))), vec![0u8; 400]).unwrap();
 
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "one resumed attempt, one clean restart");
         assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), payload);
         let _ = std::fs::remove_dir_all(&dir);
@@ -3670,8 +3646,8 @@ mod tests {
         let bad = || Fake::new("v1.0.0", &m, vec![("a.vpk", b"BAD!")]);
 
         let dir = tempdir("bad-source");
-        let dl = Flaky { inner: bad(), fail: 0.into(), kind: None, calls: 0.into() };
-        let err = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        let dl = arc(Flaky { inner: bad(), fail: 0.into(), kind: None, calls: 0.into() });
+        let err = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("verification failed"), "got: {err:#}");
         assert_eq!(dl.calls.load(Ordering::SeqCst), 1, "nothing was resumed — one attempt settles it");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3682,8 +3658,8 @@ mod tests {
         let cache = dir.join(CACHE_DIR);
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join(format!("{}.part", sha(b"GOOD"))), b"XX").unwrap();
-        let dl = Flaky { inner: bad(), fail: 0.into(), kind: None, calls: 0.into() };
-        let err = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        let dl = arc(Flaky { inner: bad(), fail: 0.into(), kind: None, calls: 0.into() });
+        let err = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("verification failed"), "got: {err:#}");
         assert_eq!(dl.calls.load(Ordering::SeqCst), 2, "the restart is spent once, not looped");
         let _ = std::fs::remove_dir_all(&dir);
@@ -3701,9 +3677,9 @@ mod tests {
             "remove": [ { "dest": "game/dota/stale.vpk" } ]
         })
         .to_string();
-        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]);
+        let dl = arc(Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk")]));
 
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(r.removed, vec!["game/dota/stale.vpk".to_string()]);
         // the removal must STICK (the old bug preserved-then-restored it in one breath,
         // re-flagging it as Remove on every future plan, forever)...
@@ -3711,7 +3687,7 @@ mod tests {
         // ...while the foreign file is preserved, not destroyed
         assert_eq!(std::fs::read(dir.join(VANILLA_DIR).join("game/dota/stale.vpk")).unwrap(), b"old");
         // and the next plan is clean — no permanent pending-remove loop
-        let chk = crate::engine::check(&settings(&dir), &dl, None).unwrap();
+        let chk = crate::engine::check(&settings(&dir), dl.as_ref(), None).unwrap();
         assert_eq!(chk.changes(), 0, "plan must not re-flag the removed file");
 
         // uninstall reverts to what was there before us: the preserved file comes back
@@ -3743,8 +3719,8 @@ mod tests {
             ]
         })
         .to_string();
-        let dl1 = Fake::new("v1.0.0", &m1, vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]);
-        install(&settings(&dir), &dl1, None, None, None, None).unwrap();
+        let dl1 = arc(Fake::new("v1.0.0", &m1, vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]));
+        install(&settings(&dir), &mod_wire(dl1.clone()), None, None, None).unwrap();
         assert_eq!(std::fs::read(dir.join(VANILLA_DIR).join("game/dota/sound.vpk")).unwrap(), b"STOCK");
 
         // v2 stops shipping it and removes the dest — our file goes, the original comes back
@@ -3754,24 +3730,24 @@ mod tests {
             "remove": [ { "dest": "game/dota/sound.vpk" } ]
         })
         .to_string();
-        let dl2 = Fake::new("v2.0.0", &m2, vec![("a.vpk", b"vpk")]);
-        let r = install(&settings(&dir), &dl2, None, None, None, None).unwrap();
+        let dl2 = arc(Fake::new("v2.0.0", &m2, vec![("a.vpk", b"vpk")]));
+        let r = install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap();
         assert_eq!(r.removed, vec!["game/dota/sound.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/sound.vpk")).unwrap(), b"STOCK");
         let st = InstalledState::load(&dir).unwrap();
         assert_eq!(st.restored, vec!["game/dota/sound.vpk".to_string()]);
 
         // the next plan is CLEAN — the restored original must not re-flag as Remove
-        let chk = crate::engine::check(&settings(&dir), &dl2, None).unwrap();
+        let chk = crate::engine::check(&settings(&dir), dl2.as_ref(), None).unwrap();
         assert_eq!(chk.changes(), 0, "restored original re-flagged: {:?}", chk.files);
 
         // a no-op re-install (the heal path) carries the record instead of dropping it
-        install(&settings(&dir), &dl2, None, None, None, None).unwrap();
+        install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap();
         assert_eq!(
             InstalledState::load(&dir).unwrap().restored,
             vec!["game/dota/sound.vpk".to_string()]
         );
-        let chk = crate::engine::check(&settings(&dir), &dl2, None).unwrap();
+        let chk = crate::engine::check(&settings(&dir), dl2.as_ref(), None).unwrap();
         assert_eq!(chk.changes(), 0);
 
         // uninstall leaves the stock file exactly where the restore put it
@@ -3799,12 +3775,12 @@ mod tests {
             m.to_string()
         };
 
-        let dl1 = Fake::new("v1", &ship("1.0.0", true, false), vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]);
-        install(&settings(&dir), &dl1, None, None, None, None).unwrap();
-        let dl2 = Fake::new("v2", &ship("2.0.0", false, true), vec![("a.vpk", b"vpk")]);
-        install(&settings(&dir), &dl2, None, None, None, None).unwrap(); // restored
-        let dl3 = Fake::new("v3", &ship("3.0.0", true, false), vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]);
-        install(&settings(&dir), &dl3, None, None, None, None).unwrap(); // ships it again
+        let dl1 = arc(Fake::new("v1", &ship("1.0.0", true, false), vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]));
+        install(&settings(&dir), &mod_wire(dl1.clone()), None, None, None).unwrap();
+        let dl2 = arc(Fake::new("v2", &ship("2.0.0", false, true), vec![("a.vpk", b"vpk")]));
+        install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap(); // restored
+        let dl3 = arc(Fake::new("v3", &ship("3.0.0", true, false), vec![("a.vpk", b"vpk"), ("sound.vpk", b"PHOENIX")]));
+        install(&settings(&dir), &mod_wire(dl3.clone()), None, None, None).unwrap(); // ships it again
 
         let st = InstalledState::load(&dir).unwrap();
         assert!(st.restored.is_empty(), "a shipped dest must not stay recorded: {:?}", st.restored);
@@ -3821,8 +3797,8 @@ mod tests {
     fn a_read_only_target_fails_with_a_permission_error_not_game_running() {
         let dir = tempdir("denied");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         // a read-only attribute denies write with ERROR_ACCESS_DENIED — not a live process
         let target = dir.join("game/bin/win64/winmm.dll");
@@ -3835,8 +3811,8 @@ mod tests {
             "files": [ file_json("winmm.dll", "game/bin/win64/winmm.dll", b"dll2") ]
         })
         .to_string();
-        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2")]);
-        let err = install(&settings(&dir), &dl2, None, None, None, None).unwrap_err();
+        let dl2 = arc(Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2")]));
+        let err = install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap_err();
         assert!(
             !err.chain().any(|c| c.downcast_ref::<engine::GameRunning>().is_some()),
             "a permissions problem must not be diagnosed as the game running: {err:#}"
@@ -3852,8 +3828,8 @@ mod tests {
     fn a_locked_target_fails_with_game_running_before_downloading() {
         let dir = tempdir("locked");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         // simulate the game holding winmm.dll open: no sharing allowed on our handle
         use std::os::windows::fs::OpenOptionsExt;
@@ -3872,8 +3848,8 @@ mod tests {
             ]
         })
         .to_string();
-        let dl2 = Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2"), ("a.vpk", b"vpk")]);
-        let err = install(&settings(&dir), &dl2, None, None, None, None).unwrap_err();
+        let dl2 = arc(Fake::new("v1.0.1", &m2, vec![("winmm.dll", b"dll2"), ("a.vpk", b"vpk")]));
+        let err = install(&settings(&dir), &mod_wire(dl2.clone()), None, None, None).unwrap_err();
         assert!(
             err.chain().any(|c| c.downcast_ref::<engine::GameRunning>().is_some()),
             "expected GameRunning in the error chain, got: {err:#}"
@@ -3924,16 +3900,16 @@ mod tests {
     fn base_repair_writes_only_the_selection() {
         let dir = tempdir("base-partial");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         // two differences: one the user picks, one they spare
         std::fs::write(dir.join("game/dota/cfg/a.cfg"), b"MOD").unwrap();
         std::fs::write(dir.join("game/core/cfg/b.cfg"), b"BAD").unwrap();
 
         let only: HashSet<String> = ["game/core/cfg/b.cfg".to_string()].into_iter().collect();
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, Some(&only)).unwrap();
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, Some(&only)).unwrap();
         assert_eq!(r.written, 1);
         assert_eq!(std::fs::read(dir.join("game/core/cfg/b.cfg")).unwrap(), b"CFG", "restored");
         assert_eq!(
@@ -3950,9 +3926,9 @@ mod tests {
     fn a_pinned_file_survives_an_unrestricted_repair() {
         let dir = tempdir("base-pinned");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MY MOD").unwrap();
@@ -3967,12 +3943,12 @@ mod tests {
         assert!(!st.action.writes(), "a pin is not a difference to be fixed");
 
         // the sweeping repair leaves it alone
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"MY MOD");
 
         // ...but naming it does not
         let only: HashSet<String> = [dest.to_string()].into_iter().collect();
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, Some(&only)).unwrap();
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, Some(&only)).unwrap();
         assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"CFG");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3988,9 +3964,9 @@ mod tests {
     fn a_partial_repair_plans_only_the_selection() {
         let dir = tempdir("base-partial-plan");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MY MOD").unwrap();
@@ -4009,7 +3985,7 @@ mod tests {
             }
         };
         let only: HashSet<String> = [dest.to_string()].into_iter().collect();
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, Some(&emit), None, Some(&only)).unwrap();
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, Some(&emit), None, Some(&only)).unwrap();
 
         assert_eq!(r.written, 1, "the one file the user picked is restored");
         assert_eq!(std::fs::read(dir.join(dest)).unwrap(), b"CFG");
@@ -4029,9 +4005,9 @@ mod tests {
     fn a_subset_plan_reads_only_what_it_was_asked_about() {
         let dir = tempdir("base-plan-subset");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MY MOD").unwrap();
@@ -4062,9 +4038,9 @@ mod tests {
     fn a_pin_expires_when_the_content_changes_again() {
         let dir = tempdir("base-pin-expiry");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         let dest = "game/dota/cfg/a.cfg";
         std::fs::write(dir.join(dest), b"MOD v1").unwrap();
@@ -4089,9 +4065,9 @@ mod tests {
     fn a_plan_carries_the_evidence_for_each_difference() {
         let dir = tempdir("base-evidence");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         std::fs::write(dir.join("game/dota/cfg/a.cfg"), b"much longer than three").unwrap();
         std::fs::remove_file(dir.join("game/core/cfg/b.cfg")).unwrap();
 
@@ -4113,9 +4089,9 @@ mod tests {
     fn extras_report_unclaimed_files_and_summarize_unknown_trees() {
         let dir = tempdir("base-extras");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         // a mod dropping a loose file among stock ones
         std::fs::write(dir.join("game/dota/cfg/mymod.cfg"), b"hello").unwrap();
@@ -4163,9 +4139,9 @@ mod tests {
     fn a_legacy_winmm_orig_is_an_extra_the_user_can_delete() {
         let dir = tempdir("winmm-extra");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         std::fs::write(dir.join(WINMM_ORIG), b"SYSTEM WINMM").unwrap();
 
         let claimed: HashSet<String> = manifest.files.iter().map(|f| f.dest.clone()).collect();
@@ -4192,9 +4168,9 @@ mod tests {
     fn a_phoenix_only_directory_is_never_foreign() {
         let dir = tempdir("base-extras-shim");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         // the shim's payload: its own top-level tree, plus a file among the game's own
         std::fs::create_dir_all(dir.join("game/dota_phoenix/pak01")).unwrap();
@@ -4264,8 +4240,8 @@ mod tests {
     fn uninstall_keeps_a_file_somebody_changed() {
         let dir = tempdir("uninstall-modified");
         let (m, assets) = basic_release();
-        let dl = Fake::new("v1.0.0", &m, assets);
-        install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let dl = arc(Fake::new("v1.0.0", &m, assets));
+        install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
 
         let state = InstalledState::load(&dir).unwrap();
         let victim = state.files[0].dest.clone();
@@ -4295,22 +4271,20 @@ mod tests {
         Fake::new(tag, manifest_json, assets).payload("game")
     }
 
-    fn base_fetch(dl: &Fake) -> (Release, Manifest) {
+    fn base_manifest(dl: &Fake) -> Manifest {
         let release = dl.fetch_release("r", None).unwrap();
-        let manifest =
-            engine::manifest_of(&Settings::default(), dl, &release, crate::trust::Payload::Game)
-                .unwrap();
-        (release, manifest)
+        engine::manifest_of(&Settings::default(), dl, &release, crate::trust::Payload::Game)
+            .unwrap()
     }
 
     #[test]
     fn base_install_into_empty_dir_writes_everything_and_no_state() {
         let dir = tempdir("base-fresh");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
 
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 4);
         assert_eq!((r.up_to_date, r.skipped), (0, 0));
         assert_eq!(r.bytes, 12); // 4 files × 3 bytes — shared content still counts per placed file
@@ -4347,10 +4321,10 @@ mod tests {
         })
         .to_string();
         // note: no "empty" asset — an upload of it would have been rejected
-        let dl = base_fake("v1805", &m, vec![("real", b"DATA")]);
-        let (release, manifest) = base_fetch(&dl);
+        let dl = arc(base_fake("v1805", &m, vec![("real", b"DATA")]));
+        let manifest = base_manifest(&dl);
 
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2);
         let empty = dir.join("game/core/scripts/vscripts/game/gameinit.lua");
         assert!(empty.exists(), "the empty file must exist");
@@ -4372,9 +4346,9 @@ mod tests {
             "files": [{ "name": "e", "dest": "game/x.bin", "sha256": sha(b"not empty"), "size": 0 }]
         })
         .to_string();
-        let dl = base_fake("v1805", &m, vec![]);
-        let (release, manifest) = base_fetch(&dl);
-        let err = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap_err();
+        let dl = arc(base_fake("v1805", &m, vec![]));
+        let manifest = base_manifest(&dl);
+        let err = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap_err();
         assert!(format!("{err:#}").contains("not the empty hash"), "got: {err:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4391,9 +4365,9 @@ mod tests {
         assert!(!dir.exists(), "the point of the test");
 
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 4);
         assert_eq!(std::fs::read(dir.join("game/dota/pak01_dir.vpk")).unwrap(), b"PAK");
         assert!(game_present(&dir), "and it is a game folder afterwards");
@@ -4406,15 +4380,15 @@ mod tests {
     fn base_repair_touches_only_damaged_files() {
         let dir = tempdir("base-repair");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         // corrupt one file, delete another, leave the rest alone
         std::fs::write(dir.join("game/dota/pak01_dir.vpk"), b"CORRUPT").unwrap();
         std::fs::remove_file(dir.join("game/dota/cfg/a.cfg")).unwrap();
 
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2, "only the corrupt + missing files");
         assert_eq!(r.up_to_date, 2);
         assert_eq!(std::fs::read(dir.join("game/dota/pak01_dir.vpk")).unwrap(), b"PAK");
@@ -4431,9 +4405,9 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         let dir = tempdir("base-unreadable");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         // held open with no sharing at all — what an antivirus or a second process produces
         let lock = std::fs::OpenOptions::new()
@@ -4465,9 +4439,9 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         let dir = tempdir("base-size-gate");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
 
         let victim = dir.join("game/dota/pak01_dir.vpk");
         std::fs::write(&victim, b"PAK plus a great deal more").unwrap(); // manifest says 3 bytes
@@ -4562,9 +4536,9 @@ mod tests {
         // hash memo and the file would still read as intact.
         std::fs::write(dir.join(".phoenix-vanilla/game/dota/cfg/a.cfg"), b"ROTTEN").unwrap();
         let (mm, assets) = base_release();
-        let dl = base_fake("v1805", &mm, assets);
-        let (release, manifest) = base_fetch(&dl);
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &mm, assets));
+        let manifest = base_manifest(&dl);
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 1);
         assert_eq!(r.skipped, 1);
         assert_eq!(std::fs::read(dir.join(".phoenix-vanilla/game/dota/cfg/a.cfg")).unwrap(), b"CFG");
@@ -4756,9 +4730,9 @@ mod tests {
             }],
         })
         .to_string();
-        let dl = Fake::new("v1.0.0", &m, vec![("a.vpk", b"raw"), ("b0.phxb", &packed)]);
+        let dl = arc(Fake::new("v1.0.0", &m, vec![("a.vpk", b"raw"), ("b0.phxb", &packed)]));
 
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(r.written.len(), 7);
         assert_eq!(std::fs::read(dir.join("game/dota/a.vpk")).unwrap(), b"raw");
         assert_eq!(std::fs::read(dir.join("game/dota/x.txt")).unwrap(), x);
@@ -4819,12 +4793,12 @@ mod tests {
             "files": [ bundled_json("game/dota/g.txt", good) ],
         })
         .to_string();
-        let dl = Counting {
+        let dl = arc(Counting {
             inner: Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]),
             calls: Mutex::new(Vec::new()),
-        };
+        });
 
-        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        let e = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("broken release"), "got: {e:#}");
         assert_eq!(
             dl.calls.lock().unwrap().len(),
@@ -4851,8 +4825,8 @@ mod tests {
             "files": [ bundled_json("game/dota/a.txt", a) ],
         })
         .to_string();
-        let dl = Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]);
-        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        let dl = arc(Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]));
+        let e = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("past its declared members"), "got: {e:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4878,8 +4852,8 @@ mod tests {
             "files": [ bundled_json("game/dota/a.txt", a) ],
         })
         .to_string();
-        let dl = Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]);
-        let e = install(&settings(&dir), &dl, None, None, None, None).unwrap_err();
+        let dl = arc(Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]));
+        let e = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("past its declared members"), "got: {e:#}");
         assert!(!dir.join("game/dota/a.txt").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -4901,19 +4875,19 @@ mod tests {
             "files": [ bundled_json("game/dota/big.vpk", &big) ],
         })
         .to_string();
-        let dl = CutOnce {
+        let dl = arc(CutOnce {
             inner: Fake::new("v1.0.0", &m, vec![("b0.phxb", &packed)]),
             cut: packed.len() / 2,
             failed: false.into(),
-        };
+        });
 
         // first run: dies mid-packed-download, leaving the resumable .part under the psha256
-        assert!(install(&settings(&dir), &dl, None, None, None, None).is_err());
+        assert!(install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).is_err());
         assert!(!dir.join("game/dota/big.vpk").exists());
         assert!(dir.join(CACHE_DIR).join(format!("{psha}.part")).exists());
 
         // second run: resumes the packed .part (asserted inside CutOnce) and completes
-        let r = install(&settings(&dir), &dl, None, None, None, None).unwrap();
+        let r = install(&settings(&dir), &mod_wire(dl.clone()), None, None, None).unwrap();
         assert_eq!(r.written, vec!["game/dota/big.vpk".to_string()]);
         assert_eq!(std::fs::read(dir.join("game/dota/big.vpk")).unwrap(), big);
         assert!(!dir.join(CACHE_DIR).join(&psha).exists());
@@ -4947,19 +4921,18 @@ mod tests {
         })
         .to_string();
         let manifest = Manifest::parse(m.as_bytes()).unwrap();
-        let dl = Counting {
+        let dl = arc(Counting {
             inner: base_fake("v1805", &m, vec![("a.phxb", &packed_a), ("b.phxb", &packed_b)]),
             calls: Mutex::new(Vec::new()),
-        };
-        let release = dl.fetch_release("r", None).unwrap();
+        });
 
         // a full install, then damage BOTH files of bundle A; bundle B's file stays intact
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         std::fs::write(dir.join("game/dota/a1.txt"), b"corrupt").unwrap();
         std::fs::write(dir.join("game/dota/a2.txt"), b"corrupt").unwrap();
         dl.calls.lock().unwrap().clear();
 
-        let r = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let r = install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         assert_eq!(r.written, 2);
         assert_eq!(std::fs::read(dir.join("game/dota/a1.txt")).unwrap(), a1);
         assert_eq!(std::fs::read(dir.join("game/dota/a2.txt")).unwrap(), a2);
@@ -5021,16 +4994,16 @@ mod tests {
         std::fs::write(cache.join(format!("{}.part", sha(b"other"))), b"par").unwrap();
 
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         let leftover = std::fs::read_dir(&cache).map(|rd| rd.count()).unwrap_or(0);
         assert_eq!(leftover, 0, "stale cache entries must be reclaimed on success");
 
         // and the nothing-to-do path (everything intact) reclaims too
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join(sha(b"junk2")), b"junk2").unwrap();
-        install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, None, None).unwrap();
+        install_base(&dir, &game_wire(dl.clone()), &manifest, None, None, None).unwrap();
         let leftover = std::fs::read_dir(&cache).map(|rd| rd.count()).unwrap_or(0);
         assert_eq!(leftover, 0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -5060,11 +5033,11 @@ mod tests {
     fn base_install_cancel_stops_before_placing_and_is_typed() {
         let dir = tempdir("base-cancel");
         let (m, assets) = base_release();
-        let dl = base_fake("v1805", &m, assets);
-        let (release, manifest) = base_fetch(&dl);
+        let dl = arc(base_fake("v1805", &m, assets));
+        let manifest = base_manifest(&dl);
 
         let cancel = AtomicBool::new(true); // cancelled before the first chunk lands
-        let err = install_base(&dir, &[Origin::new(&dl, &release)], &manifest, None, Some(&cancel), None).unwrap_err();
+        let err = install_base(&dir, &game_wire(dl.clone()), &manifest, None, Some(&cancel), None).unwrap_err();
         assert!(
             err.chain().any(|c| c.downcast_ref::<engine::Cancelled>().is_some()),
             "expected the Cancelled marker, got: {err:#}"
@@ -5131,6 +5104,9 @@ mod tests {
     struct Peer {
         inner: Fake,
         answer: Answer,
+        /// How many times the WIRE opened this source. One failover is one open, however many
+        /// workers reported the failure that caused it.
+        opens: AtomicU64,
         calls: AtomicU64,
         /// The `resume_from` of the LAST `download_to`, which is how a test proves what prefix a
         /// source inherited from the one before it. `u64::MAX` = never asked for anything.
@@ -5138,13 +5114,22 @@ mod tests {
     }
 
     impl Peer {
-        fn new(answer: Answer) -> Self {
-            Self {
-                inner: base_fake("v1805", &solo_release(), vec![("solo.vpk", SOLO)]),
+        fn new(answer: Answer) -> Arc<Self> {
+            Self::at_tag("v1805", answer)
+        }
+
+        /// A peer serving a NAMED release — for proving that a swap re-opens the SAME one.
+        fn at_tag(tag: &str, answer: Answer) -> Arc<Self> {
+            Arc::new(Self {
+                inner: base_fake(tag, &solo_release(), vec![("solo.vpk", SOLO)]),
                 answer,
+                opens: AtomicU64::new(0),
                 calls: AtomicU64::new(0),
                 resumed: AtomicU64::new(u64::MAX),
-            }
+            })
+        }
+        fn opens(&self) -> u64 {
+            self.opens.load(Ordering::SeqCst)
         }
         fn calls(&self) -> u64 {
             self.calls.load(Ordering::SeqCst)
@@ -5154,9 +5139,20 @@ mod tests {
         }
     }
 
+    // The peer is held through an `Arc` everywhere below: a `Wire` OWNS the backend it is dialled,
+    // and the test still has to read the peer's counters afterwards.
     impl crate::downloader::Downloader for Peer {
         fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
-            self.inner.fetch_release(r, t)
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let release = self.inner.fetch_release(r, t)?;
+            // A source serving ANOTHER release refuses itself, exactly as `Mirror::fetch_release`
+            // does — rooted at a status, so the walk falls through to one that does serve the tag
+            // this run is pinned to instead of quietly installing something else.
+            if t.is_some_and(|want| want != release.tag_name) {
+                return Err(anyhow::Error::new(NetKind::Status(404))
+                    .context("this source serves another release"));
+            }
+            Ok(release)
         }
         fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
             self.inner.fetch_releases(r)
@@ -5205,11 +5201,15 @@ mod tests {
         }
     }
 
-    /// Set up a two-source run over the solo release: `(manifest, releases, origins-ready pair)`.
-    fn two_sources(a: &Peer, b: &Peer) -> (Release, Release, Manifest) {
-        let (rel_a, manifest) = base_fetch(&a.inner);
-        let rel_b = b.fetch_release("r", None).unwrap();
-        (rel_a, rel_b, manifest)
+    /// The solo release's manifest, as the wire's first source publishes it.
+    fn solo_manifest(a: &Arc<Peer>) -> Manifest {
+        engine::manifest_of(
+            &Settings::default(),
+            &a.inner,
+            &a.inner.fetch_release("r", None).unwrap(),
+            crate::trust::Payload::Game,
+        )
+        .unwrap()
     }
 
     /// Two sources, and an install that is served by the second. Without this an asset the first
@@ -5219,10 +5219,10 @@ mod tests {
     fn an_asset_the_first_source_cannot_serve_comes_from_the_next() {
         let dir = tempdir("failover-next");
         let (a, b) = (Peer::new(Answer::Unreachable), Peer::new(Answer::Serves));
-        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        let manifest = solo_manifest(&a);
         install_base(
             &dir,
-            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &game_wire2(a.clone(), b.clone()),
             &manifest,
             None,
             None,
@@ -5235,24 +5235,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A TRANSPORT failure says nothing about the bytes already written, so they are kept and the
-    /// next source resumes from them. On the links this feature exists for that prefix is
-    /// gigabytes, and discarding it would make every failover start from zero.
+    /// The wire swaps UNDER the pool, and the next source picks the transfer up where the last
+    /// one stopped.
+    ///
+    /// A TRANSPORT failure says nothing about the bytes already written, so they are kept: on the
+    /// links this feature exists for that prefix is gigabytes, and discarding it would make every
+    /// failover start from zero. And the swap happens ONCE however many workers report the
+    /// failure — a worker hands back the generation it read the source with, and a report against
+    /// a generation somebody has already moved past is ignored rather than causing a second swap.
     #[test]
-    fn a_transport_failure_hands_the_next_source_the_prefix_it_left() {
+    fn the_pool_switches_source_mid_run_and_resumes_from_the_prefix() {
         let dir = tempdir("failover-resume");
         let (a, b) = (Peer::new(Answer::Truncates(20)), Peer::new(Answer::Serves));
-        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
-        install_base(
-            &dir,
-            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
-            &manifest,
-            None,
-            None,
-            None,
-        )
-        .expect("the second source must finish what the first started");
+        let manifest = solo_manifest(&a);
+        let wire = game_wire2(a.clone(), b.clone());
+        install_base(&dir, &wire, &manifest, None, None, None)
+            .expect("the second source must finish what the first started");
+
         assert_eq!(b.resumed(), 20, "the .part the first source left is the second's prefix");
+        assert_eq!(std::fs::read(dir.join("game/dota/solo.vpk")).unwrap(), SOLO);
+        assert_eq!(a.opens(), 1, "the first source is opened once and never returned to");
+        assert_eq!(b.opens(), 1, "and the failover opened the second exactly once");
+        assert!(
+            !wire.fail(0).expect("the wire still has somewhere to be"),
+            "a report against a generation already moved past must not swap again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A swap re-opens the SAME RELEASE. The wire pins the tag it opened with, so a source serving
+    /// something else refuses itself and the walk moves past it — identity keeps coming from the
+    /// manifest already verified, and only the bytes move.
+    #[test]
+    fn a_mid_run_switch_opens_the_same_release() {
+        let dir = tempdir("failover-tag");
+        let a = Peer::new(Answer::Unreachable);
+        let other = Peer::at_tag("v9.9.9", Answer::Serves);
+        let b = Peer::new(Answer::Serves);
+        let manifest = solo_manifest(&a);
+        let wire = wire_over(
+            vec![a.clone(), other.clone(), b.clone()],
+            crate::trust::Payload::Game,
+        );
+        install_base(&dir, &wire, &manifest, None, None, None)
+            .expect("the source serving the pinned release must finish the run");
+
+        assert_eq!(other.opens(), 1, "the wrong release is asked once…");
+        assert_eq!(other.calls(), 0, "…and never downloaded from");
+        assert_eq!(b.calls(), 1);
         assert_eq!(std::fs::read(dir.join("game/dota/solo.vpk")).unwrap(), SOLO);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5262,13 +5292,13 @@ mod tests {
     /// the signed manifest, so handing them to the next source as a resume prefix would let one
     /// source's corruption survive the failover meant to escape it.
     #[test]
-    fn a_source_that_serves_the_wrong_bytes_does_not_poison_the_next() {
+    fn wrong_bytes_do_not_poison_the_next_source_after_a_switch() {
         let dir = tempdir("failover-corrupt");
         let (a, b) = (Peer::new(Answer::Corrupt), Peer::new(Answer::Serves));
-        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        let manifest = solo_manifest(&a);
         install_base(
             &dir,
-            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &game_wire2(a.clone(), b.clone()),
             &manifest,
             None,
             None,
@@ -5286,10 +5316,10 @@ mod tests {
     fn every_source_exhausted_fails_the_run_cleanly() {
         let dir = tempdir("failover-exhausted");
         let (a, b) = (Peer::new(Answer::Unreachable), Peer::new(Answer::Corrupt));
-        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        let manifest = solo_manifest(&a);
         let err = install_base(
             &dir,
-            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &game_wire2(a.clone(), b.clone()),
             &manifest,
             None,
             None,
@@ -5298,8 +5328,8 @@ mod tests {
         .unwrap_err();
         assert!(a.calls() > 0 && b.calls() > 0, "every source must actually be tried");
         assert!(
-            format!("{err:#}").contains("from all 2 sources"),
-            "the failure should name the exhausted chain, got: {err:#}"
+            format!("{err:#}").contains("every download source failed"),
+            "the failure should say the ranking was spent, got: {err:#}"
         );
         assert!(!dir.join("game/dota/solo.vpk").exists(), "nothing may be placed");
         let _ = std::fs::remove_dir_all(&dir);
@@ -5309,14 +5339,14 @@ mod tests {
     /// silently restart it against the next mirror — so the abort line is asked directly rather
     /// than inferred from an error message, and the second source is never reached at all.
     #[test]
-    fn a_cancel_mid_transfer_is_a_cancel_and_never_a_failover() {
+    fn a_cancel_mid_transfer_is_never_a_failover() {
         let dir = tempdir("failover-cancel");
         let cancel = std::sync::Arc::new(AtomicBool::new(false));
         let (a, b) = (Peer::new(Answer::Cancels(cancel.clone())), Peer::new(Answer::Serves));
-        let (rel_a, rel_b, manifest) = two_sources(&a, &b);
+        let manifest = solo_manifest(&a);
         let err = install_base(
             &dir,
-            &[Origin::new(&a, &rel_a), Origin::new(&b, &rel_b)],
+            &game_wire2(a.clone(), b.clone()),
             &manifest,
             None,
             Some(&cancel),
@@ -5327,7 +5357,8 @@ mod tests {
             err.chain().any(|c| c.downcast_ref::<engine::Cancelled>().is_some()),
             "a Stop must still report as Cancelled, got: {err:#}"
         );
-        assert_eq!(b.calls(), 0, "a cancel must never advance to the next source");
+        assert_eq!(b.opens(), 0, "a cancel must never advance to the next source");
+        assert_eq!(b.calls(), 0);
         assert_eq!(a.calls(), 1, "and must not be retried against the source it stopped, either");
         assert!(!dir.join("game/dota/solo.vpk").exists());
         let _ = std::fs::remove_dir_all(&dir);

@@ -7,9 +7,10 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::cmd::{open_repo_releases, AppState};
+use crate::cmd::AppState;
 use crate::config::Settings;
 use crate::engine;
+use crate::downloader::Downloader;
 use crate::github::Github;
 use crate::views::{CmdError, NotesEntryView};
 
@@ -69,7 +70,7 @@ pub async fn launcher_notes(
             |_known| {
                 // `known` is ignored on purpose: there is no per-release download to skip. One
                 // listing carries every body, so a rebuild is always whole and always cheap.
-                let (_, releases) = open_repo_releases(&repo, &settings)?;
+                let releases = Github::for_repo(&settings, &repo).fetch_releases(&repo)?;
                 Ok(engine::launcher_notes_history(&repo, &releases))
             },
         )

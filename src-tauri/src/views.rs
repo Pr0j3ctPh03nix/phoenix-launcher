@@ -27,104 +27,74 @@ pub struct SettingsView {
     /// The optional launch flags, in table order — the UI renders one switch per entry.
     pub launch_flags: Vec<LaunchFlagView>,
     pub selections: serde_json::Value,
-    /// Download sources in priority order. Unlike the fields above these are INSTANT-APPLY: the
-    /// mirrors pane writes through on every edit, so they are never unsaved form state and never
-    /// appear in the discard-changes snapshot.
-    pub sources: Vec<SourceView>,
-    pub auto_pick_best: bool,
+}
+
+/// The download-source status block: the ranking, and what each row currently is.
+///
+/// It is a REPORT, not a form. Everything in it comes from `source::Registry` — the same value the
+/// download path walks — so the block cannot come to disagree with it about which source is in use,
+/// which is exactly what a second, UI-side resolution used to be free to do.
+// `Clone` because Tauri's `emit` takes the payload by value and this same value is also returned
+// from `download_sources` — one shape, two ways to reach it (see `cmd::sources`).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct SourcesView {
+    /// Ranked, fastest-healthy first — the same order the download path walks.
+    pub sources: Vec<SourceRowView>,
+    /// A measuring pass is running; the rows below are the PREVIOUS answer.
+    pub measuring: bool,
+    /// Why the published list could not be refreshed this launch. Never fatal, and never a reason
+    /// to hide the rows: the measurements under it are real.
+    pub refresh_error: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-pub struct SourceView {
-    /// "primary" | "mirror". The primary has no `url` and no switch — it is the baked-in source,
-    /// and no published mirror list can remove it.
-    pub kind: &'static str,
+pub struct SourceRowView {
+    /// `null` = the built-in source. The UI names it itself; WHICH repo it is is not the user's
+    /// concern here, and a sentinel URL would be a lie waiting to collide with a real mirror.
     pub url: Option<String>,
-    pub enabled: bool,
-    /// The one downloads will be attempted from. Resolved by `config::active_index` and sent
-    /// here rather than recomputed in JS, so the pane cannot come to disagree with the download
-    /// path about which source is in use.
     pub active: bool,
-    /// Has it ever been timed? False is the visible half of "a new mirror was acknowledged but
-    /// not tested", which is the whole state the auto-pick setting leaves behind when it is off.
-    pub measured: bool,
-}
-
-/// The list as the pane should paint it, with the active entry already resolved.
-pub fn source_views(
-    sources: &[crate::config::Source],
-    pinned: Option<&crate::config::SourceRef>,
-) -> Vec<SourceView> {
-    let active = crate::config::active_index(sources, pinned);
-    sources
-        .iter()
-        .enumerate()
-        .map(|(i, s)| SourceView {
-            kind: if s.is_primary() { "primary" } else { "mirror" },
-            url: s.url().map(str::to_string),
-            enabled: s.enabled(),
-            active: active == Some(i),
-            // the primary is never "untested" in the sense that matters here — it is not
-            // something that newly appeared and might be better than what you are using
-            measured: !matches!(s, crate::config::Source::Mirror { measured: false, .. }),
-        })
-        .collect()
-}
-
-/// One source's probe result. Kept apart from `SourceView` because it is a measurement, not a
-/// setting: it is never persisted, and a source nobody has swept simply has none.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MirrorProbeView {
-    /// None for the primary; the UI keys on `primary` instead of inventing a sentinel URL.
-    pub url: Option<String>,
-    pub primary: bool,
-    /// Index round-trip. All a plain reachability check would have told you.
-    pub latency_ms: Option<u64>,
-    /// Measured over a real asset chunk — the number worth sorting on.
+    pub failed: bool,
+    pub measuring: bool,
+    /// Delivered a whole 512 KiB chunk, in budget, without faulting — `Measured::healthy`, derived
+    /// here so the UI and the ranking cannot disagree about what "usable" means.
+    pub healthy: bool,
     pub bytes_per_sec: Option<u64>,
+    pub latency_ms: Option<u64>,
     pub tag: Option<String>,
     pub range_ok: bool,
+    /// Unix seconds; the frontend renders the age. `null` = never measured.
+    pub measured_at: Option<u64>,
     pub error: Option<String>,
-    /// Delivered the whole chunk in budget. Derived here so the UI and any later source-picking
-    /// logic cannot disagree about what "usable" means.
-    pub healthy: bool,
 }
 
-impl From<crate::mirror::Probe> for MirrorProbeView {
-    fn from(p: crate::mirror::Probe) -> Self {
+impl SourcesView {
+    pub fn of(snap: crate::source::Snapshot) -> Self {
         Self {
-            healthy: p.healthy(),
-            url: p.url,
-            primary: p.primary,
-            latency_ms: p.latency_ms,
-            bytes_per_sec: p.bytes_per_sec,
-            tag: p.tag,
-            range_ok: p.range_ok,
-            error: p.error,
-        }
-    }
-}
-
-/// One sweep: the list as it now stands, plus what each entry measured.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MirrorSweepView {
-    pub sources: Vec<SourceView>,
-    pub probes: Vec<MirrorProbeView>,
-    /// Why the published list could not be read, if it could not. Never fatal.
-    pub refresh_error: Option<String>,
-}
-
-impl MirrorSweepView {
-    /// `pinned` is the selection AFTER the sweep applied its own policy, so the `active` flags
-    /// describe the state that was just persisted.
-    pub fn build(s: crate::mirror::Sweep, pinned: Option<&crate::config::SourceRef>) -> Self {
-        Self {
-            sources: source_views(&s.sources, pinned),
-            probes: s.probes.into_iter().map(MirrorProbeView::from).collect(),
-            refresh_error: s.refresh_error,
+            measuring: !snap.measuring.is_empty(),
+            refresh_error: snap.refresh_error,
+            sources: snap
+                .sources
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    let m = s.measured.as_ref();
+                    SourceRowView {
+                        active: i == snap.active,
+                        failed: snap.failed.contains(&s.url),
+                        measuring: snap.measuring.contains(&s.url),
+                        healthy: m.is_some_and(crate::config::Measured::healthy),
+                        bytes_per_sec: m.and_then(|m| m.bytes_per_sec),
+                        latency_ms: m.and_then(|m| m.latency_ms),
+                        tag: m.and_then(|m| m.tag.clone()),
+                        range_ok: m.is_some_and(|m| m.range_ok),
+                        measured_at: m.map(|m| m.at),
+                        error: m.and_then(|m| m.error.clone()),
+                        url: s.url.clone(),
+                    }
+                })
+                .collect(),
         }
     }
 }
@@ -992,5 +962,63 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
+    }
+}
+
+#[cfg(test)]
+mod source_view_tests {
+    use super::*;
+    use crate::config::{Measured, Source};
+    use crate::source::Snapshot;
+
+    /// THE STATUS BLOCK IS THE REGISTRY, and nothing else.
+    ///
+    /// Order, "in use" and "failed" all come from `source::Registry` — the same value the download
+    /// path walks — so the block cannot come to disagree with it. It used to be resolved a second
+    /// time, UI-side, from a list plus a pin; two resolutions of one question is exactly how a pane
+    /// comes to name a source the installer is not using.
+    #[test]
+    fn the_status_view_is_the_registry_and_nothing_else() {
+        let healthy = Measured {
+            bytes_per_sec: Some(5_000_000),
+            latency_ms: Some(12),
+            tag: Some("v1.4.2".into()),
+            range_ok: true,
+            ..Measured::blank(1_700_000_000)
+        };
+        let snap = Snapshot {
+            sources: vec![
+                Source { url: Some("https://fast".into()), measured: Some(healthy) },
+                Source::default(),
+                Source { url: Some("https://dead".into()), measured: Some(Measured::failed(9, "down")) },
+            ],
+            active: 1,
+            failed: [Some("https://dead".to_string())].into_iter().collect(),
+            measuring: [Some("https://fast".to_string())].into_iter().collect(),
+            refresh_error: Some("the registry was unreachable".into()),
+        };
+        let v = SourcesView::of(snap);
+
+        // ORDER is the registry's, verbatim — it is the order the walk uses
+        let urls: Vec<Option<&str>> = v.sources.iter().map(|r| r.url.as_deref()).collect();
+        assert_eq!(urls, [Some("https://fast"), None, Some("https://dead")]);
+
+        assert!(v.sources[1].active, "`active` is an INDEX into that same list, not a re-resolution");
+        assert!(!v.sources[0].active && !v.sources[2].active);
+        assert!(v.sources[2].failed && !v.sources[0].failed);
+        assert!(v.sources[0].measuring && !v.sources[2].measuring);
+        assert!(v.measuring, "any source in flight makes the block say so");
+
+        // the measurement is passed through, and `healthy` is derived HERE so the UI and the
+        // ranking cannot come to mean different things by "usable"
+        assert!(v.sources[0].healthy && !v.sources[2].healthy);
+        assert_eq!(v.sources[0].bytes_per_sec, Some(5_000_000));
+        assert_eq!(v.sources[0].latency_ms, Some(12));
+        assert_eq!(v.sources[0].tag.as_deref(), Some("v1.4.2"));
+        assert!(v.sources[0].range_ok);
+        assert_eq!(v.sources[0].measured_at, Some(1_700_000_000));
+        assert_eq!(v.sources[2].error.as_deref(), Some("down"));
+        assert_eq!(v.sources[1].measured_at, None, "never measured is null, not zero");
+        assert_eq!(v.refresh_error.as_deref(), Some("the registry was unreachable"));
     }
 }

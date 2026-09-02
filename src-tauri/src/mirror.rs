@@ -1,18 +1,20 @@
-//! Download sources: discovering mirrors, and measuring whether one actually *works*.
+//! Download sources: the published list of mirrors, and what a mirror IS on the wire.
 //!
 //! A mirror is a base URL serving a payload by CONTENT: `<url>/<payload>/manifest.json`, and the
 //! blobs that document names under `<url>/<payload>/blobs/<sha256>` (the layout, and why there is
 //! no tag directory in it, is `Mirror`'s doc; `doc_url`/`blob_url` build it for both the probe and
 //! the download backend). Mirrors are never authored by the user: they are published in a SIGNED
-//! `mirrors.json` and refreshed by `sweep`. Believing that document is `signed`'s job, below — and
-//! it is the only door to it, because a list that is merely parsed rewrites this machine's download
-//! sources permanently.
+//! `mirrors.json`. Believing that document is `signed`'s job, below — and it is the only door to
+//! it, because a list that is merely parsed rewrites this machine's download sources permanently.
 //!
-//! The measurement is deliberately more than a reachability check, because the failure this exists
+//! WHICH source is used, and in what order, is `source.rs`. This file owns the list and the
+//! backend; it decides nothing about routing.
+//!
+//! The measurement is deliberately more than a reachability check, because the failure it exists
 //! to catch is not an unreachable host. It is a network path that completes a handshake, serves a
 //! few KB of JSON perfectly well, and then throttles or stalls the bulk transfer — a source that
-//! passes every ping and cannot deliver a file. So every probe ends by pulling a chunk of a REAL
-//! asset and timing it, and the number that matters is throughput, not latency.
+//! passes every ping and cannot deliver a file. So the probe ends by pulling a chunk of a REAL
+//! blob and timing it, and the number that matters is throughput, not latency.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -20,10 +22,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::config::{normalize_mirror_url, Settings, Source};
+use crate::config::{normalize_mirror_url, Measured, Settings, Source};
 use crate::downloader::{Asset, Downloader, NetKind, Release};
 use crate::github::Github;
 use crate::manifest::Manifest;
+use crate::source;
 use crate::transport::{self, FetchError};
 use crate::trust::Payload;
 
@@ -32,126 +35,29 @@ const UA: &str = concat!("phoenix-launcher/", env!("CARGO_PKG_VERSION"));
 /// The published mirror list, as a release asset and at every mirror's root.
 pub const MIRRORS_ASSET: &str = "mirrors.json";
 
-/// Ceiling on a mirror's `mirrors.json`. An entry is a couple of hundred bytes, so a megabyte is
-/// already thousands of them — and it is a list of hosts the installer will later take bytes from,
-/// which makes its size a trust input like any other. It also has to be buffered whole before its
-/// signature can be checked, so this bounds a read that happens BEFORE anything is believed. The
-/// payload MANIFEST the probe reads is bounded separately and far higher
-/// (`trust::MAX_DOC_BYTES`); see `probe_mirror`.
+/// Ceiling on the published `mirrors.json`, wherever it is read from.
+///
+/// An entry is a couple of hundred bytes, so a megabyte is already thousands of them — and it is a
+/// list of hosts the installer will later take bytes from, which makes its size a trust input like
+/// any other. It also has to be buffered whole before its signature can be checked, so this bounds
+/// a read that happens BEFORE anything is believed. ONE ceiling for both copies (the registry
+/// release's and a mirror's): it is the same document, and a second, larger number for either of
+/// them would bound nothing useful for the other.
 const MIRRORS_MAX_BYTES: u64 = 1 << 20;
 
-/// Whether a mirror can serve an INSTALL yet. The `Downloader` implementation now exists (see
-/// `Mirror` below), so this is no longer a statement about missing code: it is the DEPLOYMENT
-/// switch, and it stays false until the `mirrors.json` published for these hosts is signed and the
-/// payload trees are actually mirrored. Nothing routes a byte through a mirror while it is false —
-/// `cmd::download_sources` builds a chain of the primary alone — so the boot-time sweep's cost (a
-/// 512 KiB transfer and up to `PROBE_BUDGET` per source, every launch) is not paid for a result
-/// nothing can act on. A user-initiated sweep still measures, because there the cost is asked for.
-pub const MIRROR_DOWNLOADS_ENABLED: bool = false;
-
-/// How much of a real asset to pull. Comfortably past the ~16 KiB that throttling middleboxes have
-/// been observed to let through before choking a connection, so a path that only *looks* alive is
-/// measured as slow rather than reported as healthy.
-const PROBE_BYTES: u64 = 512 * 1024;
-
-/// Wall-clock cap on the asset read.
-///
-/// A per-read timeout does not catch a trickle: a path that delivers a few bytes every second
-/// keeps resetting the socket's read deadline and would hold the probe open for as long as it
-/// cares to. The loop is therefore bounded by total elapsed time, and running out mid-chunk counts
-/// as a failure — not a low score — because a source that cannot finish 512 KiB cannot finish a
-/// release.
-const PROBE_BUDGET: Duration = Duration::from_secs(8);
-
 /// Shorter than the download path's timeouts: a probe's job is to fail fast and be re-run, not to
-/// wait out a bad link. One blocking read may still overshoot `PROBE_BUDGET` by this much.
+/// wait out a bad link. One blocking read may still overshoot `source::PROBE_BUDGET` by this much.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One source's measurement. Every field is independently meaningful, so a partial result is still
-/// worth showing: a source can be reachable, current, and far too slow to use.
-#[derive(Debug, Clone)]
-pub struct Probe {
-    /// None for the primary — it has no URL, and the UI keys on `primary` instead.
-    pub url: Option<String>,
-    pub primary: bool,
-    /// Milliseconds to fetch and read the document that names the release — the primary's release
-    /// index, a mirror's manifest. All a plain reachability check would have said.
-    pub latency_ms: Option<u64>,
-    /// Bytes per second over a real asset chunk. The number worth sorting on.
-    pub bytes_per_sec: Option<u64>,
-    /// Newest published tag the source advertises. A source that is fast, healthy and three
-    /// releases behind is visible only here.
-    pub tag: Option<String>,
-    /// Did the asset request answer 206? Resume across a dropped connection depends on it, which
-    /// on the links this feature exists for is the difference between a multi-GiB download
-    /// finishing and never finishing.
-    pub range_ok: bool,
-    /// None when the source served everything asked of it; a short reason otherwise.
-    pub error: Option<String>,
-}
-
-impl Probe {
-    fn blank(source: &Source) -> Self {
-        Self {
-            url: source.url().map(str::to_string),
-            primary: source.is_primary(),
-            latency_ms: None,
-            bytes_per_sec: None,
-            tag: None,
-            range_ok: false,
-            error: None,
-        }
-    }
-
-    fn failed(source: &Source, why: impl Into<String>) -> Self {
-        Self { error: Some(why.into()), ..Self::blank(source) }
-    }
-
-    /// Did it deliver the whole requested chunk, within budget, without faulting? The sort's
-    /// primary key, and what the list paints green. Deliberately strict: "answered" is not health.
-    pub fn healthy(&self) -> bool {
-        self.error.is_none() && self.bytes_per_sec.is_some()
-    }
-
-    /// Sort key: usable sources first, then fastest, latency only breaking ties between two that
-    /// both deliver. Never latency-first — a latency figure is exactly what a throttled path
-    /// still passes.
-    fn rank(&self) -> (bool, std::cmp::Reverse<u64>, u64) {
-        (
-            !self.healthy(),
-            std::cmp::Reverse(self.bytes_per_sec.unwrap_or(0)),
-            self.latency_ms.unwrap_or(u64::MAX),
-        )
-    }
-}
-
-/// The result of one sweep: the source list as it now stands, and what each source measured.
+/// The signed mirror list compiled in at build time, or `None` for a build made without one.
 ///
-/// `sources` and `probes` are PARALLEL — index `i` of each describes the same source, after the
-/// sort. Callers may zip them. `probes` is empty when the sweep only refreshed the list.
-pub struct Sweep {
-    pub sources: Vec<Source>,
-    pub probes: Vec<Probe>,
-    /// Why the published list could not be read, if it could not. Never fatal — the sweep runs on
-    /// whatever list we already had.
-    pub refresh_error: Option<String>,
-    /// The serial of the list this sweep accepted, if it accepted one. Private, and written only
-    /// by `persist`, for the reason spelled out on `Refresh::persist`.
-    serial: Option<u64>,
-}
-
-impl Sweep {
-    /// Persist a measured sweep. The measured ORDER and the accepted SERIAL in one settings write —
-    /// see `Refresh::persist`, of which this is the measured half.
-    ///
-    /// `clear_pin` drops the user's pinned source, which is the caller's policy and not this
-    /// module's: the test button clears it (asking to be re-tested is asking for the answer the
-    /// test gives) and the headless `--save` does not.
-    pub fn persist(&self, clear_pin: bool) -> Result<()> {
-        store(self.sources.clone(), self.serial, clear_pin)
-    }
-}
+/// Bytes and detached signature, NOT a parsed list: it goes through `signed::verify` at runtime
+/// exactly like a fetched copy, so there is one door to the list and a baked document cannot be
+/// believed on a different rule from a downloaded one. `build.rs` refuses to produce one that does
+/// not verify, so a shipped binary either has a good list or has none — which is the whole point of
+/// baking one at all: a client that cannot reach GitHub can otherwise never learn a mirror exists.
+pub const BAKED: Option<(&[u8], &str)> = include!(concat!(env!("OUT_DIR"), "/baked_mirrors.rs"));
 
 /// What a list refresh concluded: the sources as they should now stand, and — only when a list was
 /// actually accepted — the serial to ratchet with.
@@ -165,15 +71,18 @@ pub struct Refresh {
 }
 
 impl Refresh {
-    /// Time every source and reorder them fastest-first, keeping the accepted serial.
+    /// Fold a LATER refresh into this one: the later sources stand, and the HIGHER accepted serial
+    /// survives.
     ///
-    /// The serial is a property of the DOCUMENT, so it survives any reordering of the hosts that
-    /// document named — which is exactly why measuring must not be a path that quietly loses it.
-    pub fn measured(self, settings: &Settings) -> (Self, Vec<Probe>) {
-        let payload = settings.payload_of(&settings.source_repo);
-        let (sources, probes) =
-            measure(self.sources, &settings.source_repo, payload, settings.token());
-        (Self { sources, error: self.error, serial: self.serial }, probes)
+    /// Two documents can be accepted in one launch — the baked bootstrap, then a fetched list — and
+    /// only one settings write may follow, so the fold has to happen where the private field lives.
+    /// `advance_serial` is monotonic either way, so the higher one is the only one worth carrying.
+    pub fn then(self, later: Refresh) -> Refresh {
+        Refresh {
+            sources: later.sources,
+            error: later.error,
+            serial: self.serial.max(later.serial),
+        }
     }
 
     /// Persist a refresh: the sources it concluded AND the serial of the list they came from, in
@@ -186,49 +95,26 @@ impl Refresh {
     /// stored the sources alone would leave the floor at zero forever: the rollback check would go
     /// on running against a floor nothing ever raised, and the only symptom of that is a rollback
     /// nobody notices.
-    pub fn persist(&self, clear_pin: bool) -> Result<()> {
-        store(self.sources.clone(), self.serial, clear_pin)
+    pub fn persist(&self) -> Result<()> {
+        let (sources, serial) = (self.sources.clone(), self.serial);
+        Settings::update(move |s| {
+            s.sources = sources;
+            // Only when a list was ACCEPTED — `Ok(None)` and every refusal leave the floor alone,
+            // since neither produced a document to be current with. `advance_serial` is monotonic,
+            // so this can never walk the floor back either.
+            if let Some(n) = serial {
+                s.advance_serial(Payload::Mirrors, n);
+            }
+        })
     }
-}
-
-/// The one settings write both of the above make.
-fn store(sources: Vec<Source>, serial: Option<u64>, clear_pin: bool) -> Result<()> {
-    Settings::update(move |s| {
-        s.sources = sources;
-        // Only when a list was ACCEPTED — `Ok(None)` and every refusal leave the floor alone, since
-        // neither produced a document to be current with. `advance_serial` is monotonic, so this
-        // can never walk the floor back either.
-        if let Some(n) = serial {
-            s.advance_serial(Payload::Mirrors, n);
-        }
-        if clear_pin {
-            s.selected = None;
-        }
-    })
-}
-
-/// Is there a published mirror nobody has ever timed? The ONLY thing that triggers an automatic
-/// measurement — there is no schedule, because re-timing costs a real download per source and
-/// re-ordering the list unprompted is what would move a user off the source they chose.
-///
-/// The primary is not counted: with no mirrors there is nothing to rank it against, and measuring
-/// it alone would be a download that answers no question.
-pub fn has_new_mirror(sources: &[Source]) -> bool {
-    sources.iter().any(|s| matches!(s, Source::Mirror { measured: false, .. }))
-}
-
-/// Refresh the published mirror list. Cheap — one small document and its signature — so this runs
-/// on every launch.
-pub fn refresh(settings: &Settings) -> Refresh {
-    apply(&settings.sources, fetch_published_mirrors(settings))
 }
 
 /// What an answer DOES to the list. Three outcomes, none of them interchangeable, and the
 /// differences between them are the whole safety property of this file:
 ///
 /// * a VERIFIED list REPLACES the mirrors — including an empty one, which is the publisher saying
-///   there are none. Flags survive by URL (`rebuild`); the primary is not in the document and so is
-///   untouched by construction.
+///   there are none. Measurements survive by URL (`rebuild`); the GitHub entry is not in the
+///   document and so is untouched by construction.
 /// * `Ok(None)` — nothing published a list at all — is silence, not an empty list. The existing
 ///   mirrors stay, because "could not ask" must never read as "there are none".
 /// * an ERROR is that same silence, and an error is what a document that FAILED TO VERIFY produces.
@@ -237,8 +123,7 @@ pub fn refresh(settings: &Settings) -> Refresh {
 ///   to prevent — and it would do it quietly, since a wiped list looks exactly like a publisher who
 ///   retired their mirrors.
 ///
-/// Split out from `refresh` so all three can be exercised without a network; `refresh` is one line
-/// over it.
+/// Split out from the fetch so all three can be exercised without a network.
 fn apply(existing: &[Source], answer: Result<Option<signed::SignedList>>) -> Refresh {
     match answer {
         Ok(Some(list)) => Refresh {
@@ -253,108 +138,74 @@ fn apply(existing: &[Source], answer: Result<Option<signed::SignedList>>) -> Ref
     }
 }
 
-/// Time every source and order them fastest-first, marking each mirror measured.
-///
-/// `payload` is `repo`'s (`Settings::payload_of`) — a mirror is addressed by payload directory, not
-/// by repo, and only the settings know which is which.
-pub fn measure(
-    sources: Vec<Source>,
-    repo: &str,
-    payload: Option<Payload>,
-    token: Option<&str>,
-) -> (Vec<Source>, Vec<Probe>) {
-    let probes = probe_all(&sources, repo, payload, token);
-    // Kept zipped through the sort: `sources[i]` and `probes[i]` describe the same source, and
-    // reordering one without the other would silently mislabel every measurement.
-    let mut paired: Vec<(Source, Probe)> = sources.into_iter().zip(probes).collect();
-    // Unconditional. The head of the list is what gets used when nothing is pinned, so it should
-    // be the fastest that works — there is no reading of "I would like the slow one first".
-    paired.sort_by(|(_, a), (_, b)| a.rank().cmp(&b.rank()));
-    let (mut sources, probes): (Vec<Source>, Vec<Probe>) = paired.into_iter().unzip();
-    for s in &mut sources {
-        if let Source::Mirror { measured, .. } = s {
-            *measured = true;
-        }
-    }
-    (sources, probes)
+/// "Nothing was asked, and nothing about the LIST changes." The `Ok(None)` arm of `apply`, named —
+/// a caller that only wants to persist a re-ranking still goes through `Refresh`, so `persist`
+/// stays the only writer and can never be handed a serial nothing accepted.
+pub fn unchanged(existing: &[Source]) -> Refresh {
+    apply(existing, Ok(None))
 }
 
-/// Refresh, then measure — the test button's whole job.
+/// The published list as ONE source has it, applied to `existing`.
 ///
-/// Pure: it reads settings and returns what they should become, so the caller decides whether to
-/// persist (the GUI does; the CLI only on `--save`) — through `Sweep::persist`, which is the only
-/// thing that may write one.
-pub fn sweep(settings: &Settings, do_measure: bool) -> Sweep {
-    let refreshed = refresh(settings);
-    if !do_measure {
-        return Sweep {
-            sources: refreshed.sources,
-            probes: Vec::new(),
-            refresh_error: refreshed.error,
-            serial: refreshed.serial,
-        };
-    }
-    let (refreshed, probes) = refreshed.measured(settings);
-    Sweep {
-        sources: refreshed.sources,
-        probes,
-        refresh_error: refreshed.error,
-        serial: refreshed.serial,
-    }
+/// The error arm is a SOURCE failure: the caller marks that source and moves to the next. That
+/// cannot turn a refusal into an application — `apply` still leaves the list exactly as it was —
+/// only into another attempt at another host.
+pub fn refresh_from(settings: &Settings, existing: &[Source], source: &Source) -> Refresh {
+    let floor = settings.serial_floor(Payload::Mirrors);
+    apply(existing, fetch_list_from(settings, source, floor))
 }
 
-/// Did the measurement find anything usable at all?
+/// The BAKED list, applied — but only on a machine that has never accepted one.
 ///
-/// The gate on replacing a user's pin automatically. If EVERY source is down — including the main
-/// one, which is an ordinary outage on the networks this feature exists for — then dropping the
-/// pin buys nothing: the fallback is dead too. Keeping it means the choice is still there when
-/// the outage clears, instead of having been quietly spent on a moment when nothing worked.
-pub fn any_healthy(probes: &[Probe]) -> bool {
-    probes.iter().any(Probe::healthy)
+/// "First run" is `serial_floor(Mirrors) == 0`, and it needs no new field: the floor already
+/// records "this machine has ever accepted a mirror list", which is exactly the question. (It is
+/// also why the registry must never mint serial 0.) The document goes through `signed::verify`
+/// against that same floor and is ratcheted by `persist` like any other accepted list, so a baked
+/// list applies exactly once and a machine that has since taken a newer one never sees it.
+///
+/// A REFUSAL is silence, and returns `None`: a baked list that does not verify is a build defect —
+/// `build.rs` refuses to ship one — or a floor that was reset, and neither is a fact about a source
+/// or a reason to touch the list. `None` is also what a build made without a list answers.
+pub fn bootstrap(settings: &Settings) -> Option<Refresh> {
+    if settings.serial_floor(Payload::Mirrors) != 0 {
+        return None;
+    }
+    let (doc, sig) = BAKED?;
+    let applied = apply(&settings.sources, signed::verify(doc, sig, 0).map(Some));
+    applied.error.is_none().then_some(applied)
 }
 
-/// Merge the published mirror list into the existing one, PRESERVING ORDER.
+/// Merge the published mirror list into the existing one, PRESERVING ORDER AND MEASUREMENTS.
 ///
-/// Order is a measurement result, not a property of the document: a plain list refresh happens on
-/// every launch and must not throw away the speed ranking that decides which source is used. So
-/// known entries keep their positions, their switches AND their measured flag, mirrors the
-/// document has dropped are removed, and newly published ones land at the end — unmeasured, which
-/// is precisely the signal that an automatic measurement is due.
+/// Order is a measurement result, not a property of the document: a refresh happens on every launch
+/// and must not throw away the ranking that decides which source is used. So known entries keep
+/// their positions AND their `Measured`, mirrors the document has dropped are removed, and newly
+/// published ones land at the end unmeasured — which is precisely the signal that a measuring pass
+/// is due (`source::launch_set`).
 ///
-/// The primary is preserved from `existing` wherever it sits, and re-inserted if somehow absent.
-/// It is never drawn from the document, which is what makes it unremovable by one.
+/// The GitHub entry is preserved from `existing` wherever it sits, and re-inserted if somehow
+/// absent. It is never drawn from the document, which is what makes it unremovable by one: every
+/// entry in the document is a URL, and GitHub's identity is the absence of one.
 fn rebuild(existing: &[Source], hosts: &[signed::Host]) -> Vec<Source> {
-    let published: Vec<(String, Vec<String>)> = {
+    let published: Vec<String> = {
         let mut seen = std::collections::HashSet::new();
         hosts
             .iter()
-            .filter_map(|h| normalize_mirror_url(&h.url).map(|u| (u, h.payloads.clone())))
-            .filter(|(u, _)| seen.insert(u.clone()))
+            .filter_map(|h| normalize_mirror_url(&h.url))
+            .filter(|u| seen.insert(u.clone()))
             .collect()
     };
-
     let mut out: Vec<Source> = existing
         .iter()
-        .filter(|s| s.is_primary() || s.url().is_some_and(|u| published.iter().any(|(p, _)| p == u)))
+        .filter(|s| s.is_github() || s.key().is_some_and(|u| published.iter().any(|p| p == u)))
         .cloned()
         .collect();
-    if !out.iter().any(Source::is_primary) {
-        out.insert(0, Source::Primary);
+    if !out.iter().any(Source::is_github) {
+        out.insert(0, Source::default());
     }
-    // A surviving mirror keeps its flags and its rank — the whole point of matching by URL — but
-    // takes the LIST's word on what it carries. Payloads are the publisher's statement about a
-    // host, not a local preference, so an entry that gained or lost one must be re-read here or the
-    // probe and the download chain go on believing a shape the list has stopped claiming.
-    for s in &mut out {
-        if let Source::Mirror { url, payloads, .. } = s {
-            if let Some((_, fresh)) = published.iter().find(|(p, _)| p == url) {
-                *payloads = fresh.clone();
-            }
-        }
-    }
-    for (url, payloads) in published {
-        if !out.iter().any(|s| s.url() == Some(url.as_str())) {
-            out.push(Source::Mirror { url, enabled: true, measured: false, payloads });
+    for url in published {
+        if !out.iter().any(|s| s.key() == Some(url.as_str())) {
+            out.push(Source::at(url));
         }
     }
     out
@@ -371,72 +222,56 @@ fn sig_text(bytes: Vec<u8>) -> Result<String> {
         .map_err(|_| anyhow::Error::new(crate::minisig::SigError::Malformed("not UTF-8")))
 }
 
-/// The published mirror list, VERIFIED — from the registry repo's release, or from a mirror.
+/// The published mirror list, VERIFIED, from ONE source.
 ///
 /// `Ok(None)` means no list is published, which is a different thing from a verified document whose
 /// `mirrors` array is empty: that one is a publisher stating there are none, and it replaces the
-/// set. `Err` is "no answer", and it covers BOTH a source that could not be reached and a document
-/// that failed to verify — see `apply` for why those two must land in the same place.
+/// set. `Err` is "this source could not serve it", and it covers BOTH a host that could not be
+/// reached and a document that failed to verify — see `apply` for why those two land in the same
+/// place, and `source::refresh_list` for what the caller does with either.
 ///
-/// THE REGISTRY IS AUTHORITATIVE WHENEVER IT ANSWERS; mirrors are consulted only when it could not
-/// be reached at all. The signature and the serial ratchet are what make a mirror's copy safe to
-/// obey — before them, any one enabled mirror could evict every sibling and install its own hosts,
-/// permanently, with the registry perfectly healthy, so "who is allowed to author it" was the only
-/// control there was. What the ordering still buys, now that it is not the control, is FRESHNESS
-/// and a useful error: the registry publishes first, so a mirror's copy can only ever be as new,
-/// and a mirror's failure is not the one worth showing a user when the source of truth is down.
+/// ONLY GITHUB MAY ANSWER "NOTHING IS PUBLISHED". A mirror's copy is written by its sync pass on
+/// every run, so a host that does not serve it is a host that is broken; reporting that as "the
+/// publisher has no list" would let one unsynced mirror silently freeze the mirror set of every
+/// client that reached it, which is exactly the users this whole feature exists for.
 ///
 /// The document describes MIRRORS ONLY. There is no element in it that could name, reorder or
-/// remove the primary source.
-fn fetch_published_mirrors(settings: &Settings) -> Result<Option<signed::SignedList>> {
-    let floor = settings.serial_floor(Payload::Mirrors);
-    // `cmd::open_repo`, not a bare `Github`: this repo is PUBLIC, so the fetch takes the same
-    // anonymous-first / token-on-refusal rule every other public repo takes rather than leading
-    // with a credential scoped to the dist repo (see `Settings::mirrors_repo`). The source WALK
-    // `open_repo` also performs degenerates to the primary alone here, because `payload_of` does
-    // not know this repo and must not — a mirror's copy is reached below instead, at the root path
-    // a mirror actually serves it from.
-    let last_err = match crate::cmd::open_repo(settings.mirrors_repo(), settings) {
-        Ok((dl, release)) => {
-            // Reached, and publishes no list. That is an ANSWER, not a gap — and it is the only
-            // "absent" this function recognises, which is why a missing SIGNATURE below is an error
-            // instead: "unsigned" must never be spelled the same way as "not published".
-            let Some(doc_asset) = release.asset(MIRRORS_ASSET) else { return Ok(None) };
-            let sig_name = mirrors_sig();
-            let sig_asset = release.asset(&sig_name).ok_or_else(|| {
-                anyhow::Error::new(crate::trust::TrustError::Unsigned(MIRRORS_ASSET.to_string()))
-            })?;
-            // Bounded like every other trust-adjacent fetch (see engine::manifest_of): the document
-            // is buffered whole in order to be verified, so its size is a trust input, and the read
-            // happens before a single check has run.
-            let doc = dl.download_limited(doc_asset, crate::trust::MAX_DOC_BYTES)?;
-            let sig = sig_text(dl.download_limited(sig_asset, crate::trust::MAX_SIG_BYTES)?)?;
-            // Everything past `open_repo` succeeding is the registry ANSWERING, so its verdict —
-            // including a refusal — is returned rather than falling through to the mirrors below.
-            return signed::verify(&doc, &sig, floor).map(Some);
-        }
-        Err(e) => e,
-    };
-
-    // One agent for the whole fallback: `probe_agent`'s pool is what keeps N mirrors from paying N
-    // fresh handshakes for two small documents each.
-    let agent = probe_agent();
-    for url in settings.sources.iter().filter(|s| s.enabled()).filter_map(|s| s.url()) {
-        if let Ok(Some(list)) = fetch_list_from_mirror(&agent, url, floor) {
-            return Ok(Some(list));
-        }
+/// remove the built-in source.
+fn fetch_list_from(
+    settings: &Settings,
+    source: &Source,
+    floor: u64,
+) -> Result<Option<signed::SignedList>> {
+    match source.key() {
+        None => fetch_list_from_github(settings, floor),
+        Some(base) => fetch_list_from_mirror(&probe_agent(), base, floor),
     }
+}
 
-    // NO MIRROR IS AUTHORITATIVE ABOUT WHETHER A LIST EXISTS — only the registry is, and it already
-    // returned above if it answered at all. A mirror's 404 says one thing: that HOST does not carry
-    // the document. It used to be counted as the publisher saying "there are none", and the
-    // consequences were the reverse of harmless: `Ok(None)` reaches `apply` as a successful refresh
-    // with `error: None`, so the settings pane reports nothing wrong while the mirror set silently
-    // stops changing — for precisely the users whose registry is unreachable, which is everyone
-    // this feature exists for. Any host that has not synced the list yet was enough to trigger it.
-    //
-    // So the registry's failure is what gets reported. Being unable to ask is not an answer.
-    Err(last_err)
+/// The registry repo's release: `mirrors.json` and its signature, both bounded.
+///
+/// `Github::for_repo`, not a bare credential: this repo is PUBLIC, so it takes the same
+/// anonymous-first / token-on-refusal rule every other public repo takes rather than leading with a
+/// credential scoped to the dist repo (see `Settings::mirrors_repo`).
+fn fetch_list_from_github(settings: &Settings, floor: u64) -> Result<Option<signed::SignedList>> {
+    let repo = settings.mirrors_repo();
+    let gh = Github::for_repo(settings, repo);
+    let release = gh
+        .fetch_release(repo, None)
+        .with_context(|| format!("fetching the latest {repo} release"))?;
+    // Reached, and publishes no list. That is an ANSWER, not a gap — and it is the only "absent"
+    // recognised anywhere in this file, which is why a missing SIGNATURE below is an error instead:
+    // "unsigned" must never be spelled the same way as "not published".
+    let Some(doc_asset) = release.asset(MIRRORS_ASSET) else { return Ok(None) };
+    let sig_name = mirrors_sig();
+    let sig_asset = release.asset(&sig_name).ok_or_else(|| {
+        anyhow::Error::new(crate::trust::TrustError::Unsigned(MIRRORS_ASSET.to_string()))
+    })?;
+    // Bounded like every other trust-adjacent fetch: the document is buffered whole in order to be
+    // verified, so its size is a trust input, and the read happens before a single check has run.
+    let doc = gh.download_limited(doc_asset, MIRRORS_MAX_BYTES)?;
+    let sig = sig_text(gh.download_limited(sig_asset, crate::trust::MAX_SIG_BYTES)?)?;
+    signed::verify(&doc, &sig, floor).map(Some)
 }
 
 /// One mirror's copy of the list: `<base>/mirrors.json`, with `<base>/mirrors.json.minisig` beside
@@ -447,21 +282,23 @@ fn fetch_published_mirrors(settings: &Settings) -> Result<Option<signed::SignedL
 /// here can reach the parsed form without `signed::verify` — see that module's doc for why the
 /// verified type cannot be built any other way.
 ///
-/// A missing DOCUMENT is `Ok(None)`: this host does not carry the list, which is a true answer and
-/// the one thing the caller may read as "no list published". A missing SIGNATURE is an error, for
-/// exactly that reason — a mirror that could turn "I refuse to sign this" into "there is no list"
-/// would still be choosing what the caller does, and here the caller does nothing at all.
+/// A MISSING DOCUMENT IS AN ERROR HERE, and that is an inversion of what this used to answer. It
+/// returned `Ok(None)` — "this host publishes no list" — which the caller reads as a real answer
+/// and acts on by leaving the set alone with nothing looking wrong. A mirror's sync pass writes
+/// `mirrors.json` on every run, so its absence means the host is broken, and one host that had not
+/// synced yet was enough to make the mirror set stop changing for everyone who reached it. Only
+/// GitHub gets to say "nothing is published"; a mirror only ever gets to fail.
 ///
-/// The `agent` is a parameter for the same reason `probe_mirror`'s is: `probe_agent()` is
-/// https-only and a loopback listener cannot speak TLS, so the end-to-end tests below could not
-/// otherwise reach this. Production has exactly one caller and it passes `probe_agent()`.
+/// The `agent` is a parameter for the same reason `probe_with`'s is: `probe_agent()` is https-only
+/// and a loopback listener cannot speak TLS, so the end-to-end tests below could not otherwise
+/// reach this. Production has exactly one caller and it passes `probe_agent()`.
 fn fetch_list_from_mirror(
     agent: &ureq::Agent,
     base: &str,
     floor: u64,
 ) -> Result<Option<signed::SignedList>> {
-    // `Ok(None)` here is a 404 and nothing else: every other failure is an error, so a host that
-    // answers oddly is never mistaken for one that answers "no".
+    // `Ok(None)` inside this closure is a 404 and nothing else: every other failure is an error, so
+    // a host that answers oddly is never mistaken for one that answers "no".
     let get = |name: &str, max: u64| -> Result<Option<Vec<u8>>> {
         let url = root_url(base, name);
         match transport::fetch(agent, &url, |req, _same_origin| req.set("User-Agent", UA)) {
@@ -470,26 +307,25 @@ fn fetch_list_from_mirror(
             Err(e) => Err(anyhow::anyhow!("{base}: {}", short_fetch(e))),
         }
     };
-    let Some(doc) = get(MIRRORS_ASSET, MIRRORS_MAX_BYTES)? else { return Ok(None) };
+    let Some(doc) = get(MIRRORS_ASSET, MIRRORS_MAX_BYTES)? else {
+        anyhow::bail!("{base}: this host serves no {MIRRORS_ASSET}");
+    };
     let sig = get(&mirrors_sig(), crate::trust::MAX_SIG_BYTES)?.ok_or_else(|| {
         anyhow::Error::new(crate::trust::TrustError::Unsigned(MIRRORS_ASSET.to_string()))
     })?;
-    signed::verify(&doc, &sig_text(sig)?, floor)
-        .map(Some)
-        .with_context(|| base.to_string())
+    signed::verify(&doc, &sig_text(sig)?, floor).map(Some).with_context(|| base.to_string())
 }
 
-/// Read a small document whole, under a ceiling the CALLER states — the two this module reads from
-/// a mirror are not remotely the same size, and one ceiling for both would have to be the larger.
+/// Read a small document whole, under a ceiling the CALLER states.
 ///
 /// Over-limit is an ERROR rather than a silent truncation. A truncated document is still handed to
 /// a parser, which reports it as malformed — blaming a host's syntax for its size, and on the
 /// manifest path ranking a mirror dead for serving a release that merely grew.
 fn read_all(resp: ureq::Response, max: u64) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
-    // `take(max + 1)` rather than trusting Content-Length, exactly as `Mirror::manifest_bytes`
-    // does: the length header is the peer's claim, and a host that intends to exhaust this
-    // process's memory is not going to declare it.
+    // `take(max + 1)` rather than trusting Content-Length, exactly as `Mirror::read_doc` does: the
+    // length header is the peer's claim, and a host that intends to exhaust this process's memory
+    // is not going to declare it.
     resp.into_reader().take(max + 1).read_to_end(&mut buf)?;
     if buf.len() as u64 > max {
         anyhow::bail!("the document is larger than the {max} bytes allowed for it");
@@ -561,17 +397,19 @@ mod signed {
         payloads: Vec<String>,
     }
 
-    /// One published mirror, reduced to what the client acts on: where it is, and which payload
-    /// trees it says it carries.
+    /// One published mirror, reduced to what the client acts on: WHERE IT IS. That is the whole
+    /// of it.
     ///
-    /// `payloads` is kept — not merely validated and dropped — because a mirror need not carry all
-    /// three, and both the probe and the download chain have to know. `name` and `country` are
-    /// still deliberately discarded: nothing renders them, and a field carried but unused is one a
-    /// later reader starts to believe is doing something.
+    /// `payloads` is validated and then discarded, and the asymmetry is deliberate. Validating it
+    /// is a check on our own PRODUCER — an entry advertising nothing is a registration that would
+    /// serve nothing, and the registry repo exists to make that unshippable. ACTING on it is a
+    /// different thing, and the launcher does not: every mirror carries every payload (see
+    /// `source::dial_for`), so a per-host payload list would be a field the client has to keep in
+    /// step with a fact it never asks. `name` and `country` are discarded for the plainer reason
+    /// that nothing renders them.
     #[derive(Debug)]
     pub(super) struct Host {
         pub(super) url: String,
-        pub(super) payloads: Vec<String>,
     }
 
     /// A mirror list that has been verified, identified and found current. `verify` is its sole
@@ -652,7 +490,7 @@ mod signed {
                     m.base_url
                 );
             }
-            hosts.push(Host { url: m.base_url.clone(), payloads: m.payloads.clone() });
+            hosts.push(Host { url: m.base_url.clone() });
         }
         Ok(SignedList { hosts, serial })
     }
@@ -669,18 +507,17 @@ fn probe_agent() -> ureq::Agent {
         // https-only, and re-checked on EVERY hop of a redirect chain, not just the URL we start
         // with (each hop `transport::fetch` issues is its own fresh request, so this same check
         // runs again every time). The probe DERIVES every URL it starts from (`doc_url`/`blob_url`,
-        // see `probe_mirror` below), but a mirror still chooses every `Location` it answers with —
+        // see `probe_with` below), but a mirror still chooses every `Location` it answers with —
         // so a hostile or compromised one can point the next hop at `http://`, `file://`, or a
-        // `\\host\share` UNC path. The last one is the one that matters most: Windows treats that
+        // UNC path (`\\host\share`). The last one is the one that matters most: Windows treats that
         // shape as an implicit SMB target, and touching it is enough to leak this machine's NTLMv2
         // hash to whatever server answers, before a single byte of content is read.
         .https_only(true)
         .build()
 }
 
-/// `net_reason`-style compaction for the redirect-following path: `short` already strips a
-/// `ureq::Error` down to its kind; this covers the two ways `transport::fetch` can fail without
-/// ever reaching ureq at all.
+/// Compaction for the redirect-following path: `short` already strips a `ureq::Error` down to its
+/// kind; this covers the two ways `transport::fetch` can fail without ever reaching ureq at all.
 fn short_fetch(e: FetchError) -> String {
     match e {
         FetchError::Http(inner) => short(inner),
@@ -688,136 +525,51 @@ fn short_fetch(e: FetchError) -> String {
     }
 }
 
-/// Probe every source at once.
-///
-/// Parallel because a probe is almost entirely network wait: sweeping N sources serially costs
-/// N × `PROBE_BUDGET`, which is the multi-minute freeze a user would read as a broken button. The
-/// count is published and small, so a thread each is simpler than a pool and costs nothing worth
-/// managing. Disabled mirrors are probed too — that is how one that has recovered gets noticed.
-pub fn probe_all(
-    sources: &[Source],
-    repo: &str,
-    payload: Option<Payload>,
-    token: Option<&str>,
-) -> Vec<Probe> {
-    std::thread::scope(|scope| {
-        let handles: Vec<_> =
-            sources.iter().map(|s| scope.spawn(move || probe_one(s, repo, payload, token))).collect();
-        sources
-            .iter()
-            .zip(handles)
-            .map(|(s, h)| h.join().unwrap_or_else(|_| Probe::failed(s, "the probe crashed")))
-            .collect()
-    })
-}
-
-pub fn probe_one(
-    source: &Source,
-    repo: &str,
-    payload: Option<Payload>,
-    token: Option<&str>,
-) -> Probe {
-    match source {
-        // Two backends, two measurements, deliberately not unified: the primary IS GitHub, so its
-        // release index is the right thing to time there, and a mirror has no such index at all.
-        Source::Primary => probe_primary(source, repo, token),
-        Source::Mirror { url, .. } => {
-            probe_mirror(&probe_agent(), source, url, measurable(source, payload))
-        }
+/// A compact reason for the UI. ureq's transport errors carry the URL they were fetching, which
+/// would put a full asset URL in a status row; only the kind survives.
+fn short(e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        ureq::Error::Transport(t) => t.kind().to_string(),
     }
 }
 
-/// Which payload directory to time this mirror through.
+/// Time a mirror, through the layout a mirror actually serves: its payload manifest, then a ranged
+/// read of the biggest blob that document names.
 ///
-/// It has to be one the host actually CARRIES, and that is not always the one the caller asked
-/// about: `measure` asks about the source repo's payload — always `mod`, since that is the repo
-/// whose ranking it builds — and timing that fixed directory measured one which need not exist. A
-/// game-only mirror 404'd, was painted unusable and dropped from `any_healthy` while serving the
-/// 7.9 GiB payload perfectly; a mod-only mirror measured healthy and then headed the ranking used
-/// for a game install it cannot serve at all.
-///
-/// Preferring the requested payload keeps the ordinary case measuring exactly what will be
-/// downloaded. Falling back to another one the host carries is deliberate: throughput is a property
-/// of the HOST, and a real transfer from it beats no number — while `candidates` is what keeps a
-/// payload from being routed to a mirror lacking it, so a speed measured here can never on its own
-/// send a download somewhere it cannot be served.
-///
-/// `None` means nothing measurable: a mirror advertising only payload names this build cannot name.
-fn measurable(source: &Source, want: Option<Payload>) -> Option<Payload> {
-    if want.is_some_and(|p| source.carries(p)) {
-        return want;
-    }
-    source.payloads().iter().find_map(|id| Payload::from_id(id))
+/// `payload` is the caller's (`source::PROBE_PAYLOAD`) rather than a constant here: which tree a
+/// probe is timed through is a routing decision, and routing decisions live in `source.rs`.
+pub fn probe(base: &str, payload: Payload, now: u64) -> Measured {
+    probe_with(&probe_agent(), base, payload, now)
 }
 
-/// The primary, measured through the real GitHub download path — API release lookup, then a ranged
-/// asset read that follows the authenticated redirect to storage.
-fn probe_primary(source: &Source, repo: &str, token: Option<&str>) -> Probe {
-    let gh = Github::new(token);
-    let mut p = Probe::blank(source);
-
-    let started = Instant::now();
-    let release = match gh.fetch_release(repo, None) {
-        Ok(r) => r,
-        Err(e) => return Probe::failed(source, format!("release lookup: {}", net_reason(&e))),
-    };
-    p.latency_ms = Some(started.elapsed().as_millis() as u64);
-    p.tag = Some(release.tag_name.clone());
-
-    let Some(asset) = probe_asset(&release) else {
-        p.error = Some("the release carries no asset to test".to_string());
-        return p;
-    };
-    match gh.ranged_asset(asset, PROBE_BYTES) {
-        Ok((range_ok, reader)) => {
-            p.range_ok = range_ok;
-            time_read(&mut p, reader, &asset.name);
-        }
-        Err(e) => p.error = Some(format!("{}: {e}", asset.name)),
-    }
-    p
-}
-
-/// A mirror, measured through the layout a mirror actually serves (see this module's doc): its
-/// payload manifest, then a ranged read of the biggest blob that document names.
+/// `probe` with the agent injected — `probe_agent()` is https-only and a loopback listener cannot
+/// speak TLS, so the end-to-end tests below could not otherwise reach this at all. Production has
+/// exactly one caller and it passes `probe_agent()`.
 ///
 /// NOTHING READ HERE IS VERIFIED, and nothing may come to depend on that changing. There is no
 /// signature check on this manifest — the install path fetches and verifies its own copy
-/// (`engine::manifest_of` -> `trust::accept`) before an installed byte rests on it — so the only
-/// things taken from it are a hash, handed straight back as a URL, and a size, used only to decide
-/// which blob to time. Every read stays bounded whatever the document claims: `MAX_DOC_BYTES` for
-/// the manifest, `PROBE_BYTES` for the range, `PROBE_BUDGET` for the clock. A hostile mirror can
-/// spend this probe's few seconds and mislead its own ranking, which is all a source can ever do.
-///
-/// The `agent` is a parameter for the same reason `Mirror`'s tests build their own: `probe_agent()`
-/// is https-only and a loopback listener cannot speak TLS, so the end-to-end tests below could not
-/// otherwise reach this at all. Production has exactly one caller and it passes `probe_agent()`.
-fn probe_mirror(
-    agent: &ureq::Agent,
-    source: &Source,
-    url: &str,
-    payload: Option<Payload>,
-) -> Probe {
-    let mut p = Probe::blank(source);
-    // A repo this build cannot name has no `<base>/<payload>/` to look under — `cmd::candidates`
-    // drops mirrors from the download chain for the same reason, so there is nothing here worth
-    // measuring: a number for a source that could never be used is worse than no number.
-    let Some(payload) = payload else {
-        return Probe::failed(source, "this build cannot name the payload for that repo");
-    };
+/// (`Mirror::documents` -> `engine::manifest_of`) before an installed byte rests on it — so the
+/// only things taken from it are a hash, handed straight back as a URL, and a size, used only to
+/// decide which blob to time. Every read stays bounded whatever the document claims:
+/// `MAX_DOC_BYTES` for the manifest, `PROBE_BYTES` for the range, `PROBE_BUDGET` for the clock. A
+/// hostile mirror can spend this probe's few seconds and mislead its own ranking, which is all a
+/// source can ever do.
+fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Measured {
+    let mut m = Measured::blank(now);
 
     // 1. the manifest — the one document a mirror must serve for a payload, so an answer here is
-    //    what proves the host is a mirror of it at all (the role `releases.json` used to play).
-    //    It is also the only way to address a blob: there is no index, and no listable directory.
+    //    what proves the host is a mirror of it at all. It is also the only way to address a blob:
+    //    there is no index, and no listable directory.
     let started = Instant::now();
-    let manifest_url = doc_url(url, payload.id(), crate::engine::MANIFEST_ASSET);
+    let manifest_url = doc_url(base, payload.id(), crate::engine::MANIFEST_ASSET);
     let resp = match transport::fetch(agent, &manifest_url, |req, _same_origin| {
         req.set("User-Agent", UA)
     }) {
         Ok(r) => r,
         Err(e) => {
             let why = format!("{}: {}", crate::engine::MANIFEST_ASSET, short_fetch(e));
-            return Probe::failed(source, why);
+            return Measured::failed(now, why);
         }
     };
     // Bounded through `read_all`, NOT `into_json`: ureq bounds `into_string` but not `into_json`,
@@ -826,119 +578,68 @@ fn probe_mirror(
     // it. This is the least trusted input the launcher reads.
     //
     // The ceiling is the one this SAME document is read under on the install path
-    // (`Mirror::manifest_bytes`), not `mirrors.json`'s: a payload manifest is a genuinely large
-    // document — the base game's is ~4.6k entries of ~200 bytes (see `trust::MAX_DOC_BYTES`) —
-    // and a megabyte would start reporting a healthy game mirror as unreadable as that grew.
+    // (`Mirror::read_doc`), not `mirrors.json`'s: a payload manifest is a genuinely large document
+    // — the base game's is ~4.6k entries of ~200 bytes (see `trust::MAX_DOC_BYTES`) — and a
+    // megabyte would start reporting a healthy game mirror as unreadable as that grew.
     let doc = match read_all(resp, crate::trust::MAX_DOC_BYTES) {
         Ok(b) => b,
-        Err(e) => return Probe::failed(source, format!("{}: {e}", crate::engine::MANIFEST_ASSET)),
+        Err(e) => return Measured::failed(now, format!("{}: {e}", crate::engine::MANIFEST_ASSET)),
     };
     // The strict reader, not a private permissive one: a second parser over the least trusted
-    // document in the system is exactly the thing that drifts, and a document this one refuses is
-    // a document the installer would refuse too.
+    // document in the system is exactly the thing that drifts, and a document this one refuses is a
+    // document the installer would refuse too.
     let manifest = match Manifest::parse(&doc) {
         Ok(m) => m,
         Err(e) => {
             let why = format!("{} is not readable: {e:#}", crate::engine::MANIFEST_ASSET);
-            return Probe::failed(source, why);
+            return Measured::failed(now, why);
         }
     };
-    p.latency_ms = Some(started.elapsed().as_millis() as u64);
-    p.tag = Some(tag_of(&manifest.version));
+    m.latency_ms = Some(started.elapsed().as_millis() as u64);
+    m.tag = Some(tag_of(&manifest.version));
 
     let Some(sha256) = probe_blob(&manifest) else {
-        p.error = Some("the release carries no blob to test".to_string());
-        return p;
+        m.error = Some("the release carries no blob to test".to_string());
+        return m;
     };
     // 12 hex digits, the short form `manifest.rs`'s own validator prints: a 64-character name in a
-    // settings row is noise. `probe_blob` returned it only after `is_content_hash`, so the slice
+    // status row is noise. `probe_blob` returned it only after `is_content_hash`, so the slice
     // cannot land inside a character.
     let label = format!("blob {}", &sha256[..12]);
 
     // 2. a real transfer. Ranged so the cost is bounded on the mirror's side too, and so the answer
     //    doubles as a resume-support check. The URL is DERIVED from the hash, never a URL the
     //    document named — a content-addressed mirror advertises none, which is one attacker-chosen
-    //    string fewer than the old release-index probe had to handle. What it does still choose is
+    //    string fewer than a release-index probe would have to handle. What it does still choose is
     //    every `Location` it answers with, which is why this goes through the same guarded fetch as
     //    the manifest did — see `transport`'s module doc.
-    let blob = blob_url(url, payload.id(), sha256);
+    let blob = blob_url(base, payload.id(), sha256);
     let resp = match transport::fetch(agent, &blob, |req, _same_origin| {
-        req.set("User-Agent", UA).set("Range", &format!("bytes=0-{}", PROBE_BYTES - 1))
+        req.set("User-Agent", UA).set("Range", &format!("bytes=0-{}", source::PROBE_BYTES - 1))
     }) {
         Ok(r) => r,
         Err(e) => {
-            p.error = Some(format!("{label}: {}", short_fetch(e)));
-            return p;
+            m.error = Some(format!("{label}: {}", short_fetch(e)));
+            return m;
         }
     };
-    p.range_ok = resp.status() == 206;
-    time_read(&mut p, resp.into_reader(), &label);
-    p
-}
-
-/// Read up to `PROBE_BYTES` under a wall-clock budget and record the throughput.
-fn time_read(p: &mut Probe, mut reader: impl Read, asset: &str) {
-    let started = Instant::now();
-    let mut buf = vec![0u8; 32 * 1024];
-    let mut got: u64 = 0;
-    let mut out_of_budget = false;
-    loop {
-        if started.elapsed() >= PROBE_BUDGET {
-            out_of_budget = true;
-            break;
-        }
-        match reader.read(&mut buf) {
-            Ok(0) => break, // asset smaller than the chunk we asked for
-            Ok(n) => {
-                got += n as u64;
-                if got >= PROBE_BYTES {
-                    break;
-                }
-            }
-            Err(e) => {
-                if got == 0 {
-                    p.error = Some(format!("{asset}: the transfer failed: {e}"));
-                    return;
-                }
-                // A transfer that dies partway is broken, not slow — but the bytes that did arrive
-                // are a real measurement, so keep both and let the caller weigh them.
-                p.error = Some(format!("the transfer stalled after {} KiB", got / 1024));
-                break;
-            }
-        }
-    }
-    if got == 0 {
-        p.error = Some("answered, but delivered no data".to_string());
-        return;
-    }
-    p.bytes_per_sec = Some((got as f64 / started.elapsed().as_secs_f64().max(0.001)) as u64);
-    // Running out of budget mid-chunk is a FAILURE, not merely a low score. This is the exact
-    // shape of the throttled path this module exists for — index instant, first few KiB instant,
-    // then a drip — and reporting it as healthy-but-slow would paint a green row on a source that
-    // cannot finish a download this decade. The measured rate rides along in the message.
-    if out_of_budget && got < PROBE_BYTES {
-        p.error =
-            Some(format!("too slow — {} KiB in {}s", got / 1024, PROBE_BUDGET.as_secs()));
-    }
+    m.range_ok = resp.status() == 206;
+    source::time_read(&mut m, resp.into_reader(), &label);
+    m
 }
 
 /// The blob to time: the BIGGEST one the mirror could actually be asked for.
 ///
-/// Size is what makes the measurement honest, exactly as in `probe_asset` below — a release carries
-/// hundreds of small loose game files, and a throttled path serves a 2 KB file flawlessly, so
-/// picking arbitrarily would let the very link this module exists to catch report itself healthy.
+/// Size is what makes the measurement honest — a release carries hundreds of small loose game
+/// files, and a throttled path serves a 2 KB file flawlessly, so picking arbitrarily would let the
+/// very link this module exists to catch report itself healthy.
 ///
-/// `probe_asset`'s name-based exclusions (`mirrors.json`, `manifest.json`, `*.sha256`) have no
-/// analogue here and need none. They exist because GitHub's release index lists the release
-/// DOCUMENTS alongside the payload's assets; a manifest lists no such thing — it describes payload
-/// content only, and the documents live at the payload root, a different URL space from `blobs/`.
-///
-/// What replaces them is a ROUTE rule, because not every entry in the document HAS a blob.
+/// What it has to respect is a ROUTE rule, because not every entry in the document HAS a blob.
 /// `install::build_acqs` is the authority on the three routes, and only two of them ever cross the
 /// wire: a bundle (addressed by `psha256`, `psize` bytes packed) and an entry carrying a `name`.
 /// An entry with no `name` is carried inside a bundle and a zero-size one is materialized locally,
 /// so neither has a blob of its own — timing one would 404 against a perfectly healthy mirror and
-/// rank it dead, which is precisely the misjudgement the metadata exclusions were written to avoid.
+/// rank it dead.
 fn probe_blob(m: &Manifest) -> Option<&str> {
     let bundles = m.bundles.iter().map(|b| (b.psha256.as_str(), b.psize));
     let named = m
@@ -953,40 +654,6 @@ fn probe_blob(m: &Manifest) -> Option<&str> {
         .filter(|(sha256, _)| is_content_hash(sha256))
         .max_by_key(|&(_, size)| size)
         .map(|(sha256, _)| sha256)
-}
-
-/// The asset to time on GITHUB, whose release index is a real index: the BIGGEST one that is not
-/// release metadata.
-///
-/// Size is what makes the measurement honest. A release carries hundreds of small loose game
-/// files, and a throttled path serves a 2 KB file flawlessly — so picking arbitrarily would let
-/// exactly the link this module exists to catch report itself healthy. `manifest.json` is excluded
-/// for the same reason: it is the one transfer such a path can always complete.
-fn probe_asset(release: &Release) -> Option<&Asset> {
-    let usable = |a: &&Asset| a.name != MIRRORS_ASSET && a.name != "manifest.json" && !a.name.ends_with(".sha256");
-    match release.assets.iter().filter(usable).max_by_key(|a| a.size) {
-        // an index that omits sizes leaves nothing to choose on; any real asset beats none
-        Some(a) if a.size > 0 => Some(a),
-        _ => release.assets.iter().find(usable).or_else(|| release.assets.first()),
-    }
-}
-
-/// The same compaction for the GitHub path, whose errors arrive as an anyhow chain rooted at a
-/// `NetKind`. Without this the primary's row would carry GitHub's whole JSON error body — API
-/// message, documentation URL and all — on a line sized for "HTTP 404".
-fn net_reason(e: &anyhow::Error) -> String {
-    e.chain()
-        .find_map(|c| c.downcast_ref::<NetKind>())
-        .map_or_else(|| "failed".to_string(), NetKind::to_string)
-}
-
-/// A compact reason for the UI. ureq's transport errors carry the URL they were fetching, which
-/// would put a full asset URL in a settings row; only the kind survives.
-fn short(e: ureq::Error) -> String {
-    match e {
-        ureq::Error::Status(code, _) => format!("HTTP {code}"),
-        ureq::Error::Transport(t) => t.kind().to_string(),
-    }
 }
 
 // ---- the layout, shared by the probe and the download backend ----
@@ -1005,9 +672,9 @@ fn doc_url(base: &str, payload: &str, name: &str) -> String {
 /// A document at a mirror's ROOT: `<base>/<name>`.
 ///
 /// The mirror list lives here and not under a payload directory, because it is not any payload's
-/// content: it describes the HOSTS, and a host serves one list whatever payload trees it happens to
-/// carry. That is also why `Settings::payload_of` must never learn the registry repo — there is no
-/// `<base>/mirrors/` to address.
+/// content: it describes the HOSTS, not any payload's tree. That is also why the registry repo is
+/// not a payload and must never become one — there is no `<base>/mirrors/` on any mirror to
+/// address, and `Payload::Mirrors` names a document, never a directory.
 fn root_url(base: &str, name: &str) -> String {
     format!("{}/{name}", base.trim_end_matches('/'))
 }
@@ -1376,159 +1043,62 @@ impl Downloader for Mirror {
 mod tests {
     use super::*;
 
-    fn mirror(url: &str, measured: bool) -> Source {
-        // No payloads: an entry that advertises nothing is read permissively, so these tests keep
-        // measuring what they were written to measure. `carries_only` is for the cases that are
-        // ABOUT a mirror holding some payloads and not others.
-        Source::Mirror { url: url.to_string(), enabled: true, measured, payloads: Vec::new() }
-    }
-
-    fn carries_only(url: &str, payloads: &[&str]) -> Source {
-        Source::Mirror {
-            url: url.to_string(),
-            enabled: true,
-            measured: true,
-            payloads: payloads.iter().map(|p| p.to_string()).collect(),
+    /// A mirror entry with a HEALTHY measurement, so a test can prove one SURVIVES a refresh.
+    fn measured(url: &str) -> Source {
+        Source {
+            url: Some(url.to_string()),
+            measured: Some(Measured { bytes_per_sec: Some(1), ..Measured::blank(1_000) }),
         }
     }
 
-    /// `rebuild` takes what the signed list said; these build one entry of it.
+    /// `rebuild` takes what the signed list said; this builds one entry of it.
     fn host(url: &str) -> signed::Host {
-        signed::Host { url: url.to_string(), payloads: Vec::new() }
+        signed::Host { url: url.to_string() }
     }
 
-    fn host_with(url: &str, payloads: &[&str]) -> signed::Host {
-        signed::Host {
-            url: url.to_string(),
-            payloads: payloads.iter().map(|p| p.to_string()).collect(),
-        }
-    }
-
-    fn probe(source: &Source, healthy: bool) -> Probe {
-        let mut p = Probe::blank(source);
-        if healthy {
-            p.bytes_per_sec = Some(1);
-        } else {
-            p.error = Some("down".into());
-        }
-        p
-    }
-
-    /// The one and only trigger for an automatic measurement.
+    /// A refresh must not disturb the ranking, and must not throw away what it cost a real
+    /// transfer to learn: known mirrors keep their slots AND their measurement, and only genuinely
+    /// new ones arrive unmeasured — which is the one thing that triggers a measuring pass.
     #[test]
-    fn a_newly_published_mirror_is_the_trigger() {
-        assert!(has_new_mirror(&[Source::Primary, mirror("https://a", false)]));
-        assert!(!has_new_mirror(&[Source::Primary, mirror("https://a", true)]));
-    }
-
-    /// With no mirrors there is nothing to rank the primary against, so timing it alone would be
-    /// a download that answers no question.
-    #[test]
-    fn the_primary_alone_never_triggers_a_measurement() {
-        assert!(!has_new_mirror(&[Source::Primary]));
-    }
-
-    /// Measuring marks every mirror, so the same list never triggers a second automatic pass.
-    #[test]
-    fn measuring_clears_the_trigger() {
-        let sources = vec![mirror("https://a", false)];
-        // no network in a test: mark them the way `measure` does and check the trigger is gone
-        let marked: Vec<Source> = sources
-            .into_iter()
-            .map(|s| match s {
-                Source::Mirror { url, enabled, payloads, .. } => {
-                    Source::Mirror { url, enabled, measured: true, payloads }
-                }
-                p => p,
-            })
-            .collect();
-        assert!(!has_new_mirror(&marked));
-    }
-
-    /// Nothing usable anywhere — main source included — is an ordinary outage on these networks,
-    /// and the one case where the automatic switch must NOT spend the user's pin on a moment when
-    /// no alternative worked.
-    #[test]
-    fn everything_offline_is_not_a_reason_to_repick() {
-        let sources = vec![Source::Primary, mirror("https://a", true)];
-        let all_dead = vec![probe(&sources[0], false), probe(&sources[1], false)];
-        assert!(!any_healthy(&all_dead));
-
-        let one_alive = vec![probe(&sources[0], false), probe(&sources[1], true)];
-        assert!(any_healthy(&one_alive));
-    }
-
-    /// A refresh must not disturb the ranking: known mirrors keep their slots and their measured
-    /// flag, and only genuinely new ones arrive — unmeasured, which is what triggers a pass.
-    #[test]
-    fn rebuild_preserves_rank_and_marks_only_new_mirrors() {
-        let existing = vec![mirror("https://fast", true), Source::Primary, mirror("https://slow", true)];
+    fn rebuild_keeps_rank_and_leaves_new_mirrors_unmeasured() {
+        let existing =
+            vec![measured("https://fast"), Source::default(), measured("https://slow")];
         // the document lists them in a different order and adds one
-        let out = rebuild(
-            &existing,
-            &[host("https://slow"), host("https://new"), host("https://fast")],
-        );
-        assert_eq!(out[0].url(), Some("https://fast"));
-        assert!(out[1].is_primary());
-        assert_eq!(out[2].url(), Some("https://slow"));
-        assert_eq!(out[3].url(), Some("https://new"));
-        assert!(has_new_mirror(&out));
-        assert!(matches!(out[0], Source::Mirror { measured: true, .. }));
-        assert!(matches!(out[3], Source::Mirror { measured: false, .. }));
+        let out =
+            rebuild(&existing, &[host("https://slow"), host("https://new"), host("https://fast")]);
+        assert_eq!(out[0].key(), Some("https://fast"));
+        assert!(out[1].is_github());
+        assert_eq!(out[2].key(), Some("https://slow"));
+        assert_eq!(out[3].key(), Some("https://new"));
+        assert!(out[0].measured.is_some(), "a surviving host keeps what it measured");
+        assert!(out[3].measured.is_none(), "and a new one has nothing yet — so a pass is due");
     }
 
     /// A mirror the publisher dropped leaves the list; one that is merely OFFLINE does not — the
     /// document says what exists, not what is reachable.
     #[test]
     fn rebuild_removes_only_unpublished_mirrors() {
-        let existing = vec![Source::Primary, mirror("https://gone", true), mirror("https://kept", true)];
+        let existing =
+            vec![Source::default(), measured("https://gone"), measured("https://kept")];
         let out = rebuild(&existing, &[host("https://kept")]);
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|s| s.url() != Some("https://gone")));
+        assert!(out.iter().all(|s| s.key() != Some("https://gone")));
     }
 
-    /// A mirror is measured through a payload it actually holds.
-    ///
-    /// `measure` always asks about the source repo's payload — `mod` — so a fixed answer meant a
-    /// game-only mirror was timed against a `mod/` directory it does not have: 404, painted
-    /// UNUSABLE, dropped from `any_healthy`, while serving the 7.9 GiB payload perfectly.
+    /// MEASUREMENTS SURVIVE BY URL. A refresh happens on every launch, and a host that is reordered
+    /// in the document, or joined by a new sibling, has not changed: throwing its number away would
+    /// re-time the world on every launch and re-rank the user off a source that works.
     #[test]
-    fn a_mirror_is_measured_through_a_payload_it_carries() {
-        let game_only = carries_only("https://g", &["game"]);
-        assert_eq!(measurable(&game_only, Some(Payload::Mod)), Some(Payload::Game));
-        // …and the requested one still wins wherever the host has it, so the ordinary case measures
-        // exactly what will be downloaded.
-        let both = carries_only("https://b", &["mod", "game"]);
-        assert_eq!(measurable(&both, Some(Payload::Mod)), Some(Payload::Mod));
-    }
+    fn a_refresh_keeps_measurements_by_url() {
+        let existing =
+            vec![measured("https://a"), Source::default(), measured("https://dropped")];
+        let out = rebuild(&existing, &[host("https://b"), host("https://a")]);
 
-    /// An entry advertising nothing predates the field. Reading that as "carries nothing" would
-    /// have made an upgrade silently unmeasurable — and unusable — for every mirror already saved.
-    #[test]
-    fn a_mirror_that_advertises_nothing_is_trusted_not_excluded() {
-        let legacy = mirror("https://old", true);
-        assert_eq!(measurable(&legacy, Some(Payload::Game)), Some(Payload::Game));
-        assert!(legacy.carries(Payload::Mod) && legacy.carries(Payload::Game));
-    }
-
-    /// A payload kind added after this build ships is not a directory it can name, so there is
-    /// nothing to time — and inventing a path for it would 404 a mirror that is perfectly healthy.
-    #[test]
-    fn a_mirror_carrying_only_unknown_payloads_is_not_measurable() {
-        let future = carries_only("https://f", &["something-new"]);
-        assert_eq!(measurable(&future, Some(Payload::Mod)), None);
-        assert!(!future.carries(Payload::Mod));
-    }
-
-    /// Which payloads a host carries is the PUBLISHER's statement about it, not a local preference,
-    /// so a refresh must re-read it — while flags and rank still survive by URL.
-    #[test]
-    fn rebuild_refreshes_payloads_but_keeps_flags() {
-        let existing = vec![Source::Primary, carries_only("https://m", &["mod"])];
-        let out = rebuild(&existing, &[host_with("https://m", &["mod", "game"])]);
-        let m = out.iter().find(|s| s.url() == Some("https://m")).expect("kept by URL");
-        assert!(m.carries(Payload::Game), "the list now says it carries the game");
-        assert!(matches!(m, Source::Mirror { measured: true, .. }), "and it is still measured");
+        let by_url = |u: &str| out.iter().find(|s| s.key() == Some(u)).cloned();
+        assert!(by_url("https://a").unwrap().measured.is_some(), "reordered, not re-measured");
+        assert!(by_url("https://b").unwrap().measured.is_none(), "newly published: no answer yet");
+        assert!(by_url("https://dropped").is_none(), "unpublished hosts leave");
+        assert!(out.iter().any(Source::is_github), "and the built-in source is never in the list");
     }
 
     /// A URL that fails the https-only check must be refused as an ordinary error, never a panic
@@ -1710,21 +1280,74 @@ mod tests {
         );
     }
 
-    /// "Unsigned" and "absent" must not be spelled the same way. A mirror that could answer with an
-    /// unsigned list and have it counted as "there is no list here" would still be choosing what
-    /// the caller does; a mirror that genuinely carries no list is answering a question.
+    /// A MIRROR WITHOUT `mirrors.json` IS A BROKEN HOST — and this deliberately INVERTS what this
+    /// same case used to assert. It read a 404 as `Ok(None)`, "this host publishes no list", which
+    /// the caller acts on by leaving the set alone with `error: None` and nothing anywhere looking
+    /// wrong; one host that had not synced the document yet was enough to freeze the mirror set of
+    /// every client that reached it first. A mirror's sync pass writes that file on every run, so
+    /// its absence is a fact about the HOST. Only GitHub gets to say "nothing is published".
+    ///
+    /// "Unsigned" is refused for a related but distinct reason: a mirror that could strip the
+    /// signature and have that counted as an answer would still be choosing what the caller does.
     #[test]
-    fn an_unsigned_list_is_refused_while_a_missing_one_is_simply_absent() {
-        let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
-        let server = list_server(Some(doc.into_bytes()), None); // the list, with no signature beside it
-        let base = format!("http://127.0.0.1:{}", server.port);
-        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
-        assert!(got.is_err(), "an unsigned list must not pass for an absent one: {got:?}");
-
+    fn a_mirror_without_mirrors_json_is_a_broken_host() {
         let bare = list_server(None, None); // 404s both
         let base = format!("http://127.0.0.1:{}", bare.port);
         let got = fetch_list_from_mirror(&test_agent(), &base, 0);
-        assert!(matches!(&got, Ok(None)), "a 404 on the list is an answer: {got:?}");
+        assert!(got.is_err(), "a host that serves no list has failed, not answered: {got:?}");
+
+        let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
+        let server = list_server(Some(doc.into_bytes()), None); // the list, with no signature
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let got = fetch_list_from_mirror(&test_agent(), &base, 0);
+        assert!(got.is_err(), "an unsigned list must not pass for an absent one: {got:?}");
+    }
+
+    /// THE BAKED BOOTSTRAP GOES THROUGH THE SAME DOOR AS A FETCHED LIST — `signed::verify`, then
+    /// `apply`, then the ratchet — and the floor is what makes it a BOOTSTRAP rather than a
+    /// permanent override: it applies exactly once, on a machine that has never accepted a list at
+    /// all, and the same document is refused afterwards.
+    ///
+    /// Driven over `apply`/`verify` rather than `bootstrap` itself, because `BAKED` is decided by
+    /// the BUILD (`PHOENIX_MIRRORS_DIR`) and a test that needed one baked in could only run in half
+    /// of the two build modes this feature has.
+    #[test]
+    fn the_baked_list_goes_through_the_same_gate_as_a_fetched_one() {
+        let doc = list_doc("mirrors", 5, &entry("phx-fi-1", "https://fi1.example", ALL));
+        let existing = vec![Source::default()];
+
+        // floor 0 — a machine that has never accepted a list
+        let applied = apply(&existing, verify_signed(&doc, 0).map(Some));
+        assert_eq!(applied.sources.len(), 2, "the baked hosts arrive");
+        assert!(applied.sources[1].measured.is_none(), "unmeasured, so a pass is due");
+        assert_eq!(applied.serial, Some(5), "…and it ratchets, like any accepted document");
+
+        // the same document, against a floor a newer list has already raised: refused, and a
+        // refusal leaves the list exactly as it was
+        assert!(verify_signed(&doc, 6).is_err(), "serial 5 is below a floor of 6");
+        let applied = apply(&existing, verify_signed(&doc, 6).map(Some));
+        assert_eq!(applied.sources, existing);
+        assert_eq!(applied.serial, None);
+    }
+
+    /// A build made with no `PHOENIX_MIRRORS_DIR` bakes nothing, and that is an ORDINARY build —
+    /// the local one, and every build before this existed. `bootstrap` then answers `None`, the
+    /// source list is GitHub alone, and every rule in the model degenerates to exactly what the
+    /// launcher did before mirrors: a one-element walk that never swaps.
+    #[test]
+    fn a_build_with_no_baked_list_degenerates_to_github_only() {
+        let settings = Settings::default();
+        assert_eq!(settings.sources, vec![Source::default()]);
+        assert_eq!(settings.serial_floor(Payload::Mirrors), 0, "a fresh machine's floor");
+        if BAKED.is_none() {
+            assert!(bootstrap(&settings).is_none(), "nothing baked, nothing to bootstrap");
+        }
+        // …and whatever this build baked, a machine that has already accepted a list never sees it
+        let taken = Settings {
+            max_serial_seen: [("mirrors".to_string(), 9u64)].into_iter().collect(),
+            ..Settings::default()
+        };
+        assert!(bootstrap(&taken).is_none(), "the bootstrap is for a machine with no list at all");
     }
 
     /// Rules this reader adds ON TOP of the signature, each proven over a document our own key
@@ -1766,11 +1389,11 @@ mod tests {
     /// with nothing anywhere looking wrong.
     #[test]
     fn a_verified_empty_list_replaces_the_set_while_silence_leaves_it_alone() {
-        let existing = vec![Source::Primary, mirror("https://kept", true)];
+        let existing = vec![Source::default(), measured("https://kept")];
 
         let empty = verify_signed(&list_doc("mirrors", 5, ""), 0).expect("an empty list is valid");
         let applied = apply(&existing, Ok(Some(empty)));
-        assert_eq!(applied.sources, vec![Source::Primary], "an empty list is an instruction");
+        assert_eq!(applied.sources, vec![Source::default()], "an empty list is an instruction");
         assert_eq!(applied.serial, Some(5), "…and it still ratchets — we accepted a document");
         assert!(applied.error.is_none());
 
@@ -1841,22 +1464,22 @@ mod tests {
         });
 
         let base = format!("http://127.0.0.1:{}", server.port);
-        let source = mirror(&base, false);
-        let p = probe_mirror(&test_agent(), &source, &base, Some(Payload::Mod));
+        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
 
-        assert!(p.error.is_none(), "a healthy mirror must not report one: {:?}", p.error);
-        assert!(p.healthy());
-        assert!(p.bytes_per_sec.is_some(), "throughput is the measurement, not latency");
-        assert!(p.latency_ms.is_some());
+        assert!(m.error.is_none(), "a healthy mirror must not report one: {:?}", m.error);
+        assert!(m.healthy());
+        assert_eq!(m.at, 1_000, "the pass stamps every measurement with one instant");
+        assert!(m.bytes_per_sec.is_some(), "throughput is the measurement, not latency");
+        assert!(m.latency_ms.is_some());
         // named by the manifest it serves, exactly as the download backend names it
-        assert_eq!(p.tag.as_deref(), Some("v1.4.2"));
+        assert_eq!(m.tag.as_deref(), Some("v1.4.2"));
         // asked for a bounded chunk and got a 206 — the answer a resume across a dropped
         // connection depends on, and the reason the request is `bytes=0-N` and not `bytes=0-`
         assert_eq!(
             server.saw_range(bundle_path).as_deref(),
-            Some(format!("bytes=0-{}", PROBE_BYTES - 1).as_str())
+            Some(format!("bytes=0-{}", source::PROBE_BYTES - 1).as_str())
         );
-        assert!(p.range_ok);
+        assert!(m.range_ok);
         assert_eq!(server.hits(bundle_path), 1);
         // the exact path the probe used to ask for, and the reason this test exists
         assert_eq!(server.hits("/releases.json"), 0, "no release index exists to ask for");
@@ -1890,8 +1513,8 @@ mod tests {
         });
 
         let base = format!("http://127.0.0.1:{}", server.port);
-        let p = probe_mirror(&test_agent(), &mirror(&base, false), &base, Some(Payload::Mod));
-        assert!(p.healthy());
+        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
+        assert!(m.healthy());
         assert_eq!(server.hits(loose_path), 0, "the small file must never be the measurement");
         assert_eq!(server.hits(bundle_path), 1);
     }
@@ -1946,22 +1569,11 @@ mod tests {
         use crate::test_http::TestServer;
         let server = TestServer::start(|_port| std::collections::HashMap::new()); // 404s everything
         let base = format!("http://127.0.0.1:{}", server.port);
-        let p = probe_mirror(&test_agent(), &mirror(&base, false), &base, Some(Payload::Mod));
-        assert!(!p.healthy());
-        assert!(p.bytes_per_sec.is_none() && p.latency_ms.is_none() && p.tag.is_none());
-        let why = p.error.expect("a failed probe must say why");
+        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
+        assert!(!m.healthy());
+        assert!(m.bytes_per_sec.is_none() && m.latency_ms.is_none() && m.tag.is_none());
+        let why = m.error.expect("a failed probe must say why");
         assert!(why.contains("manifest.json") && why.contains("404"), "unhelpful reason: {why}");
-    }
-
-    /// A repo this build cannot name has no `<base>/<payload>/` to look under, so there is no
-    /// measurement to take — and the probe must not fall back to some other payload's directory,
-    /// which would rank a source on a transfer the installer would never repeat.
-    #[test]
-    fn a_repo_with_no_payload_directory_is_refused_rather_than_guessed() {
-        let source = mirror("https://mirror.example", false);
-        let p = probe_mirror(&test_agent(), &source, "https://mirror.example", None);
-        assert!(!p.healthy());
-        assert!(p.error.is_some());
     }
 
     // ---- the download backend ----

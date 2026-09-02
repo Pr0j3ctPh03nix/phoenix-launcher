@@ -7,10 +7,13 @@ license = "GPL-3.0-only"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
-# build.rs `include!`s src/minisig.rs so the build script and the binary cannot disagree about the
-# signature format. That file verifies Ed25519, so the script needs the same primitive the binary
-# does — the SAME crate, already in the tree; nothing new is pulled in for it.
+# build.rs pulls src/minisig.rs in with `#[path]` so the build script and the binary cannot
+# disagree about the signature format. That file verifies Ed25519, so the script needs the same
+# primitive the binary does — the SAME crate, already in the tree; nothing new is pulled in.
 ring = "0.17"
+# The baked mirror list is checked here before it can ship: format, payload id and serial, over the
+# document build.rs has just verified. Same crate the binary parses it with, already in the tree.
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = [] }

@@ -33,9 +33,6 @@ pub fn get_settings() -> SettingsView {
             })
             .collect(),
         selections: serde_json::to_value(&s.selections).unwrap_or_default(),
-        // Instant-apply, written by cmd::mirrors — read here only so the pane can paint itself.
-        sources: crate::views::source_views(&s.sources, s.selected.as_ref()),
-        auto_pick_best: s.auto_pick_best,
     }
 }
 

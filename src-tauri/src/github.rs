@@ -10,9 +10,9 @@ use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crate::config::Settings;
+use crate::config::{Measured, Settings};
 use crate::downloader::{Asset, ChunkProgress, Downloader, NetKind, Release};
 use crate::transport::{self, FetchError};
 
@@ -101,7 +101,7 @@ impl Github {
     /// has already proved is needed here. `None` means ask anonymously.
     fn upfront(&self) -> Option<&str> {
         (self.lead_with_token || self.authed.load(Ordering::Relaxed))
-            .then(|| self.token.as_deref())
+            .then_some(self.token.as_deref())
             .flatten()
     }
 
@@ -151,6 +151,67 @@ impl Github {
             _ => req,
         }
     }
+}
+
+/// Time GitHub, through the real download path — API release lookup, then a ranged asset read that
+/// follows the authenticated redirect to storage.
+///
+/// Deliberately not unified with `mirror::probe`: GitHub IS a release index, and that index is the
+/// right thing to time here, while a mirror has none at all. What the two share is the transfer
+/// itself (`source::time_read`), because throughput is the one number the ranking sorts on and two
+/// ways of measuring it would be two rankings.
+pub fn probe(settings: &Settings, repo: &str, now: u64) -> Measured {
+    let gh = Github::for_repo(settings, repo);
+    let mut m = Measured::blank(now);
+
+    let started = Instant::now();
+    let release = match gh.fetch_release(repo, None) {
+        Ok(r) => r,
+        Err(e) => return Measured::failed(now, format!("release lookup: {}", net_reason(&e))),
+    };
+    m.latency_ms = Some(started.elapsed().as_millis() as u64);
+    m.tag = Some(release.tag_name.clone());
+
+    let Some(asset) = probe_asset(&release) else {
+        m.error = Some("the release carries no asset to test".to_string());
+        return m;
+    };
+    match gh.ranged_asset(asset, crate::source::PROBE_BYTES) {
+        Ok((range_ok, reader)) => {
+            m.range_ok = range_ok;
+            crate::source::time_read(&mut m, reader, &asset.name);
+        }
+        Err(e) => m.error = Some(format!("{}: {e}", asset.name)),
+    }
+    m
+}
+
+/// The asset to time, out of a release index that is a real index: the BIGGEST one that is not
+/// release metadata.
+///
+/// Size is what makes the measurement honest. A release carries hundreds of small loose game files,
+/// and a throttled path serves a 2 KB file flawlessly — so picking arbitrarily would let exactly
+/// the link the probe exists to catch report itself healthy. `manifest.json` is excluded for the
+/// same reason: it is the one transfer such a path can always complete.
+fn probe_asset(release: &Release) -> Option<&Asset> {
+    let usable = |a: &&Asset| {
+        a.name != crate::mirror::MIRRORS_ASSET
+            && a.name != crate::engine::MANIFEST_ASSET
+            && !a.name.ends_with(".sha256")
+    };
+    match release.assets.iter().filter(usable).max_by_key(|a| a.size) {
+        // an index that omits sizes leaves nothing to choose on; any real asset beats none
+        Some(a) if a.size > 0 => Some(a),
+        _ => release.assets.iter().find(usable).or_else(|| release.assets.first()),
+    }
+}
+
+/// A compact reason for a probe row. Without this the GitHub row would carry the API's whole JSON
+/// error body — message, documentation URL and all — on a line sized for "HTTP 404".
+fn net_reason(e: &anyhow::Error) -> String {
+    e.chain()
+        .find_map(|c| c.downcast_ref::<NetKind>())
+        .map_or_else(|| "failed".to_string(), NetKind::to_string)
 }
 
 /// Should the very first request carry the credential, instead of earning it after a refusal?

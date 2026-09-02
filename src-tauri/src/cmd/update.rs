@@ -6,41 +6,38 @@ use std::sync::Arc;
 
 use tauri::Emitter;
 
-use crate::cmd::{open_repo, open_repo_tagged, AppState, CachedManifest};
+use crate::cmd::{AppState, CachedManifest};
 use crate::config::Settings;
-use crate::downloader::Downloader;
+use crate::source::{self, Wire};
 use crate::trust::Payload;
 use crate::views::{build_check_view, CheckView, CmdError, InstallView, UninstallView};
 use crate::{engine, install};
-
-/// The backend for a shim operation: whichever source `open_repo` found could serve the dist repo.
-///
-/// It used to build `Github::new(s.token())` directly, which bypassed not just source failover but
-/// the ANONYMOUS-FIRST credential rule every other command goes through — so this one path sent the
-/// baked token to a repo that may not want it, and could not fall back at all. Callers that also
-/// need the release should use `open_repo` itself and keep both; this is for the ones that only
-/// need somewhere to fetch from.
-fn downloader(s: &Settings) -> anyhow::Result<Box<dyn Downloader>> {
-    open_repo(&s.source_repo, s).map(|(dl, _)| dl)
-}
 
 #[tauri::command]
 pub async fn check(state: tauri::State<'_, Arc<AppState>>) -> Result<CheckView, CmdError> {
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let settings = Settings::load();
-        // `open_repo` + `manifest_of`, not `engine::fetch`: fetch would resolve the release a
-        // second time, and this runs on every launch. Same two steps, one round trip each.
-        let (dl, release) = open_repo(&settings.source_repo, &settings).map_err(CmdError::from)?;
-        let manifest = engine::manifest_of(&settings, dl.as_ref(), &release, Payload::Mod)
-            .map_err(CmdError::from)?;
+        // The TRUST GATE is inside the closure, which is the whole point: a manifest a source
+        // refuses fails that source over instead of ending the check.
+        let (tag, manifest) = source::with_active(
+            &settings,
+            &settings.source_repo,
+            Payload::Mod,
+            None,
+            |dl, release| {
+                let manifest = engine::manifest_of(&settings, dl, release, Payload::Mod)?;
+                Ok((release.tag_name.clone(), manifest))
+            },
+        )
+        .map_err(CmdError::from)?;
         // cache before evaluating: even if the local diff fails, the fetched manifest is kept
         *st.manifest_cache.lock().unwrap() = Some(CachedManifest {
             repo: settings.source_repo.clone(),
-            tag_name: release.tag_name.clone(),
+            tag_name: tag.clone(),
             manifest: manifest.clone(),
         });
-        let r = engine::evaluate(&settings, &release.tag_name, &manifest).map_err(CmdError::from)?;
+        let r = engine::evaluate(&settings, &tag, &manifest).map_err(CmdError::from)?;
         Ok(build_check_view(r))
     })
     .await
@@ -118,13 +115,11 @@ pub async fn apply(
                 game_dir.display()
             )));
         }
-        // Pinned to the tag the UI showed, and opened through the source chain — the release itself
-        // is re-resolved inside `install` (it fetches its own manifest), so only the SOURCE choice
-        // is carried across.
-        let (dl, _release) =
-            open_repo_tagged(&settings.source_repo, &settings, tag.as_deref())
-                .map_err(CmdError::from)?;
-        let dl = dl.as_ref();
+        // Pinned to the tag the UI showed. The wire holds that pin for the whole run: a source it
+        // swaps to mid-download is opened for the SAME release, so what the button offered is what
+        // the button installs however many hosts it takes to finish.
+        let wire = Wire::open(&settings, &settings.source_repo, Payload::Mod, tag.as_deref())
+            .map_err(CmdError::from)?;
         // the engine's progress ticks go straight to the webview
         let emit = |p: engine::OpProgress| {
             let _ = app.emit("op-progress", p);
@@ -134,8 +129,7 @@ pub async fn apply(
         // dest; with one, naming a pinned dest IS the user taking the pin back, so it is dropped
         // after the run rather than left to re-hide the file on the next check.
         let only: Option<HashSet<String>> = restore.map(|v| v.into_iter().collect());
-        let report =
-            install::install(&settings, dl, tag.as_deref(), Some(&emit), None, only.as_ref());
+        let report = install::install(&settings, &wire, Some(&emit), None, only.as_ref());
         if let (Ok(_), Some(sel)) = (&report, &only) {
             let _ = crate::keep::unpin_all(&game_dir, sel);
         }
@@ -154,9 +148,11 @@ pub async fn apply(
             tauri::async_runtime::spawn_blocking(|| {
                 let settings = Settings::load();
                 // best-effort like the warm itself: a source that cannot be opened just means the
-                // optional content downloads on demand later
-                if let Ok(dl) = downloader(&settings) {
-                    install::warm_cache(&settings, dl.as_ref());
+                // optional content downloads on demand later. Its own wire, so a background warm
+                // that outlives the install gains failover without sharing the install's swaps.
+                let opened = Wire::open(&settings, &settings.source_repo, Payload::Mod, None);
+                if let Ok(wire) = opened {
+                    install::warm_cache(&settings, &wire);
                 }
             });
         }

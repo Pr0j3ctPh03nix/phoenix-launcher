@@ -59,12 +59,6 @@ impl Release {
         !self.draft && !self.prerelease
     }
 
-    /// Name -> asset, built once. `asset()` is a linear scan, which is fine for the handful of
-    /// lookups the shim does but quadratic for the base game: 4,635 jobs against a merged release
-    /// carrying 4,636 assets is ~10 million string comparisons.
-    pub fn asset_index(&self) -> std::collections::HashMap<&str, &Asset> {
-        self.assets.iter().map(|a| (a.name.as_str(), a)).collect()
-    }
 }
 
 /// Why a network operation failed, in shell-actionable terms. Rooted in the anyhow chain at the
