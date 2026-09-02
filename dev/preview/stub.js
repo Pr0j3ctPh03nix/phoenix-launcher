@@ -54,6 +54,8 @@ const LANG_Q = new URLSearchParams(location.search).get("lang") || "en";
 // ?fail=check makes the network commands reject like an offline machine would, so the local-only
 // fallback (and any other can't-reach-GitHub wording) can be seen.
 const FAIL = new URLSearchParams(location.search).get("fail");
+// measurement timestamps are absolute, so the rendered ages have to be relative to now
+const NOW = Math.floor(Date.now() / 1000);
 const offline = { kind: "network", message: "fetching the release: connection failed" };
 
 const HANDLERS = {
@@ -66,15 +68,6 @@ const HANDLERS = {
     renderer: "dx11",
     animations: true,
     launchFlags: [],
-    // the always-on primary plus one of each mirror row state: enabled, and switched off
-    sources: [
-      { kind: "primary", url: null, enabled: true, active: true, measured: true },
-      { kind: "mirror", url: "https://mirror.example/client-dist", enabled: true, active: false, measured: true },
-      { kind: "mirror", url: "https://eu2.mirror.example/client-dist", enabled: true, active: false, measured: true },
-      // newly published and never timed — what auto-pick leaves behind when it is switched off
-      { kind: "mirror", url: "https://new.mirror.example/client-dist", enabled: true, active: false, measured: false },
-    ],
-    autoPickBest: true,
   }),
   launcher_info: () => ({ version: "1.2.1", justUpdated: false }),
   game_dir_status: () => ({ configured: true, clientVersion: "1805" }),
@@ -131,27 +124,21 @@ const HANDLERS = {
   set_language: () => null,
   save_settings: () => null,
   set_selection: () => null,
-  set_mirror_enabled: () => null,
-  set_selected_source: () => null,
-  set_auto_pick_best: () => null,
-  auto_sweep_mirrors: () => null,
-  // sorted as the backend would return it (fastest first, unusable last), carrying each verdict a
-  // row can paint: fast and resumable, usable but with no resume, and a server that answers and
-  // then cannot deliver — the case the whole probe exists for. The primary sits mid-pack to show
-  // that it sorts like any other source even though it can never be switched off.
-  sweep_mirrors: () => ({
+  // Ranked as the backend returns it — fastest healthy first, unusable last — carrying each
+  // verdict a row can paint: fast and resumable, usable but with no resume, one that answers and
+  // then cannot deliver (the case the whole probe exists for), one still being measured, and one
+  // that failed an operation this session. The built-in source sits mid-pack, which is the point:
+  // it is ranked as a peer, not as a floor.
+  download_sources: () => ({
+    measuring: true,
     refreshError: null,
     sources: [
-      { kind: "mirror", url: "https://mirror.example/client-dist", enabled: true, active: true, measured: true },
-      { kind: "primary", url: null, enabled: true, active: false, measured: true },
-      { kind: "mirror", url: "https://eu2.mirror.example/client-dist", enabled: true, active: false, measured: true },
-      { kind: "mirror", url: "https://slow.mirror.example/client-dist", enabled: false, active: false, measured: true },
-    ],
-    probes: [
-      { url: "https://mirror.example/client-dist", primary: false, latencyMs: 34, bytesPerSec: 7340032, tag: "v1.2.1", rangeOk: true, error: null, healthy: true },
-      { url: null, primary: true, latencyMs: 620, bytesPerSec: 1258291, tag: "v1.2.1", rangeOk: true, error: null, healthy: true },
-      { url: "https://eu2.mirror.example/client-dist", primary: false, latencyMs: 210, bytesPerSec: 389120, tag: "v1.2.1", rangeOk: false, error: null, healthy: true },
-      { url: "https://slow.mirror.example/client-dist", primary: false, latencyMs: 180, bytesPerSec: null, tag: null, rangeOk: false, error: "the transfer stalled after 16 KiB", healthy: false },
+      { url: "https://mirror.example/client-dist", active: true, failed: false, measuring: false, healthy: true, bytesPerSec: 7340032, latencyMs: 34, tag: "v1.2.1", rangeOk: true, measuredAt: NOW - 90, error: null },
+      { url: null, active: false, failed: false, measuring: false, healthy: true, bytesPerSec: 1258291, latencyMs: 620, tag: "v1.2.1", rangeOk: true, measuredAt: NOW - 90, error: null },
+      { url: "https://eu2.mirror.example/client-dist", active: false, failed: false, measuring: false, healthy: true, bytesPerSec: 389120, latencyMs: 210, tag: "v1.2.0", rangeOk: false, measuredAt: NOW - 4200, error: null },
+      { url: "https://new.mirror.example/client-dist", active: false, failed: false, measuring: true, healthy: false, bytesPerSec: null, latencyMs: null, tag: null, rangeOk: false, measuredAt: null, error: null },
+      { url: "https://down.mirror.example/client-dist", active: false, failed: true, measuring: false, healthy: false, bytesPerSec: null, latencyMs: null, tag: null, rangeOk: false, measuredAt: NOW - 300, error: "connection failed" },
+      { url: "https://slow.mirror.example/client-dist", active: false, failed: false, measuring: false, healthy: false, bytesPerSec: null, latencyMs: 180, tag: null, rangeOk: false, measuredAt: NOW - 300, error: "the transfer stalled after 16 KiB" },
     ],
   }),
   open_url: () => null,

@@ -4,24 +4,12 @@
 use anyhow::Result;
 use tauri::Emitter;
 
-use crate::cmd::{open_repo, open_repo_tagged, AppState};
+use crate::cmd::AppState;
 use crate::config::Settings;
-use crate::downloader::{Downloader, Release};
+use crate::source;
+use crate::trust::Payload;
 use crate::views::{CmdError, LauncherInfoView, LauncherProgress, LauncherUpdateView};
 use crate::{install, selfupdate};
-
-/// The launcher repo's latest release + the downloader that could see it. Anonymous first with a
-/// token retry only on an HTTP refusal — the shared `open_repo` rationale, which matters most
-/// here: this runs on the Play path, where offline must not pay two connect timeouts.
-fn fetch(settings: &Settings) -> Result<(Box<dyn Downloader>, Release)> {
-    open_repo(settings.launcher_repo(), settings)
-}
-
-/// The specific release the UI offered. `launcher_update` pins to it instead of re-resolving
-/// "latest", which is what the engine's `apply` documents and expects.
-fn fetch_tag(settings: &Settings, tag: &str) -> Result<(Box<dyn Downloader>, Release)> {
-    open_repo_tagged(settings.launcher_repo(), settings, Some(tag))
-}
 
 /// Is a newer launcher published? `Ok(None)` = this build is current.
 ///
@@ -34,18 +22,31 @@ pub async fn launcher_check(
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let s = Settings::load();
-        let (dl, release) = fetch(&s).map_err(CmdError::from)?;
+        let found = source::with_active(
+            &s,
+            s.launcher_repo(),
+            Payload::Launcher,
+            None,
+            |dl, release| Ok((release.tag_name.clone(), selfupdate::available(&s, dl, release)?)),
+        );
+        // A release this launcher cannot BELIEVE is a release we do not have, and `available` now
+        // says so with an error so the walk can fail the source over. Once the whole ranking has
+        // answered that way it is not an error any more, it is "no update" — which is the answer
+        // the user gets today and the one that must never block Play.
+        let (tag, available) = match found {
+            Ok(v) => v,
+            Err(e) if selfupdate::is_untrustworthy(&e) => return Ok(None),
+            Err(e) => return Err(CmdError::from(e)),
+        };
         // Record the tag whether or not it is an update: this is the freshness key the "What's
         // new" launcher page checks its cached history against, and the common case — this build
         // IS the latest — is exactly the one where that history must open without a round trip.
-        *st.launcher_tag.lock().unwrap() = Some(release.tag_name.clone());
-        Ok(selfupdate::available(&s, dl.as_ref(), &release).map_err(CmdError::from)?.map(|a| {
-            LauncherUpdateView {
-                tag: a.tag,
-                version: a.version,
-                current: a.current,
-                notes: a.notes,
-            }
+        *st.launcher_tag.lock().unwrap() = Some(tag);
+        Ok(available.map(|a| LauncherUpdateView {
+            tag: a.tag,
+            version: a.version,
+            current: a.current,
+            notes: a.notes,
         }))
     })
     .await
@@ -74,26 +75,36 @@ pub async fn launcher_update(
     tauri::async_runtime::spawn_blocking(move || {
         let _op = st.begin_op("launcher update")?;
         let s = Settings::load();
-        let (dl, release) = match tag.as_deref() {
-            Some(t) => fetch_tag(&s, t),
-            None => fetch(&s),
-        }
-        .map_err(CmdError::from)?;
-        // Refuse to "update" to something that is not newer. Guards the pinned path too: a tag
-        // can be re-pointed at other bytes, and this is the only check that the release we are
-        // about to execute is an upgrade at all.
-        if selfupdate::available(&s, dl.as_ref(), &release).map_err(CmdError::from)?.is_none() {
-            return Err(CmdError::from(format!(
-                "release {} is not newer than this build ({}) — check for updates again",
-                release.tag_name,
-                env!("CARGO_PKG_VERSION")
-            )));
-        }
-        let mut emit = |bytes_done: u64, bytes_total: Option<u64>| {
+        let emit = |bytes_done: u64, bytes_total: Option<u64>| {
             let _ = handle.emit("launcher-progress", LauncherProgress { bytes_done, bytes_total });
             true // nothing cancels a self-update mid-flight; the swap only happens after verify
         };
-        let exe = selfupdate::apply(&s, dl.as_ref(), &release, &mut emit).map_err(CmdError::from)?;
+        // The WALK covers the download and nothing else. A source that serves a bad exe fails over
+        // and the next one is asked from zero (a `.part` from a different version stitched onto new
+        // bytes is a corrupt file of plausible length, so this path never resumes); the SWAP is
+        // outside it, because renaming the running launcher is not an operation to retry against
+        // another host.
+        let staged = source::with_active(
+            &s,
+            s.launcher_repo(),
+            Payload::Launcher,
+            tag.as_deref(),
+            |dl, release| {
+                // Refuse to "update" to something that is not newer. Guards the pinned path too: a
+                // tag can be re-pointed at other bytes, and this is the only check that the release
+                // we are about to execute is an upgrade at all.
+                if selfupdate::available(&s, dl, release)?.is_none() {
+                    anyhow::bail!(
+                        "release {} is not newer than this build ({}) — check for updates again",
+                        release.tag_name,
+                        env!("CARGO_PKG_VERSION")
+                    );
+                }
+                selfupdate::fetch_verified(&s, dl, release, &mut |d, t| emit(d, t))
+            },
+        )
+        .map_err(CmdError::from)?;
+        let exe = selfupdate::swap_in(&staged).map_err(CmdError::from)?;
 
         // A detached cache warm may still be streaming optional content. Exiting would abort it
         // anyway (it is best-effort and resumable), but stopping it deliberately keeps the handoff

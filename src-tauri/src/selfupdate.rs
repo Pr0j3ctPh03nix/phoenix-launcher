@@ -32,8 +32,8 @@ use std::time::Duration;
 use crate::config::Settings;
 use crate::downloader::{Asset, ChunkProgress, Downloader, Release};
 use crate::engine::{self, version_lt};
-use crate::install::{Origin, Resolved};
 use crate::manifest::{FileEntry, Manifest};
+use crate::source;
 use crate::trust::Payload;
 
 /// The launcher binary published by release.yml, and the checksum sidecar beside it.
@@ -63,6 +63,19 @@ fn exe_path() -> Result<PathBuf> {
     std::env::current_exe().context("locating the launcher executable")
 }
 
+/// Is this failure "we cannot believe that release" rather than "we could not get it"?
+///
+/// The one predicate that turns an exhausted walk back into `Ok(None)` — no update — so a launcher
+/// whose sources all serve something unverifiable reports what it always did: nothing to install.
+/// `UnsupportedSchema` is deliberately NOT in it: a release this build is too old to read IS an
+/// update, and telling the user to update by hand is the only useful thing to say.
+pub fn is_untrustworthy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<crate::trust::TrustError>().is_some()
+            || c.downcast_ref::<crate::minisig::SigError>().is_some()
+    })
+}
+
 /// `<stem><suffix>` next to `exe` — e.g. ".new.exe" -> `phoenix-launcher.new.exe`. Built from the
 /// stem of the RUNNING file, so a launcher the user renamed still parks its siblings beside it.
 fn sibling(exe: &Path, suffix: &str) -> PathBuf {
@@ -73,7 +86,7 @@ fn sibling(exe: &Path, suffix: &str) -> PathBuf {
 }
 
 /// Is `release` newer than this build? `Ok(None)` means there is nothing to offer — we are current,
-/// or ahead (normal for a local dev build), or the release is not one we can believe.
+/// or ahead (normal for a local dev build).
 ///
 /// THE VERSION COMPARED IS THE SIGNED ONE. A tag is a label the source chooses, so comparing
 /// against it lets whoever serves the release pick the answer: publish a genuine OLD release under
@@ -86,9 +99,13 @@ fn sibling(exe: &Path, suffix: &str) -> PathBuf {
 /// A release with no manifest falls back to the tag — that is the pre-signing shape, and the same
 /// deliberate gap `expected_sha` documents. It stops firing once every release carries one.
 ///
-/// Untrustworthy is `Ok(None)`, not an error: an unverifiable release is one we do not have, and
-/// there is nothing useful to say to a user about a release that was never really offered. An
-/// UNREADABLE one (schema too new) is an error on purpose — that one the user must act on.
+/// Untrustworthy is an ERROR, and `is_untrustworthy` is how the caller turns it back into "no
+/// update". It used to be `Ok(None)` right here, which is the right thing to SHOW and the wrong
+/// thing to decide: a source serving a release this launcher refuses would have ended the check as
+/// "you are current" without the next source ever being asked. The walk needs a failure to fail
+/// over on, and the caller — which is the thing that knows the whole ranking has answered the same
+/// way — is where "we do not have it" becomes the honest silence it always was. Net UX unchanged,
+/// failover gained. An UNREADABLE release (schema too new) stays an error the user must act on.
 pub fn available(
     settings: &Settings,
     dl: &dyn Downloader,
@@ -96,16 +113,9 @@ pub fn available(
 ) -> Result<Option<Available>> {
     let current = env!("CARGO_PKG_VERSION");
     let signed = match release.asset(engine::MANIFEST_ASSET) {
-        Some(_) => match engine::manifest_of(settings, dl, release, Payload::Launcher) {
-            Ok(m) => Some(m.version),
-            // Schema we cannot read: the one failure worth showing, so it propagates.
-            Err(e) if e.chain().any(|c| c.is::<crate::manifest::UnsupportedSchema>()) => {
-                return Err(e)
-            }
-            // Anything else — bad signature, unknown key, wrong payload, stale serial — is a
-            // release we do not have.
-            Err(_) => return Ok(None),
-        },
+        // Bad signature, unknown key, wrong payload, stale serial — a release we do not have, and
+        // a fact about the SOURCE serving it, so it propagates and the walk moves on.
+        Some(_) => Some(engine::manifest_of(settings, dl, release, Payload::Launcher)?.version),
         None => None,
     };
     let version = signed.unwrap_or_else(|| release.tag_name.trim_start_matches('v').to_string());
@@ -116,34 +126,61 @@ pub fn available(
         tag: release.tag_name.clone(),
         version,
         current: current.to_string(),
-        // an empty release body is "no notes", not an empty section in the UI
-        notes: release.body.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string),
+        // Through the BACKEND: GitHub carries the body in the release index, a mirror publishes
+        // it as a file. An empty one is "no notes", not an empty section in the UI — and a notes
+        // fetch that FAILS is the same thing here, because a launcher update is not withheld on
+        // account of its changelog.
+        notes: dl
+            .notes(release)
+            .ok()
+            .flatten()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty()),
     }))
 }
 
-/// Download the launcher published by `release`, verify it, and swap it into place. Returns the
-/// path to start — after the swap that path names the NEW binary.
+/// A verified launcher binary, staged beside the running one and ready to be swapped in.
 ///
-/// Installing the release the user was SHOWN (rather than re-resolving "latest" here) is
-/// deliberate: what the update button offers is what the update button installs.
-pub fn apply(
+/// The two halves of an update are separate types of operation and only ONE of them may be retried
+/// against another source. Downloading is transport: a host that serves a bad exe is a bad host,
+/// and the next one deserves a turn. Renaming the running launcher is not — it is a local,
+/// irreversible-ish pair of moves, and running it twice because a network failed is how a user ends
+/// up with no launcher at all.
+pub struct Staged {
+    exe: PathBuf,
+    new: PathBuf,
+}
+
+/// Download the launcher published by `release` and verify it — everything up to, and not
+/// including, touching the running binary. Fail this and the next source is asked, from zero.
+///
+/// Installing the release the user was SHOWN (rather than re-resolving "latest") is deliberate:
+/// what the update button offers is what the update button installs.
+pub fn fetch_verified(
     settings: &Settings,
     dl: &dyn Downloader,
     release: &Release,
     progress: ChunkProgress,
-) -> Result<PathBuf> {
-    apply_at(&exe_path()?, settings, dl, release, progress)
+) -> Result<Staged> {
+    fetch_verified_at(&exe_path()?, settings, dl, release, progress)
 }
 
-/// `apply` with the target injected, so tests can drive the whole path — download, verify, swap,
-/// rollback — against a scratch file instead of the running test binary.
-fn apply_at(
+/// Move the verified binary into place and return the path to start — after the swap that path
+/// names the NEW file.
+pub fn swap_in(staged: &Staged) -> Result<PathBuf> {
+    swap(&staged.exe, &staged.new)?;
+    Ok(staged.exe.clone())
+}
+
+/// `fetch_verified` with the target injected, so tests can drive the whole path — download, verify,
+/// swap, rollback — against a scratch file instead of the running test binary.
+fn fetch_verified_at(
     exe: &Path,
     settings: &Settings,
     dl: &dyn Downloader,
     release: &Release,
     progress: ChunkProgress,
-) -> Result<PathBuf> {
+) -> Result<Staged> {
     let dir = exe.parent().context("the launcher executable has no parent directory")?;
     ensure_dir_writable(dir)?;
 
@@ -198,8 +235,7 @@ fn apply_at(
         let _ = std::fs::remove_file(&new); // never leave a rejected binary lying next to the exe
         return Err(e);
     }
-    swap(exe, &new)?;
-    Ok(exe.to_path_buf())
+    Ok(Staged { exe: exe.to_path_buf(), new })
 }
 
 /// Reject anything we would not want to execute. The checksum is the real gate; the PE magic
@@ -255,8 +291,8 @@ struct Target {
 /// every change made to it.
 ///
 /// On the SIGNED branch the manifest also decides WHICH entry is the launcher and the source only
-/// decides how to address it — through `install::Resolved::asset_for`, the same rule every payload
-/// download goes through. GitHub is name-addressed: the entry's `name` is looked up in the
+/// decides how to address it — through `source::asset_for`, the same rule every payload download
+/// goes through. GitHub is name-addressed: the entry's `name` is looked up in the
 /// release's asset list. A mirror is content-addressed: it has no asset list at all, and the
 /// entry's `sha256` IS its address (`Mirror::url_of` sends a hash to `blobs/<sha256>`). Reading
 /// the exe out of the release index, as this used to, worked on GitHub and could never work on a
@@ -305,8 +341,7 @@ fn resolve(settings: &Settings, dl: &dyn Downloader, release: &Release) -> Resul
     let manifest = engine::manifest_of(settings, dl, release, Payload::Launcher)?;
     let entry = exe_entry(&manifest, &release.tag_name)?;
     let name = entry.name.as_deref().expect("exe_entry only ever returns a named entry");
-    let asset = Resolved::of(&Origin::new(dl, release))
-        .asset_for(name, &entry.sha256, entry.size)
+    let asset = source::asset_for(dl, release, name, &entry.sha256, entry.size)
         .with_context(|| format!("release {} publishes no asset named {name}", release.tag_name))?;
     Ok(Target { asset, sha256: entry.sha256.clone(), size: Some(entry.size) })
 }
@@ -519,9 +554,15 @@ mod tests {
     /// user. Comparing `manifest.version` instead makes the old release state its own age.
     #[test]
     fn a_new_tag_over_an_old_signed_release_is_not_an_upgrade() {
-        let old = r#"{"schema":2,"payload_id":"launcher","version":"0.0.1",
-                      "files":[{"dest":"x","name":"x","sha256":"aa","size":1}]}"#;
-        let dl = crate::downloader::fake::Fake::new("v999.0.0", old, vec![]);
+        // A REAL manifest, not a sketch: `available` now reports a document it cannot believe as
+        // an error (so a walk can fail the source over), which means a fixture the parser refuses
+        // would make this pass for the wrong reason entirely.
+        let old = format!(
+            r#"{{"schema":2,"payload_id":"launcher","version":"0.0.1",
+                 "files":[{{"dest":"x","name":"x","sha256":"{}","size":1}}]}}"#,
+            "aa".repeat(32)
+        );
+        let dl = crate::downloader::fake::Fake::new("v999.0.0", &old, vec![]);
         let rel = dl.fetch_release("r", None).unwrap();
         assert!(
             rel.asset(engine::MANIFEST_ASSET).is_some(),
@@ -726,6 +767,68 @@ mod tests {
 
     fn settings() -> Settings {
         Settings::default()
+    }
+
+    /// REQUIREMENT 3, for self-update: a source that serves a launcher whose bytes do not match the
+    /// hash its release committed to is a BAD SOURCE, not the end of the update.
+    ///
+    /// The walk wraps the DOWNLOAD only. `fetch_verified` never resumes — a `.part` from a
+    /// different version stitched onto new bytes is a corrupt file of plausible length — so the
+    /// next source restarts from zero, and the rejected `.new.exe` is deleted before it does.
+    /// The SWAP is outside the walk on purpose: renaming the running launcher is not an operation
+    /// to retry against another host.
+    #[test]
+    fn a_source_that_serves_a_bad_launcher_hash_fails_over() {
+        use crate::config::Source;
+        use crate::downloader::Downloader;
+        use std::sync::Arc;
+
+        let good = b"MZ the launcher that was signed for";
+        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(good));
+        // Two releases naming the SAME hash: the first serves other bytes under it, the second
+        // serves the bytes it promised.
+        let (dir, honest) = stage_signed("phoenix-selfupdate-failover", good, &sha, "launcher");
+        let (_, liar) = stage_signed("phoenix-selfupdate-failover-liar", b"MZ not this", &sha, "launcher");
+        let exe = dir.join("phoenix-launcher.exe");
+
+        let peers: Vec<Arc<dyn Downloader>> = vec![Arc::new(liar), Arc::new(honest)];
+        let sources = vec![Source::default(), Source::at("https://b.example")];
+        let by_key: std::collections::HashMap<Option<String>, Arc<dyn Downloader>> =
+            sources.iter().map(|s| s.url.clone()).zip(peers).collect();
+        let dial: crate::source::Dial = Box::new(move |s: &Source| by_key[&s.url].clone());
+
+        let staged = crate::source::walk(&dial, &sources, "r", None, |dl, release| {
+            fetch_verified_at(&exe, &settings(), dl, release, &mut |_, _| true)
+        })
+        .expect("the second source serves what the first promised");
+        let out = swap_in(&staged).expect("and the swap runs once, outside the walk");
+
+        assert_eq!(out, exe);
+        assert_eq!(std::fs::read(&exe).unwrap(), good);
+        assert!(
+            !dir.join("phoenix-launcher.new.exe").exists(),
+            "nothing partial may be left beside the launcher — the rejected download is deleted \
+             before the next source starts, and the accepted one is renamed away"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("phoenix-selfupdate-failover-liar"));
+    }
+
+    /// The two halves back to back, against a scratch exe: download + verify, then swap.
+    ///
+    /// They are separate in production because only the FIRST may be retried against another
+    /// source (see `Staged`), and separating them here would mean spelling both out in twenty
+    /// tests that are about the whole path — download, verify, swap, rollback — and not about the
+    /// seam between them.
+    fn apply_at(
+        exe: &Path,
+        settings: &Settings,
+        dl: &dyn Downloader,
+        release: &Release,
+        progress: ChunkProgress,
+    ) -> Result<PathBuf> {
+        let staged = fetch_verified_at(exe, settings, dl, release, progress)?;
+        swap_in(&staged)
     }
 
     #[test]
@@ -1031,8 +1134,7 @@ mod tests {
     /// The bug, end to end: a self-update from a mirror. The exe is fetched from `blobs/<sha256>`,
     /// verified against the signed hash, and swapped in — and the path the old code asked for, the
     /// asset's NAME at the payload root, is never requested, because it does not exist on any
-    /// mirror. Inert in production while `MIRROR_DOWNLOADS_ENABLED` is false; this is what whoever
-    /// flips it inherits.
+    /// mirror.
     #[test]
     fn a_launcher_self_updates_from_a_mirror_by_hash() {
         let body: &[u8] = b"MZ\x90\x00A LAUNCHER BUILD SERVED BY A MIRROR";

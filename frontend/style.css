@@ -900,41 +900,42 @@ input::placeholder { color: #4d4941; }
    :not(.on) so it can't fight .switch.on regardless of rule order. */
 .flag-row .switch:not(.on) { background: var(--bg); }
 
-/* download sources: the same plate as a launch flag, but the row is a DIV. A flag row IS one big
-   button, and a mirror row has to carry a real <button> switch inside it — nested buttons are
-   invalid. The primary row carries a .tag instead of a switch and so has no control at all. */
-.mirror-list { display: flex; flex-direction: column; gap: 0.5rem; }
-.mirror-row {
+/* download sources: the same plate as a launch flag, and a plain DIV — nothing in this block is
+   actionable. It reports the ranking the download path is walking; there is no switch, no pin and
+   no button, so there is nothing to focus and nothing to hover. */
+.sources { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.25rem; }
+/* Capped and scrollable. The block sits above the files area, which is the flex child that gives
+   — so an unbounded list of published mirrors would starve the thing the screen is actually about
+   down to nothing. Three rows is enough to see the ranking; the rest scrolls. */
+.src-list {
+  display: flex; flex-direction: column; gap: 0.5rem;
+  max-height: 11.5rem; overflow-y: auto; padding-right: var(--gutter);
+}
+.src-row {
   display: flex; align-items: center; gap: 0.75rem;
   min-height: var(--ctl-h); padding: 0.5rem 0.875rem;
   background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--r);
-  cursor: pointer; transition: background 0.15s, border-color 0.15s;
 }
-.mirror-row.on { border-color: rgba(201, 168, 106, 0.45); background: rgba(201, 168, 106, 0.05); }
-.mirror-row:hover { border-color: rgba(201, 168, 106, 0.55); }
-.mirror-row:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(201, 168, 106, 0.12); }
-/* the chosen source: verdigris, matching its own `in use` chip — settled, not actionable. It has
-   to outrank .on, which every enabled row carries. */
-.mirror-row.current, .mirror-row.current:hover {
+/* the source in use: verdigris, matching its own `in use` chip — settled, not actionable */
+.src-row.current {
   border-color: rgba(98, 208, 180, 0.45); background: rgba(98, 208, 180, 0.05);
 }
-.mirror-text { display: flex; flex-direction: column; gap: 0.1875rem; min-width: 0; flex: 1; }
-.mirror-host {
-  font-size: 0.84375rem; color: var(--text-dim); transition: color 0.15s;
+.src-text { display: flex; flex-direction: column; gap: 0.1875rem; min-width: 0; flex: 1; }
+.src-host {
+  font-size: 0.84375rem; color: var(--text-dim);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.mirror-row.on .mirror-host { color: var(--text); }
-/* the measurement line — the only place a probe result is shown, so it carries the verdict */
-.mirror-meta {
+.src-row.current .src-host { color: var(--text); }
+/* the measurement line — the only place a measurement is shown, so it carries the verdict */
+.src-meta {
   font-family: "Mono", monospace; font-size: 0.6875rem; color: var(--text-mute);
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.mirror-meta.good { color: var(--verd); }
-.mirror-meta.bad { color: var(--terra); }
-/* .switch is a decorative span on a flag plate; here it is the control itself */
-button.switch { padding: 0; appearance: none; font: inherit; }
-.mirror-row .switch:not(.on) { background: var(--bg); }
-.switch:focus-visible { outline: none; box-shadow: 0 0 0 3px rgba(201, 168, 106, 0.18); }
+.src-meta.good { color: var(--verd); }
+.src-meta.bad { color: var(--terra); }
+/* the note under the list carries the ordinary hint, or the reason the list could not be refreshed
+   — which is a failure, and reads as one */
+.sources .hint.bad { color: var(--terra); }
 
 .advanced { border-top: 1px solid var(--line); padding-top: 0.875rem; }
 .advanced summary {

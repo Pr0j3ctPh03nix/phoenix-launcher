@@ -193,18 +193,6 @@ pub(crate) fn version_lt(a: &str, b: &str) -> bool {
 /// The release asset every payload describes itself with.
 pub const MANIFEST_ASSET: &str = "manifest.json";
 
-/// Fetch the release and its manifest.json. Returned together so an install can reuse the release's
-/// asset list (for private downloads) without a second round trip. Fails with `UnsupportedSchema`
-/// when the manifest declares a format this build cannot read — a stale launcher must refuse a
-/// manifest it doesn't understand rather than misinstall it.
-pub fn fetch(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Result<(Release, Manifest)> {
-    let release = dl
-        .fetch_release(&settings.source_repo, tag)
-        .context("fetching the release")?;
-    let manifest = manifest_of(settings, dl, &release, Payload::Mod)?;
-    Ok((release, manifest))
-}
-
 /// The manifest.json of an already-fetched release, VERIFIED — for callers that resolved the
 /// release themselves (the base-game commands probe repo credentials first and hold a `Release` by
 /// the time they need the manifest, and self-update reads the launcher payload).
@@ -247,7 +235,7 @@ pub fn manifest_of(
         .download_limited(sig_asset, trust::MAX_SIG_BYTES)
         .with_context(|| format!("downloading {sig_name}"))?;
     let sig = String::from_utf8(sig)
-        .map_err(|_| anyhow!(trust::TrustError::Malformed("not UTF-8")))?;
+        .map_err(|_| anyhow!(crate::minisig::SigError::Malformed("not UTF-8")))?;
     // WHICH key signed is deliberately not acted on: a release signed by the cold spare installs
     // exactly like one signed by the active key (the spare exists for the day the other is gone,
     // and a client that treated it as suspicious would defeat its only purpose). The id is
@@ -499,11 +487,22 @@ pub fn fetch_notes_history(
 /// same build and must not disagree about what to call it.
 /// Drafts and prereleases are excluded here for the same reason as in `fetch_notes_history`: this
 /// page must not offer a version `launcher_check` will never see.
-pub fn launcher_notes_history(repo: &str, releases: &[Release]) -> NotesCache {
+pub fn launcher_notes_history(
+    dl: &dyn Downloader,
+    repo: &str,
+    releases: &[Release],
+) -> NotesCache {
     let published = || releases.iter().filter(|r| r.is_published());
     let entries = published()
         .filter_map(|r| {
-            let notes = r.body.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+            // Through the BACKEND, not `r.body`: a mirror publishes no release index, so its notes
+            // live in a file it has to be asked for. A failure there is "no notes" — one release
+            // whose text could not be fetched must not sink the whole history.
+            let text = dl.notes(r).ok().flatten()?;
+            let notes = text.trim();
+            if notes.is_empty() {
+                return None;
+            }
             Some(NotesEntry {
                 tag: r.tag_name.clone(),
                 version: r.tag_name.trim_start_matches('v').to_string(),
@@ -744,15 +743,18 @@ pub fn evaluate(settings: &Settings, tag_name: &str, manifest: &Manifest) -> Res
     })
 }
 
-/// Read-only check: fetch the manifest and evaluate it.
+/// Read-only check against ONE backend: resolve the release, verify its manifest, evaluate it.
 ///
-/// Callers are the debug-only CLI and the test suite — the GUI's `check` command composes
-/// `fetch` + `evaluate` itself (it caches the manifest between the two). Release builds compile
-/// neither caller, so the release-only dead-code silence below is accurate, and a debug build
-/// still warns if this ever becomes genuinely unused.
+/// Callers are the debug-only CLI and the test suite. The GUI's `check` command does the same three
+/// steps through `source::with_active`, so a source that refuses the manifest fails over — which is
+/// exactly the difference between the two, and why this one takes a `&dyn Downloader` rather than
+/// pretending to be the model. Release builds compile neither caller, so the release-only dead-code
+/// silence below is accurate, and a debug build still warns if this ever becomes genuinely unused.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub fn check(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Result<CheckResult> {
-    let (release, manifest) = fetch(settings, dl, tag)?;
+    let release =
+        dl.fetch_release(&settings.source_repo, tag).context("fetching the release")?;
+    let manifest = manifest_of(settings, dl, &release, Payload::Mod)?;
     evaluate(settings, &release.tag_name, &manifest)
 }
 
@@ -773,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_refuses_a_manifest_schema_it_cannot_read() {
+    fn a_manifest_schema_this_build_cannot_read_is_refused_as_such() {
         use crate::manifest::{UnsupportedSchema, MAX_SCHEMA};
         let settings = Settings::default();
         let future = MAX_SCHEMA + 1;
@@ -782,7 +784,7 @@ mod tests {
             &format!(r#"{{ "schema": {future}, "version": "9.9.9", "files": [] }}"#),
             vec![],
         );
-        let err = fetch(&settings, &too_new, None).unwrap_err();
+        let err = check(&settings, &too_new, None).unwrap_err();
         let refused = err
             .chain()
             .find_map(|c| c.downcast_ref::<UnsupportedSchema>())
@@ -791,9 +793,9 @@ mod tests {
 
         // a supported schema, and a legacy manifest with no `schema` key at all, both pass
         let ok = Fake::new("v1.0.0", r#"{ "schema": 2, "version": "1.0.0", "files": [] }"#, vec![]);
-        assert!(fetch(&settings, &ok, None).is_ok());
+        assert!(check(&settings, &ok, None).is_ok());
         let legacy = Fake::new("v1.0.0", r#"{ "version": "1.0.0", "files": [] }"#, vec![]);
-        assert!(fetch(&settings, &legacy, None).is_ok());
+        assert!(check(&settings, &legacy, None).is_ok());
     }
 
     /// The gate itself: a release whose manifest is not signed by a key we pin is not a release
@@ -802,14 +804,20 @@ mod tests {
     /// frontend's soft set and therefore never blocks Play on an install that is already clean.
     #[test]
     fn an_unverifiable_manifest_is_refused_as_notfound() {
+        use crate::minisig::SigError;
         use crate::trust::TrustError;
         let settings = Settings::default();
         let doc = r#"{"schema":2,"version":"1.0.0","files":[]}"#;
         let refusal = |dl: &dyn Downloader| -> String {
             let release = dl.fetch_release("r", None).unwrap();
             let e = manifest_of(&settings, dl, &release, Payload::Mod).unwrap_err();
+            // EITHER typed refusal — the signature file's own (`SigError`) or the document's
+            // identity (`TrustError`). The variants below produce both, and `wire_kind` has to
+            // classify each of them; an assertion naming only one type would let the other fall
+            // through to "internal", which the frontend treats as fatal.
             assert!(
-                e.chain().any(|c| c.downcast_ref::<TrustError>().is_some()),
+                e.chain().any(|c| c.downcast_ref::<TrustError>().is_some()
+                    || c.downcast_ref::<SigError>().is_some()),
                 "must carry a typed trust failure so the shell can classify it: {e:#}"
             );
             assert_eq!(crate::views::CmdError::from(e).kind, "notFound");
@@ -1010,6 +1018,13 @@ mod tests {
         assert_eq!(cache.latest_tag, "", "nor may it date the cache");
     }
 
+    /// A backend that carries the body inside its release index — GitHub's shape, and the trait's
+    /// default answer. A mirror's is exercised where a mirror is (mirror.rs); what these tests are
+    /// about is which releases reach the history and how they are ordered.
+    fn indexed() -> Fake {
+        Fake::new("v0", r#"{"version":"0","files":[]}"#, vec![])
+    }
+
     fn launcher_rel(tag: &str, body: Option<&str>) -> Release {
         Release {
             tag_name: tag.into(),
@@ -1028,7 +1043,7 @@ mod tests {
             launcher_rel("v1.2.8", None),            // no body at all
             launcher_rel("1.2.7", Some("plain")),    // a tag without the "v" still reports a version
         ];
-        let c = launcher_notes_history("o/r", &rels);
+        let c = launcher_notes_history(&indexed(), "o/r", &rels);
 
         assert_eq!(c.repo, "o/r");
         // newest first, the listing's own order, with the note-less releases dropped
@@ -1040,7 +1055,7 @@ mod tests {
         // no notes must not silently date the cache to the one below it
         assert_eq!(c.latest_tag, "v1.3.0");
 
-        assert_eq!(launcher_notes_history("o/r", &[]).latest_tag, "");
+        assert_eq!(launcher_notes_history(&indexed(), "o/r", &[]).latest_tag, "");
     }
 
     #[test]
@@ -1051,7 +1066,7 @@ mod tests {
         pre.prerelease = true;
         let rels = vec![draft, pre, launcher_rel("v1.8.0", Some("shipped"))];
 
-        let c = launcher_notes_history("o/r", &rels);
+        let c = launcher_notes_history(&indexed(), "o/r", &rels);
         assert_eq!(c.entries.len(), 1);
         assert_eq!(c.entries[0].tag, "v1.8.0");
         // and the key dates to the newest PUBLISHED release, which is what /releases/latest —

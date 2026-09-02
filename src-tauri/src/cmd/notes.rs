@@ -7,10 +7,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::cmd::{open_repo_releases, AppState};
+use crate::cmd::AppState;
 use crate::config::Settings;
 use crate::engine;
-use crate::github::Github;
+use crate::source;
+use crate::trust::Payload;
 use crate::views::{CmdError, NotesEntryView};
 
 /// The full "What's new" history (every release's notes, newest first). Cached in memory AND on
@@ -37,8 +38,13 @@ pub async fn release_notes(
             engine::NOTES_FILE_SHIM,
             current_tag,
             |known| {
-                let dl = Github::new(settings.token());
-                engine::fetch_notes_history(&settings, &dl, known)
+                source::with_active(
+                    &settings,
+                    &settings.source_repo,
+                    Payload::Mod,
+                    None,
+                    |dl, _release| engine::fetch_notes_history(&settings, dl, known),
+                )
             },
         )
     })
@@ -50,8 +56,12 @@ pub async fn release_notes(
 ///
 /// Costs one API call when it is cold and none at all when it is warm: `launcher_check` runs on
 /// every launch and records the tag it saw, so a cached history that names the same tag is
-/// provably current. The launcher repo is meant to be public, so the listing goes through the
-/// same anonymous-first / token-on-refusal rule the self-update check uses.
+/// provably current.
+///
+/// Read through the ACTIVE SOURCE like everything else, and what that buys is not failover so much
+/// as an answer at all: a client that cannot reach GitHub has no release index to list, and its
+/// mirror publishes exactly one release. So on a mirror this history is the CURRENT release alone —
+/// which is what there is, and better than the honest error it used to be.
 #[tauri::command]
 pub async fn launcher_notes(
     state: tauri::State<'_, Arc<AppState>>,
@@ -67,10 +77,13 @@ pub async fn launcher_notes(
             engine::NOTES_FILE_LAUNCHER,
             current_tag,
             |_known| {
-                // `known` is ignored on purpose: there is no per-release download to skip. One
-                // listing carries every body, so a rebuild is always whole and always cheap.
-                let (_, releases) = open_repo_releases(&repo, &settings)?;
-                Ok(engine::launcher_notes_history(&repo, &releases))
+                // `known` is ignored on purpose: there is no per-release download to skip on
+                // GitHub — one listing carries every body, so a rebuild is always whole and always
+                // cheap.
+                source::with_active(&settings, &repo, Payload::Launcher, None, |dl, _release| {
+                    let releases = dl.fetch_releases(&repo)?;
+                    Ok(engine::launcher_notes_history(dl, &repo, &releases))
+                })
             },
         )
     })

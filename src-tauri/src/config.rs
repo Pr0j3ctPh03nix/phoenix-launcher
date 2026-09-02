@@ -1,16 +1,15 @@
 //! Persisted updater settings. Both the GUI and the CLI load/override these.
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use crate::trust::Payload;
-
-/// On-disk schema version of settings.json. v1 = initial. Bump and extend `migrate` when the
-/// shape changes (e.g. a future `installs[]` for multi-install support).
-const SETTINGS_VERSION: u32 = 1;
+/// On-disk schema version of settings.json. v1 = initial. v2 = one kind of download source, with
+/// its measurement persisted alongside it (see `Source`, `Measured` and `migrate`). Bump and extend
+/// `migrate` when the shape changes (e.g. a future `installs[]` for multi-install support).
+const SETTINGS_VERSION: u32 = 2;
 
 /// Baked default source repo. Settings override it (Advanced is hidden behind SHOW_ADVANCED in
 /// the frontend, so for now this is effectively fixed).
@@ -49,119 +48,141 @@ pub const DEFAULT_MIRRORS_REPO: &str = "Pr0j3ctPh03nix/phoenix-mirror-registry";
 const DIST_STAGING_REPO_ACCESS: Option<&str> =
     option_env!("PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS");
 
-/// One place releases can be downloaded from. Position in `Settings::sources` is priority order.
+/// One place every payload can be fetched from.
 ///
-/// The two variants are deliberately asymmetric, and that asymmetry is the safety property:
-/// `Primary` has NO `enabled` field and NO url. Mirrors are discovered from a published, SIGNED
-/// `mirrors.json`, which describes mirrors and nothing else — so there exists no value that
-/// document could carry, however malformed or hostile, that names, disables or removes the main
-/// source. Mirrors can only ever be a complement to it. `migrate` guarantees exactly one `Primary`
-/// survives.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum Source {
-    /// The baked-in GitHub source repo (`Settings::source_repo`). Always present, always used.
-    Primary,
-    Mirror {
-        /// Base URL, normalized (no trailing slash) — the entry's identity, and what the list is
-        /// deduplicated on.
-        url: String,
-        /// A disabled mirror stays in the list and is still PROBED, which is how one that has
-        /// come back gets noticed; it is simply never downloaded from.
-        #[serde(default = "default_true")]
-        enabled: bool,
-        /// Has this mirror ever been timed? A newly published one arrives `false`, and that — not
-        /// a clock — is the only thing that triggers an automatic measurement. Speeds are never
-        /// re-taken on a schedule: measuring costs a real download per source, and re-ordering the
-        /// list unprompted is exactly what would move a user off the source they chose.
-        #[serde(default)]
-        measured: bool,
-        /// The payload trees this mirror says it carries, taken from the signed list.
-        ///
-        /// Kept rather than validated-and-dropped because a mirror need not carry all three: the
-        /// probe has to measure a directory that exists on THIS host, and the download chain must
-        /// not route a payload to a host without it. EMPTY means unknown — an entry written before
-        /// this field existed — and is read permissively, so upgrading cannot disable a mirror that
-        /// works; the next refresh fills it in from the list.
-        #[serde(default)]
-        payloads: Vec<String>,
-    },
+/// There is no second KIND of entry: GitHub is a source with no URL, and that ABSENCE is its whole
+/// identity — a published list carries URLs, so no value in it can name, replace or remove the
+/// built-in source. That asymmetry used to be an enum with two variants and a pile of methods to
+/// paper over them (`carries`, `payloads`, `is_primary`, `enabled`); making it the absence of a
+/// field is the same guarantee with nothing to keep in step. `migrate` guarantees exactly one
+/// urlless entry survives any file.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Source {
+    /// Base URL, `normalize_mirror_url`'d (no trailing slash). `None` = GitHub. Also the key the
+    /// published list is merged and deduplicated on, and the key a measurement survives a refresh
+    /// by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The last measurement. `None` = never measured, which is what triggers a measuring pass — on
+    /// a fresh install GitHub itself is `None`, which is why the first launch measures at all.
+    ///
+    /// A v1 file spells this as a BOOL; `measured_compat` reads that as `None`. See `migrate`.
+    #[serde(
+        default,
+        deserialize_with = "measured_compat",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub measured: Option<Measured>,
 }
 
 impl Source {
-    /// Does this source carry `payload`? The primary carries everything; a mirror carries what the
-    /// signed list said, and an entry that says nothing is trusted rather than excluded (see the
-    /// field's own note on why empty is permissive).
-    pub fn carries(&self, payload: Payload) -> bool {
-        match self {
-            Source::Primary => true,
-            Source::Mirror { payloads, .. } => {
-                payloads.is_empty() || payloads.iter().any(|p| p == payload.id())
-            }
-        }
+    /// A mirror at `url`, never measured.
+    pub fn at(url: impl Into<String>) -> Self {
+        Self { url: Some(url.into()), measured: None }
     }
 
-    /// The payloads a mirror advertises, for callers deciding what to measure it with.
-    pub fn payloads(&self) -> &[String] {
-        match self {
-            Source::Primary => &[],
-            Source::Mirror { payloads, .. } => payloads,
-        }
+    /// The built-in GitHub entry.
+    pub fn is_github(&self) -> bool {
+        self.url.is_none()
     }
 
-    pub fn url(&self) -> Option<&str> {
-        match self {
-            Source::Primary => None,
-            Source::Mirror { url, .. } => Some(url),
-        }
-    }
-
-    pub fn is_primary(&self) -> bool {
-        matches!(self, Source::Primary)
-    }
-
-    /// The primary is unconditionally enabled — see the type's note.
-    pub fn enabled(&self) -> bool {
-        match self {
-            Source::Primary => true,
-            Source::Mirror { enabled, .. } => *enabled,
-        }
+    /// Identity, for the runtime sets. `None` is GitHub and no mirror can collide with it — which
+    /// is why this is an `Option<&str>` and not a `""` sentinel.
+    pub fn key(&self) -> Option<&str> {
+        self.url.as_deref()
     }
 }
 
-/// A reference to a source, for naming one the user pinned. Separate from `Source` because a
-/// pin stores an identity, not a state — carrying `enabled` here would be a second copy of a
-/// fact the list already holds, free to disagree with it.
+/// What one measurement concluded. PERSISTED — a restart must not re-time the world, and the
+/// status block has to have something to show before the first pass finishes.
+///
+/// This is the old `mirror::Probe` and the old `Source::measured: bool` collapsed into one value.
+/// Two representations of one fact is what let the settings pane say "not tested" beside a live
+/// measurement.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum SourceRef {
-    Primary,
-    Mirror { url: String },
+pub struct Measured {
+    /// Unix seconds. Absolute, not an age: the process that reads it is not the one that wrote it.
+    pub at: u64,
+    /// Bytes per second over a real 512 KiB transfer. The number worth sorting on. `None` = it
+    /// failed the measurement.
+    #[serde(default)]
+    pub bytes_per_sec: Option<u64>,
+    /// Milliseconds to fetch the document that names the release. A tiebreak, never a key — a
+    /// latency figure is exactly what a throttled path still passes.
+    #[serde(default)]
+    pub latency_ms: Option<u64>,
+    /// The release the source advertised. A source can be fast, healthy and three releases behind.
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Answered 206. Without resume a dropped connection restarts a multi-GiB file.
+    #[serde(default)]
+    pub range_ok: bool,
+    /// Why it failed, if it did. English; the UI localizes the verdict and shows this as detail.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
-impl Source {
-    pub fn is(&self, r: &SourceRef) -> bool {
-        match (self, r) {
-            (Source::Primary, SourceRef::Primary) => true,
-            (Source::Mirror { url, .. }, SourceRef::Mirror { url: pinned }) => url == pinned,
-            _ => false,
+impl Measured {
+    /// A measurement taken at `at` that failed, and why.
+    pub fn failed(at: u64, why: impl Into<String>) -> Self {
+        Self { at, error: Some(why.into()), ..Self::blank(at) }
+    }
+
+    /// A measurement in progress: nothing concluded yet.
+    pub fn blank(at: u64) -> Self {
+        Self {
+            at,
+            bytes_per_sec: None,
+            latency_ms: None,
+            tag: None,
+            range_ok: false,
+            error: None,
         }
+    }
+
+    /// Delivered the whole chunk, in budget, without faulting. Deliberately strict: "answered" is
+    /// not health.
+    pub fn healthy(&self) -> bool {
+        self.error.is_none() && self.bytes_per_sec.is_some()
     }
 }
 
-/// Which source will actually be used.
+/// Sort key: usable sources first, then fastest, latency only breaking ties between two that both
+/// deliver. Never latency-first — a latency figure is exactly what a throttled path still passes.
 ///
-/// THE one definition — the settings pane, the CLI and any future downloader all resolve through
-/// here, so "in use" cannot come to mean different things in the UI and in the download path.
+/// GitHub is ranked by this and nothing else: it is a peer, not a floor. An UNMEASURED source
+/// sorts with the unhealthy ones, because it is not a settled answer either.
+pub fn rank(m: Option<&Measured>) -> (bool, std::cmp::Reverse<u64>, u64) {
+    let healthy = m.is_some_and(Measured::healthy);
+    (
+        !healthy,
+        std::cmp::Reverse(m.and_then(|m| m.bytes_per_sec).unwrap_or(0)),
+        m.and_then(|m| m.latency_ms).unwrap_or(u64::MAX),
+    )
+}
+
+/// v1 persisted `measured` as a BOOL ("has this ever been timed"). Read as "never measured", both
+/// for `true` and for `false`, and that is the safe direction — the next launch measures.
 ///
-/// A pin wins while it is still in the list and still enabled; otherwise the head of the ranking
-/// does, which after a sweep is the fastest working source. A pin that has gone stale (its mirror
-/// unpublished, or switched off) is therefore ignored rather than obeyed into a dead end — and it
-/// is kept, not cleared, so re-enabling the mirror restores the user's choice.
-pub fn active_index(sources: &[Source], pinned: Option<&SourceRef>) -> Option<usize> {
-    pinned
-        .and_then(|r| sources.iter().position(|s| s.is(r) && s.enabled()))
-        .or_else(|| sources.iter().position(Source::enabled))
+/// Without this the WHOLE settings file fails to parse, because a type mismatch is not an unknown
+/// field: `Settings::load` would copy it to `.bak` and return defaults, and the file it just gave
+/// up on is the one carrying `max_serial_seen["mirrors"]` — the anti-rollback high-water mark,
+/// gone with no signal anywhere.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MeasuredCompat {
+    New(Measured),
+    /// The v1 spelling. Its VALUE is deliberately never read — `true` meant "has been timed at
+    /// some point", which says nothing this model can rank on — but the variant still has to exist
+    /// so a bool PARSES instead of failing the whole document.
+    Legacy(#[allow(dead_code)] bool),
+}
+
+fn measured_compat<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Measured>, D::Error> {
+    Ok(match Option::<MeasuredCompat>::deserialize(d)? {
+        Some(MeasuredCompat::New(m)) => Some(m),
+        _ => None,
+    })
 }
 
 /// Canonical form of a published mirror base URL, or None if it is not one. Everything downstream
@@ -220,32 +241,17 @@ pub struct Settings {
     /// Manifest option selections: option id -> variant id (choice) or bool (toggle).
     #[serde(default)]
     pub selections: BTreeMap<String, serde_json::Value>,
-    /// Download sources in priority order. Always holds exactly one `Source::Primary` (enforced
-    /// by `migrate`). The `Mirror` entries are DISCOVERED, never user-authored: a sweep replaces
-    /// them wholesale from the published `mirrors.json`, so the only thing a user decides about a
-    /// mirror is whether to use it.
-    /// Always ordered fastest-first by the last sweep that measured, so the head of the list is
-    /// the source in use. There is no setting for this: a slower source ahead of a faster one is
-    /// not a preference anyone holds.
+    /// Download sources, RANKED — fastest working first. Always holds exactly one urlless
+    /// (GitHub) entry, enforced by `migrate`. Mirrors are DISCOVERED, never user-authored: a
+    /// refresh replaces them wholesale from the published `mirrors.json`, so nothing about a
+    /// mirror is a preference.
+    ///
+    /// The order is a measurement result, not a setting. There is no knob for it, and there is no
+    /// pin either: a slower source ahead of a faster one is not a preference anyone holds, and a
+    /// pin is a choice a user has no information to make and would then be stuck with when the
+    /// host it names goes dark. `source::Registry` walks this list in this order.
     #[serde(default = "default_sources")]
     pub sources: Vec<Source>,
-    /// The source the user pinned, if any. `None` means "follow the ranking" — use the fastest.
-    ///
-    /// A choice is never overridden quietly. Exactly two things clear it: the TEST BUTTON (asking
-    /// to be re-tested is asking for the answer the test gives), and a measurement finding the
-    /// pinned source unusable — which is the user's own rule, "unless their mirror goes offline".
-    /// Nothing else touches it: not a launch, not a list refresh, not a newly published mirror.
-    #[serde(default)]
-    pub selected: Option<SourceRef>,
-    /// When a newly published mirror turns up, test everything and switch to the best — pin and
-    /// all. On by default: a mirror is published because it is worth using, and the people this
-    /// exists for are the least likely to go looking for a settings pane.
-    ///
-    /// Off means a new mirror is only listed, marked untested, and left alone until the user runs
-    /// the test themselves. It does not merely defer the switch — with it off, NOTHING measures
-    /// automatically, so nothing reorders and nothing touches the pin.
-    #[serde(default = "default_true")]
-    pub auto_pick_best: bool,
     /// The highest signed `serial` accepted for each payload id, ever. The rollback ratchet: a
     /// mirror can always serve an older release it once held a valid signature for, and nothing
     /// else in a signed document says it is not the current one.
@@ -258,7 +264,7 @@ pub struct Settings {
 }
 
 fn default_sources() -> Vec<Source> {
-    vec![Source::Primary]
+    vec![Source::default()]
 }
 
 fn default_version() -> u32 {
@@ -293,8 +299,6 @@ impl Default for Settings {
             launch_flags: BTreeMap::new(),
             selections: BTreeMap::new(),
             sources: default_sources(),
-            selected: None,
-            auto_pick_best: true,
             max_serial_seen: BTreeMap::new(),
         }
     }
@@ -321,20 +325,30 @@ impl Settings {
         s
     }
 
-    /// Bring an older on-disk schema up to SETTINGS_VERSION. No field transformations yet — v1 is
-    /// the first schema; future bumps migrate here.
+    /// Bring an older on-disk schema up to SETTINGS_VERSION.
+    ///
+    /// v1 -> v2 needs no field transformation, and that is by construction rather than by luck:
+    /// `{"kind":"primary"}` reads as `Source { url: None }`, which is correct; a v1 mirror's
+    /// `kind`/`enabled`/`payloads` are unknown fields and serde drops them (a v1-DISABLED mirror
+    /// comes back enabled, which is also correct — there is no such concept any more); `selected`
+    /// and `auto_pick_best` retire themselves on the next save. The one field that is a serde TYPE
+    /// error rather than an unknown one is `measured`, and `measured_compat` covers it — read its
+    /// doc for what a failure there would silently cost.
     fn migrate(&mut self) {
-        if self.version < SETTINGS_VERSION {
-            self.version = SETTINGS_VERSION;
+        self.version = SETTINGS_VERSION;
+        // Exactly one urlless entry, always, restored at the FRONT — a file written before
+        // `sources` existed, or hand-edited to drop it, must not leave the launcher with no
+        // built-in source. That is the state a published list is never allowed to produce, so it
+        // must not be reachable by accident either. The front, because a list with no measurements
+        // has no better order to claim.
+        if self.sources.iter().filter(|s| s.is_github()).count() != 1 {
+            self.sources.retain(|s| !s.is_github());
+            self.sources.insert(0, Source::default());
         }
-        // Exactly one Primary, always. A file written before `sources` existed, or one hand-edited
-        // to drop it, must not leave the launcher with no main source — that is the state mirrors
-        // are never allowed to produce, so it cannot be reachable by accident either. Restored at
-        // the FRONT, since a list with no measurements has no better order to claim.
-        if self.sources.iter().filter(|s| s.is_primary()).count() != 1 {
-            self.sources.retain(|s| !s.is_primary());
-            self.sources.insert(0, Source::Primary);
-        }
+        // …and no duplicate mirrors by URL: identity IS the URL, and two rows for one host would
+        // rank, fail over and be measured independently.
+        let mut seen = HashSet::new();
+        self.sources.retain(|s| seen.insert(s.url.clone()));
     }
 
     /// `load` behind an mtime memo, for POLLING callers only (today: the 3-second game_running
@@ -386,12 +400,12 @@ impl Settings {
     /// be public and anonymous GitHub allows 60 requests/hour per IP, which is plenty for one
     /// check per launch.
     ///
-    /// It is not, however, "never authenticated" — `open_repo` tries anonymously and retries with
-    /// `Settings::token()` (the dist PAT) if and only if the anonymous attempt was REFUSED by the
-    /// server. That is what keeps self-update working while this repo is still private. The
-    /// header only ever reaches api.github.com and is stripped on redirect, so the retry costs
-    /// nothing but a possible 403 where anonymous would have worked — which is why it is a retry
-    /// and not the first attempt.
+    /// It is not, however, "never authenticated" — `Github::for_repo` tries anonymously and
+    /// retries with `Settings::token()` (the dist PAT) if and only if the anonymous attempt was
+    /// REFUSED by the server. That is what keeps self-update working while this repo is still
+    /// private. The header only ever reaches api.github.com and is stripped on redirect, so the
+    /// retry costs nothing but a possible 403 where anonymous would have worked — which is why it
+    /// is a retry and not the first attempt.
     pub fn launcher_repo(&self) -> &str {
         self.launcher_repo.as_deref().unwrap_or(DEFAULT_LAUNCHER_REPO)
     }
@@ -401,43 +415,17 @@ impl Settings {
         self.game_repo.as_deref().unwrap_or(DEFAULT_GAME_REPO)
     }
 
-    /// The repo the signed mirror list is published from. Public, so `mirror::fetch_published_mirrors`
-    /// reads it through `cmd::open_repo` — anonymous first, the baked credential only if the
+    /// The repo the signed mirror list is published from. Public, so `mirror::fetch_list_from`
+    /// reads it through `Github::for_repo` — anonymous first, the baked credential only if the
     /// anonymous attempt was REFUSED. That credential is scoped to the dist repo and a fine-grained
     /// PAT can be turned away where anonymous access would have worked, which on this repo would
     /// cost every client its mirror list for nothing.
     ///
-    /// Deliberately ABSENT from `payload_of`, which answers a different question: "which payload
-    /// DIRECTORY does a mirror serve this repo's releases from". A mirror serves the list at its own
-    /// root (`<base>/mirrors.json` — see `mirror::fetch_list_from_mirror`), not under
-    /// `<base>/mirrors/`, so teaching `payload_of` this repo would point `cmd::candidates` and the
-    /// probe at a directory that exists on no mirror.
+    /// It names no PAYLOAD DIRECTORY, and must not be given one: a mirror serves the list at its
+    /// own root (`<base>/mirrors.json`), not under `<base>/mirrors/`, because the list describes
+    /// the HOSTS rather than any payload's content.
     pub fn mirrors_repo(&self) -> &str {
         self.mirrors_repo.as_deref().unwrap_or(DEFAULT_MIRRORS_REPO)
-    }
-
-    /// The payload a repo names, and therefore the directory a mirror serves it from
-    /// (`<base>/<payload>/…`). `None` for a repo this build knows nothing about, which is reachable
-    /// only through the debug CLI's `--repo`.
-    ///
-    /// THREE repos, not four: `mirrors_repo` belongs to no payload directory and must never be
-    /// added here — see that method.
-    ///
-    /// Lives here rather than beside either of its callers because the three repo names it compares
-    /// against are settings, and because both the download chain (`cmd::candidates`) and the probe
-    /// (`mirror::measure`) have to answer this the SAME way: a probe that measured one directory
-    /// while the installer read another would rank a source on a transfer nothing would ever repeat.
-    pub fn payload_of(&self, repo: &str) -> Option<crate::trust::Payload> {
-        use crate::trust::Payload;
-        if repo == self.source_repo {
-            Some(Payload::Mod)
-        } else if repo == self.game_repo() {
-            Some(Payload::Game)
-        } else if repo == self.launcher_repo() {
-            Some(Payload::Launcher)
-        } else {
-            None
-        }
     }
 
     /// The lowest `serial` a signed manifest for `payload` may carry: this machine's own
@@ -493,69 +481,127 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::Payload;
 
-    fn mirror(url: &str, enabled: bool) -> Source {
-        Source::Mirror { url: url.to_string(), enabled, measured: true, payloads: Vec::new() }
-    }
-    fn pin(url: &str) -> SourceRef {
-        SourceRef::Mirror { url: url.to_string() }
+    /// A mirror entry with a HEALTHY measurement of the given age.
+    fn measured(url: &str, at: u64) -> Source {
+        Source {
+            url: Some(url.to_string()),
+            measured: Some(Measured { bytes_per_sec: Some(1), ..Measured::blank(at) }),
+        }
     }
 
-    /// No pin: the head of the ranking wins, which after a sweep is the fastest working source.
+    /// THE loss that would be silent and permanent.
+    ///
+    /// A v1 file spells `measured` as a bool, which is a serde TYPE error rather than an unknown
+    /// field, so the whole document fails to parse — and `Settings::load` answers a parse failure
+    /// by copying the file to `.bak` and returning defaults. The file it gives up on is the one
+    /// carrying `max_serial_seen["mirrors"]`: the anti-rollback high-water mark, gone, with the
+    /// only symptom being a rollback nobody notices.
     #[test]
-    fn unpinned_uses_the_head() {
-        let s = vec![mirror("https://a", true), Source::Primary];
-        assert_eq!(active_index(&s, None), Some(0));
-    }
-
-    #[test]
-    fn a_pin_wins_over_the_ranking() {
-        let s = vec![mirror("https://a", true), Source::Primary, mirror("https://b", true)];
-        assert_eq!(active_index(&s, Some(&pin("https://b"))), Some(2));
-        assert_eq!(active_index(&s, Some(&SourceRef::Primary)), Some(1));
-    }
-
-    /// Switching off the pinned mirror must hand the job to the ranking, not strand the user on a
-    /// source that is excluded — the pin itself is deliberately NOT cleared, so turning the mirror
-    /// back on restores the choice.
-    #[test]
-    fn a_disabled_pin_falls_back() {
-        let s = vec![mirror("https://a", true), mirror("https://b", false)];
-        assert_eq!(active_index(&s, Some(&pin("https://b"))), Some(0));
-    }
-
-    /// A mirror the publisher has dropped is gone from the list; a pin naming it is stale and must
-    /// not resolve to nothing.
-    #[test]
-    fn a_pin_to_a_vanished_mirror_falls_back() {
-        let s = vec![Source::Primary, mirror("https://a", true)];
-        assert_eq!(active_index(&s, Some(&pin("https://gone"))), Some(0));
-    }
-
-    /// Every mirror off is a reachable state; the primary has no switch, so there is always one
-    /// enabled source left and this can never resolve to None.
-    #[test]
-    fn primary_survives_everything_being_switched_off() {
-        let s = vec![mirror("https://a", false), Source::Primary, mirror("https://b", false)];
-        assert_eq!(active_index(&s, Some(&pin("https://a"))), Some(1));
-        assert_eq!(active_index(&s, None), Some(1));
-    }
-
-    /// `migrate` is the guarantee that no settings file — hand-edited, or written by a build that
-    /// predates `sources` — can leave the launcher without a main source.
-    #[test]
-    fn migrate_restores_a_missing_primary() {
-        let mut s = Settings { sources: vec![mirror("https://a", true)], ..Settings::default() };
+    fn a_v1_settings_file_upgrades_without_losing_the_mirror_serial_floor() {
+        // exactly what v1 wrote: kind-tagged sources, a bool `measured`, `payloads`, and the two
+        // settings that no longer exist
+        let v1 = r#"{
+          "version": 1,
+          "sources": [
+            {"kind": "primary", "measured": true},
+            {"kind": "mirror", "url": "https://fi1.example", "enabled": false,
+             "measured": true, "payloads": ["mod", "game"]}
+          ],
+          "selected": {"kind": "mirror", "url": "https://fi1.example"},
+          "auto_pick_best": false,
+          "max_serial_seen": {"mirrors": 7, "mod": 3}
+        }"#;
+        let mut s: Settings = serde_json::from_str(v1).expect("a v1 file must still parse");
         s.migrate();
-        assert_eq!(s.sources.first(), Some(&Source::Primary));
+
+        assert_eq!(s.serial_floor(Payload::Mirrors), 7, "the floor is the whole point");
+        assert_eq!(s.serial_floor(Payload::Mod), 3);
+        assert_eq!(s.version, SETTINGS_VERSION);
+        assert_eq!(
+            s.sources,
+            vec![Source::default(), Source::at("https://fi1.example")],
+            "both survive, unmeasured — a v1 bool says nothing this model can use, and a v1 \
+             DISABLED mirror comes back usable because there is no such concept any more"
+        );
+
+        // and the dead keys retire themselves rather than accumulating on disk
+        let round: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(round.get("selected").is_none());
+        assert!(round.get("auto_pick_best").is_none());
+        assert!(round["sources"][0].get("kind").is_none());
+        assert!(round["sources"][1].get("payloads").is_none());
+        assert!(round["sources"][1].get("measured").is_none(), "None is absent, not null");
+    }
+
+    /// NO file and no published list can leave the launcher without the built-in source, and none
+    /// can give it two of anything. GitHub's identity is the ABSENCE of a URL, so "exactly one
+    /// urlless entry" is the whole invariant — and a duplicate mirror would rank, fail over and be
+    /// measured twice under one name.
+    #[test]
+    fn exactly_one_github_entry_survives_any_file() {
+        let github_first = |s: &Settings| {
+            assert_eq!(s.sources.iter().filter(|x| x.is_github()).count(), 1);
+            assert!(s.sources[0].is_github(), "restored at the front: {:?}", s.sources);
+        };
+
+        // missing entirely (hand-edited, or written before `sources` existed)
+        let mut s = Settings { sources: vec![Source::at("https://a")], ..Settings::default() };
+        s.migrate();
+        github_first(&s);
         assert_eq!(s.sources.len(), 2);
+
+        // doubled — and the measurement on either copy is discarded with it, since neither copy
+        // can be said to be the one that was measured
+        let mut s = Settings {
+            sources: vec![Source::default(), measured("https://a", 100), Source::default()],
+            ..Settings::default()
+        };
+        s.migrate();
+        github_first(&s);
+        assert_eq!(s.sources.len(), 2);
+
+        // the same mirror twice: identity is the URL, so the first one wins and keeps its rank
+        let mut s = Settings {
+            sources: vec![Source::default(), measured("https://a", 100), Source::at("https://a")],
+            ..Settings::default()
+        };
+        s.migrate();
+        github_first(&s);
+        assert_eq!(s.sources, vec![Source::default(), measured("https://a", 100)]);
+    }
+
+    /// GitHub is ranked by the measurement and nothing else — it is a peer, not a floor — and an
+    /// UNMEASURED source sorts with the unhealthy ones, because it is not a settled answer either.
+    #[test]
+    fn rank_puts_the_fastest_working_source_first() {
+        let fast = Measured { bytes_per_sec: Some(5_000_000), ..Measured::blank(0) };
+        let slow = Measured { bytes_per_sec: Some(1_000_000), ..Measured::blank(0) };
+        let dead = Measured::failed(0, "down");
+        assert!(rank(Some(&fast)) < rank(Some(&slow)));
+        assert!(rank(Some(&slow)) < rank(None), "unmeasured is not an answer");
+        assert!(rank(Some(&slow)) < rank(Some(&dead)));
+        assert_eq!(
+            rank(None),
+            rank(Some(&dead)),
+            "never measured and measured-and-failed are the same non-answer to a SORT; what \
+             tells them apart is whether a pass is due, which is `source`'s question, not \
+             this one's"
+        );
+
+        // latency only breaks a tie between two that both deliver
+        let (mut a, mut b) = (fast.clone(), fast.clone());
+        a.latency_ms = Some(10);
+        b.latency_ms = Some(400);
+        assert!(rank(Some(&a)) < rank(Some(&b)));
     }
 
     /// The rollback ratchet: forward only, per payload, and durable. It is the WHOLE floor — there
     /// is no build-time backstop under it any more (see the note in `trust.rs`).
     #[test]
     fn the_serial_ratchet_only_ever_moves_forward() {
-        use crate::trust::Payload;
         let mut s = Settings::default();
         assert_eq!(s.serial_floor(Payload::Mod), 0, "no history: nothing to roll back from");
 
@@ -597,15 +643,5 @@ mod tests {
         let round: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(round.get("token").is_none(), "no token may be written back to disk");
-    }
-
-    #[test]
-    fn migrate_dedupes_a_doubled_primary() {
-        let mut s = Settings {
-            sources: vec![Source::Primary, mirror("https://a", true), Source::Primary],
-            ..Settings::default()
-        };
-        s.migrate();
-        assert_eq!(s.sources.iter().filter(|x| x.is_primary()).count(), 1);
     }
 }

@@ -4,14 +4,17 @@
 //! variable, because a second source of one is what let a stale value outrank the baked one.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::config::Settings;
+use crate::config::{Settings, Source};
 use crate::downloader::Downloader;
 use crate::engine::{self, Action};
 use crate::github::Github;
-use crate::install;
+use crate::source::{self, Wire};
+use crate::trust::Payload;
+use crate::{install, manifest};
 
 fn settings_from_flags(flags: &[String]) -> (Settings, Option<String>) {
     let mut s = Settings::load();
@@ -36,81 +39,90 @@ fn settings_from_flags(flags: &[String]) -> (Settings, Option<String>) {
     (s, tag)
 }
 
-/// `sweep [--save]` — refresh the published mirror list and measure every source, headless.
+/// `sources [--save] [--mirror <url>]` — run the boot sequence headless and print the ranking.
 ///
-/// The only way to exercise the whole loop without the GUI, and the only way to seed a list at all
-/// now that mirrors are discovered rather than typed. `--save` persists the result, exactly as the
-/// settings pane does; without it nothing is written.
-pub fn run_sweep(flags: &[String]) -> Result<()> {
+/// The only way to exercise the whole loop without the GUI: bootstrap, refresh the published list
+/// from the ranking, measure whatever is due, sort. `--save` persists the result exactly as the
+/// GUI does; without it nothing is written, which is what makes this safe to run for a look.
+///
+/// There is no `--no-measure` any more, because there is no longer a decision to override: the
+/// sequence measures when something has no settled answer and not otherwise (`source::launch_set`),
+/// and a flag that forced it either way would be exercising a path the launcher never takes.
+pub fn run_sources(flags: &[String]) -> Result<()> {
     let (mut settings, _) = settings_from_flags(flags);
     // `--mirror <url>` seeds one for this run only. Mirrors are normally discovered, and discovery
-    // bootstraps from the primary — so without this there is no way to exercise the mirror side of
-    // the loop on a box that cannot reach the primary, which is the very situation it is for.
+    // bootstraps from GitHub — so without this there is no way to exercise the mirror side of the
+    // loop on a box that cannot reach GitHub, which is the very situation it is for.
     let mut it = flags.iter();
     while let Some(k) = it.next() {
         if k == "--mirror" {
             if let Some(url) = it.next().and_then(|u| crate::config::normalize_mirror_url(u)) {
-                settings.sources.push(crate::config::Source::Mirror { url, enabled: true, measured: false, payloads: Vec::new() });
+                settings.sources.push(Source::at(url));
             }
         }
     }
-    // `--no-measure` is the launch-time path: refresh the list only. Worth being able to run on
-    // its own, because its whole contract is that it must NOT disturb the speed ranking.
-    let measure = !flags.iter().any(|f| f == "--no-measure");
-    let sweep = crate::mirror::sweep(&settings, measure);
+    // The registry is what the walk reads, and nothing has booted here.
+    source::adopt(&settings.sources);
+    let outcome = source::refresh_and_measure(&settings);
 
-    if let Some(e) = &sweep.refresh_error {
+    if let Some(e) = source::snapshot().refresh_error {
         println!("mirror list not refreshed: {e}");
     }
-    // Resolved through config::active_index — the same call the download path will make, so this
-    // marker is the real answer to "which source gets used", not a second guess at it.
-    let active = crate::config::active_index(&sweep.sources, settings.selected.as_ref());
-    let mark = |i: usize, s: &crate::config::Source| {
-        format!(
-            "{}{}{}",
-            s.url().unwrap_or("<primary>"),
-            if s.enabled() { "" } else { "  (off)" },
-            if active == Some(i) { "  <- IN USE" } else { "" }
-        )
-    };
-
-    if !measure {
-        for (i, s) in sweep.sources.iter().enumerate() {
-            println!("{}", mark(i, s));
-        }
-        return Ok(());
-    }
-    for (i, (s, p)) in sweep.sources.iter().zip(sweep.probes.iter()).enumerate() {
-        let speed = match p.bytes_per_sec {
+    // The head of the ranking is what the next operation uses — there is no second resolution to
+    // guess at, which is the whole point of the model.
+    for (i, s) in outcome.sources().iter().enumerate() {
+        let in_use = if i == 0 { "  <- IN USE" } else { "" };
+        println!("{}{in_use}", s.key().unwrap_or("<github>"));
+        let Some(m) = &s.measured else {
+            println!("  NOT MEASURED");
+            continue;
+        };
+        let speed = match m.bytes_per_sec {
             Some(b) => format!("{:.2} MiB/s", b as f64 / (1024.0 * 1024.0)),
             None => "—".to_string(),
         };
         println!(
-            "{}\n  {:<8} latency {:>7}  speed {:>12}  range {:<3}  tag {}",
-            mark(i, s),
-            if p.healthy() { "HEALTHY" } else { "UNUSABLE" },
-            p.latency_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "—".into()),
+            "  {:<8} latency {:>7}  speed {:>12}  range {:<3}  tag {}",
+            if m.healthy() { "HEALTHY" } else { "UNUSABLE" },
+            m.latency_ms.map(|v| format!("{v}ms")).unwrap_or_else(|| "—".into()),
             speed,
-            if p.range_ok { "ok" } else { "NO" },
-            p.tag.as_deref().unwrap_or("—"),
+            if m.range_ok { "ok" } else { "NO" },
+            m.tag.as_deref().unwrap_or("—"),
         );
-        if let Some(e) = &p.error {
+        if let Some(e) = &m.error {
             println!("  error: {e}");
         }
     }
 
     if flags.iter().any(|f| f == "--save") {
-        // `false`: the headless sweep does not touch the user's pin — only the settings pane's own
-        // test button does, and only because pressing it asks for the ranking's answer.
-        sweep.persist(false)?;
-        println!("\nsaved {} source(s) to settings", sweep.sources.len());
+        outcome.persist()?;
+        println!("\nsaved {} source(s) to settings", outcome.sources().len());
     }
     Ok(())
 }
 
+/// A wire pinned to GITHUB, for the headless commands.
+///
+/// A repo override is meaningful to nothing else: a mirror is addressed by PAYLOAD DIRECTORY, so
+/// there is nothing for a repo name to override, and routing one at a mirror would quietly serve
+/// some other repo's tree under the name the operator typed. The GUI never overrides a repo and
+/// never takes this path.
+fn github_wire(settings: &Settings, repo: &str, payload: Payload, tag: Option<&str>) -> Result<Wire> {
+    let (owned, name) = (settings.clone(), repo.to_string());
+    Wire::with_dial(
+        Box::new(move |_| Arc::new(Github::for_repo(&owned, &name)) as Arc<dyn Downloader>),
+        vec![Source::default()],
+        settings,
+        repo,
+        payload,
+        tag,
+    )
+}
+
 pub fn run_check(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
-    let dl = Github::new(settings.token());
+    // Pinned to GitHub for the same reason `github_wire` is: `--repo` is a GitHub-only override.
+    let dl = Github::for_repo(&settings, &settings.source_repo);
     let r = engine::check(&settings, &dl, tag.as_deref())?;
     println!("Release {} (version {}) | changes {}", r.tag, r.version, r.changes());
     for f in &r.files {
@@ -129,11 +141,11 @@ pub fn run_check(flags: &[String]) -> Result<()> {
 
 pub fn run_install(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
-    let dl = Github::new(settings.token());
-    let r = install::install(&settings, &dl, tag.as_deref(), None, None, None)?;
+    let wire = github_wire(&settings, &settings.source_repo, Payload::Mod, tag.as_deref())?;
+    let r = install::install(&settings, &wire, None, None, None)?;
     println!("Installed {}: wrote {}, removed {}", r.version, r.written.len(), r.removed.len());
     // headless: warm the customization cache synchronously (the GUI runs this detached)
-    install::warm_cache(&settings, &dl);
+    install::warm_cache(&settings, &wire);
     Ok(())
 }
 
@@ -146,32 +158,27 @@ pub fn run_uninstall(flags: &[String]) -> Result<()> {
 
 // ---- base game (game-install / game-verify against Settings::game_repo) ----
 
-fn game_repo_manifest(
-    settings: &Settings,
-) -> Result<(Box<dyn Downloader>, crate::downloader::Release, crate::manifest::Manifest)> {
-    // Through `open_repo`, because the game repo is PUBLIC and the credential rule is not the GUI's
-    // private business: anonymous first, the baked token only once the server has actually refused.
-    // This used to build `Github::new(settings.token())` and so sent the token on every request —
-    // and the baked credential is scoped to the DIST repo, which a fine-grained PAT may be refused
-    // for here, failing `game-install` against a repo that would have served it anonymously.
-    // "Headless keeps auth simple" was the old justification; simple and wrong is not simpler.
-    let (dl, release) = crate::cmd::open_repo(settings.game_repo(), settings)?;
-    let manifest =
-        engine::manifest_of(settings, dl.as_ref(), &release, crate::trust::Payload::Game)?;
-    // file assets are sharded across prereleases (GitHub caps 1000 assets per release)
-    let release = engine::merged_game_release(dl.as_ref(), settings.game_repo(), release)?;
-    Ok((dl, release, manifest))
+/// The base game's wire and manifest, headless.
+///
+/// The SOURCE MODEL unless a repo was overridden — the game repo is public and a mirror serves it
+/// like any other payload, so there is no reason for the headless path to see a different set of
+/// sources from the GUI. `--game-repo` is the exception and pins to GitHub, because that is the
+/// only backend a repo name means anything to (see `github_wire`).
+fn game_wire(settings: &Settings, flags: &[String]) -> Result<(Wire, manifest::Manifest)> {
+    let pinned = flags.iter().any(|f| f == "--game-repo");
+    let wire = match pinned {
+        true => github_wire(settings, settings.game_repo(), Payload::Game, None)?,
+        false => Wire::open(settings, settings.game_repo(), Payload::Game, None)?,
+    };
+    let manifest = wire.manifest()?;
+    Ok((wire, manifest))
 }
 
 pub fn run_game_install(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let game_dir = settings.resolve_game_dir()?;
-    let (dl, release, manifest) = game_repo_manifest(&settings)?;
-    // ONE origin for the file downloads: `game_repo_manifest` walks the source chain to RESOLVE the
-    // release, and whichever source answered then serves every asset. Per-asset failover ACROSS
-    // sources mid-download is the GUI's business.
-    let origins = [install::Origin::new(dl.as_ref(), &release)];
-    let r = install::install_base(&game_dir, &origins, &manifest, None, None, None)?;
+    let (wire, manifest) = game_wire(&settings, flags)?;
+    let r = install::install_base(&game_dir, &wire, &manifest, None, None, None)?;
     println!(
         "Base game {} ({}): wrote {} ({} MB), up-to-date {}, skipped {}",
         r.version,
@@ -187,7 +194,7 @@ pub fn run_game_install(flags: &[String]) -> Result<()> {
 pub fn run_game_verify(flags: &[String]) -> Result<()> {
     let (settings, _tag) = settings_from_flags(flags);
     let game_dir = settings.resolve_game_dir()?;
-    let (_dl, _release, manifest) = game_repo_manifest(&settings)?;
+    let (_wire, manifest) = game_wire(&settings, flags)?;
     let statuses = install::base_plan(&game_dir, &manifest, None, "verify", None)?;
     let mut differing = 0;
     for s in &statuses {
