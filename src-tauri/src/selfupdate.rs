@@ -59,6 +59,11 @@ pub struct Available {
     /// above is read from. `None` for a release whose manifest carries none, and for the legacy
     /// shape that carries no manifest at all.
     pub notes: Option<String>,
+    /// The manifest this offer was judged by, VERIFIED, carried so the download that follows does
+    /// not fetch and verify it a second time. `None` is the legacy shape — a release publishing no
+    /// manifest at all — and it is what selects `resolve`'s sidecar branch, so the choice between
+    /// the two paths is made once, here, where the question is first asked.
+    pub manifest: Option<Manifest>,
 }
 
 fn exe_path() -> Result<PathBuf> {
@@ -138,6 +143,7 @@ pub fn available(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        manifest: signed,
     }))
 }
 
@@ -179,12 +185,12 @@ pub struct Staged {
 /// Installing the release the user was SHOWN (rather than re-resolving "latest") is deliberate:
 /// what the update button offers is what the update button installs.
 pub fn fetch_verified(
-    settings: &Settings,
     dl: &dyn Downloader,
     release: &Release,
+    manifest: Option<&Manifest>,
     progress: ChunkProgress,
 ) -> Result<Staged> {
-    fetch_verified_at(&exe_path()?, settings, dl, release, progress)
+    fetch_verified_at(&exe_path()?, dl, release, manifest, progress)
 }
 
 /// Move the verified binary into place and return the path to start — after the swap that path
@@ -198,15 +204,15 @@ pub fn swap_in(staged: &Staged) -> Result<PathBuf> {
 /// swap, rollback — against a scratch file instead of the running test binary.
 fn fetch_verified_at(
     exe: &Path,
-    settings: &Settings,
     dl: &dyn Downloader,
     release: &Release,
+    manifest: Option<&Manifest>,
     progress: ChunkProgress,
 ) -> Result<Staged> {
     let dir = exe.parent().context("the launcher executable has no parent directory")?;
     ensure_dir_writable(dir)?;
 
-    let Target { asset, sha256: expected, size: expected_size } = resolve(settings, dl, release)?;
+    let Target { asset, sha256: expected, size: expected_size } = resolve(dl, release, manifest)?;
 
     let new = sibling(exe, ".new.exe");
     // Deliberately never resumed. A `.part` left by an earlier attempt at a DIFFERENT version
@@ -305,6 +311,11 @@ struct Target {
 /// hand) instead of swapping in an unchecked binary. The size IS optional, and that is deliberate
 /// — see below.
 ///
+/// `manifest` is the one `available` already verified, HANDED here rather than fetched again: an
+/// update used to download and Ed25519-check the same document twice on the one path that is also
+/// downloading a multi-megabyte exe (three times counting the check that offered it). `None` is
+/// the legacy branch, and `available` is where that is decided — see `signed_manifest`.
+///
 /// TWO sources of the hash, and the SIGNED one wins. A `.minisig` over the launcher's manifest is
 /// a statement by a key we pinned; the `.sha256` sidecar is a statement by whoever served the
 /// release, which is exactly the party a mirror lets somebody else be. The sidecar is nonetheless
@@ -354,14 +365,13 @@ struct Target {
 /// game folder; the producer still emits a legal `dest` because the format demands one. `size`,
 /// unlike `dest`, IS read — it is the same trust input as `sha256`, just enforced during the
 /// transfer instead of after it (see `apply_at`).
-fn resolve(settings: &Settings, dl: &dyn Downloader, release: &Release) -> Result<Target> {
-    if release.asset(engine::MANIFEST_ASSET).is_none() {
+fn resolve(dl: &dyn Downloader, release: &Release, manifest: Option<&Manifest>) -> Result<Target> {
+    let Some(manifest) = manifest else {
         let asset = exe_asset(release)?.clone();
         let sha256 = legacy_sha(dl, release, &asset.name)?;
         return Ok(Target { asset, sha256, size: None });
-    }
-    let manifest = engine::manifest_of(settings, dl, release, Payload::Launcher)?;
-    let entry = exe_entry(&manifest, &release.tag_name)?;
+    };
+    let entry = exe_entry(manifest, &release.tag_name)?;
     let name = entry.name.as_deref().expect("exe_entry only ever returns a named entry");
     let asset = source::asset_for(dl, release, name, &entry.sha256, entry.size)
         .with_context(|| format!("release {} publishes no asset named {name}", release.tag_name))?;
@@ -847,7 +857,8 @@ mod tests {
         let dial: crate::source::Dial = Box::new(move |s: &Source| by_key[&s.url].clone());
 
         let staged = crate::source::walk(&dial, &sources, "r", None, |dl, release| {
-            fetch_verified_at(&exe, &settings(), dl, release, &mut |_, _| true)
+            let manifest = signed_manifest(&settings(), dl, release)?;
+            fetch_verified_at(&exe, dl, release, manifest.as_ref(), &mut |_, _| true)
         })
         .expect("the second source serves what the first promised");
         let out = swap_in(&staged).expect("and the swap runs once, outside the walk");
@@ -863,6 +874,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(std::env::temp_dir().join("phoenix-selfupdate-failover-liar"));
     }
 
+    /// ONE fetch and one signature check of the launcher manifest per update.
+    ///
+    /// `available` verifies it to decide whether the release is newer at all — the signed version
+    /// is what that judgement rests on — and the download then needs the same document to learn
+    /// which entry names the exe. Those were two independent fetch-and-verify rounds of identical
+    /// bytes, on the one path that is already pulling a multi-megabyte binary. The offer carries
+    /// the document it was judged by, and this is the production sequence exactly.
+    #[test]
+    fn the_launcher_manifest_is_verified_once_per_update() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        struct Counting {
+            inner: crate::downloader::fake::Fake,
+            reads: AtomicU32,
+        }
+        impl Downloader for Counting {
+            fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+                self.inner.fetch_release(r, t)
+            }
+            fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+                self.inner.fetch_releases(r)
+            }
+            fn download(&self, a: &Asset) -> Result<Vec<u8>> {
+                if a.name == engine::MANIFEST_ASSET {
+                    self.reads.fetch_add(1, Ordering::SeqCst);
+                }
+                self.inner.download(a)
+            }
+            fn download_to(
+                &self,
+                a: &Asset,
+                d: &Path,
+                r: u64,
+                p: ChunkProgress,
+            ) -> Result<(u64, String)> {
+                self.inner.download_to(a, d, r, p)
+            }
+        }
+
+        let body: &[u8] = b"MZ\x90\x00ONE VERIFICATION";
+        let sha = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(body));
+        let (dir, fake) = stage_signed("phoenix-selfupdate-once", body, &sha, "launcher");
+        let dl = Counting { inner: fake, reads: AtomicU32::new(0) };
+        let exe = dir.join("phoenix-launcher.exe");
+
+        let release = dl.fetch_release("r", None).unwrap();
+        let offer = available(&settings(), &dl, &release).unwrap().expect("999.0.0 is an upgrade");
+        let staged =
+            fetch_verified_at(&exe, &dl, &release, offer.manifest.as_ref(), &mut |_, _| true)
+                .expect("the offer's own manifest is what resolves the exe");
+        swap_in(&staged).unwrap();
+
+        assert_eq!(std::fs::read(&exe).unwrap(), body);
+        assert_eq!(
+            dl.reads.load(Ordering::SeqCst),
+            1,
+            "the manifest crosses the wire once for the whole update"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The two halves back to back, against a scratch exe: download + verify, then swap.
     ///
     /// They are separate in production because only the FIRST may be retried against another
@@ -876,7 +947,9 @@ mod tests {
         release: &Release,
         progress: ChunkProgress,
     ) -> Result<PathBuf> {
-        let staged = fetch_verified_at(exe, settings, dl, release, progress)?;
+        // The shell's own shape: the manifest is verified ONCE, up front, and handed on.
+        let manifest = signed_manifest(settings, dl, release)?;
+        let staged = fetch_verified_at(exe, dl, release, manifest.as_ref(), progress)?;
         swap_in(&staged)
     }
 
@@ -1156,7 +1229,8 @@ mod tests {
         let (dir, fake) = stage_signed("phoenix-selfupdate-shape-name", body, &hash, "launcher");
         assert!(!fake.content_addressed(), "the Fake stands in for GitHub: a release index");
         let release = fake.fetch_release("r", None).unwrap();
-        let t = resolve(&settings(), &fake, &release).expect("resolves on a name-addressed source");
+        let m = signed_manifest(&settings(), &fake, &release).unwrap();
+        let t = resolve(&fake, &release, m.as_ref()).expect("resolves on a name-addressed source");
         assert_eq!(t.asset.name, EXE_ASSET, "GitHub serves the exe under the asset name");
         assert_eq!(t.sha256, hash);
         assert_eq!(t.size, Some(body.len() as u64), "the signed size caps the transfer");
@@ -1170,7 +1244,9 @@ mod tests {
             release.asset(EXE_ASSET).is_none(),
             "a mirror publishes no index, so the exe cannot be found by name — that was the bug"
         );
-        let t = resolve(&settings(), &mirror, &release).expect("resolves on a content-addressed source");
+        let m = signed_manifest(&settings(), &mirror, &release).unwrap();
+        let t =
+            resolve(&mirror, &release, m.as_ref()).expect("resolves on a content-addressed source");
         assert_eq!(t.asset.name, hash, "a mirror serves the exe under its hash");
         assert_eq!(t.sha256, hash);
         assert_eq!(t.size, Some(body.len() as u64));

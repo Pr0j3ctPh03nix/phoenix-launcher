@@ -93,14 +93,19 @@ pub async fn launcher_update(
                 // Refuse to "update" to something that is not newer. Guards the pinned path too: a
                 // tag can be re-pointed at other bytes, and this is the only check that the release
                 // we are about to execute is an upgrade at all.
-                if selfupdate::available(&s, dl, release)?.is_none() {
+                let Some(offer) = selfupdate::available(&s, dl, release)? else {
                     anyhow::bail!(
                         "release {} is not newer than this build ({}) — check for updates again",
                         release.tag_name,
                         env!("CARGO_PKG_VERSION")
                     );
-                }
-                selfupdate::fetch_verified(&s, dl, release, &mut |d, t| emit(d, t))
+                };
+                // The manifest that judgement was made on, already verified: the download resolves
+                // the exe out of THAT document instead of fetching and Ed25519-checking a second
+                // copy of it on the one path that is also pulling a multi-megabyte binary.
+                selfupdate::fetch_verified(dl, release, offer.manifest.as_ref(), &mut |d, t| {
+                    emit(d, t)
+                })
             },
         )
         .map_err(CmdError::from)?;
