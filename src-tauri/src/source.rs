@@ -571,9 +571,15 @@ pub struct Wire {
     ranking: Vec<Source>,
     settings: Settings,
     dial: Dial,
+    /// LOCK ORDER: `tried` is ALWAYS taken before this one's write lock, and `manifest` and `fail`
+    /// — the only two that take both — do exactly that. It is not an arbitrary choice: `manifest`
+    /// walks with `tried` held (the walk owns that set for its whole length) and adopts each source
+    /// it opens under `inner`, so `tried` is necessarily the outer lock, and the other order
+    /// anywhere would be a deadlock two threads on one wire could reach. Reading `gen` under the
+    /// READ lock takes no `tried` and is free to happen first.
     inner: RwLock<Live>,
     /// Sources this run has given up on. Owned by the wire, not the registry: it is what makes
-    /// "each source is asked at most once per operation" structural.
+    /// "each source is asked at most once per operation" structural. The OUTER lock — see `inner`.
     tried: Mutex<HashSet<Option<String>>>,
 }
 
@@ -642,6 +648,12 @@ impl Wire {
         if self.inner.read().unwrap().gen != seen {
             return Ok(false);
         }
+        // `tried` BEFORE `inner`'s write lock — the wire's one lock order, stated on the fields.
+        // `manifest` holds `tried` for its whole walk and takes `inner` inside it, so taking them
+        // the other way round here would let a `fail` and a `manifest` on one wire hold each
+        // other's next lock. Nothing calls both at once today (every caller reads the manifest
+        // before the pool starts), which is exactly what would make the inversion sit there.
+        let mut tried = self.tried.lock().unwrap();
         let mut live = self.inner.write().unwrap();
         // Asked again, because the two locks are not one: the worker that WON the race may have
         // finished swapping in the gap between them.
@@ -649,7 +661,6 @@ impl Wire {
             return Ok(false);
         }
         report_failed(live.key.as_deref());
-        let mut tried = self.tried.lock().unwrap();
         tried.insert(live.key.clone());
         // Pinned to the tag this run opened with: a source serving a different release refuses
         // itself (`Mirror::fetch_release`, GitHub's tag lookup) and the walk moves past it.
@@ -690,9 +701,11 @@ impl Wire {
     /// after it is opened exactly as a mid-download swap opens it, pinned to the same tag, and the
     /// wire is left pointing at whichever one answered: the bytes follow the manifest.
     pub fn manifest(&self) -> Result<Manifest> {
-        // Held for the whole walk, which is also why nothing here calls `fail`: this walk advances
-        // the wire itself, over the same set, and a second lock on it would be this thread waiting
-        // for itself.
+        // Held for the whole walk — the walk owns this set for its length — which is why nothing
+        // here calls `fail`: that would take the same mutex again and this thread would wait for
+        // itself. It is also what fixes the wire's LOCK ORDER at `tried` before `inner`'s write
+        // lock, since the swap below happens inside this walk; `fail` takes them in that same
+        // order, and the fields say so.
         let mut tried = self.tried.lock().unwrap();
         each_source(&self.ranking, &mut tried, |source| {
             let live = {

@@ -2895,6 +2895,18 @@ mod tests {
             crate::source::snapshot().failed.contains(&Some("https://wire0.example".to_string())),
             "…and the refusal is reported as a source failure, like any other"
         );
+
+        // The manifest walk's swap is a REAL one, on the same wire the pool then pulls through: a
+        // worker still holding the generation it read beforehand is told somebody already
+        // switched…
+        assert!(
+            !wire.fail(0).expect("the wire is still on a source"),
+            "a report against a generation the manifest walk moved past must not swap again"
+        );
+        // …and failing the source it is actually on now exhausts the list, because that walk had
+        // already given up on the first. Both calls take the wire's two locks in its ONE order
+        // (`tried`, then `inner`); the other way round would hang here rather than answer.
+        assert!(wire.fail(1).is_err(), "both sources have been tried by now");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
