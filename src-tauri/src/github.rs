@@ -9,8 +9,10 @@
 use anyhow::{bail, Context, Result};
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use crate::config::Settings;
 use crate::downloader::{Asset, ChunkProgress, Downloader, NetKind, Release};
 use crate::transport::{self, FetchError};
 
@@ -26,15 +28,29 @@ const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// slack for a straggling background warm and the notes fetch — idle sockets cost nothing.
 const POOL_PER_HOST: usize = 12;
 
-/// The GitHub-backed `Downloader`. Holds the optional auth token and its pooled HTTP agent.
+/// The GitHub-backed `Downloader`. Holds the optional auth token, the rule for when to send it,
+/// and its pooled HTTP agent.
 ///
 /// The agent is stored, not built per request, because ureq keeps its CONNECTION POOL inside the
 /// Agent: a fresh one each time forces a full DNS + TCP + TLS handshake for every file. Measured
 /// against this repo's small assets that is 663 ms/file versus 159 ms/file pooled — a 4.2x
 /// difference, and the base game is thousands of small files where the handshake *is* the
 /// transfer time. Construct one Github and reuse it (install/warm already do).
+///
+/// THE CREDENTIAL RULE LIVES HERE, and this is the only type that can hold a credential at all —
+/// a mirror has no field for one (`mirror::Mirror`). It used to live in the command layer, spread
+/// over a `Candidate` and a walk, where every caller that reached for a backend directly bypassed
+/// it; keeping it in the backend means there is nowhere left to bypass it from.
 pub struct Github {
     token: Option<String>,
+    /// Send the credential on the FIRST request. True only for the private source repo: anonymous
+    /// there is a round trip spent to be refused, on every check. Everything else is public and a
+    /// repo-scoped PAT can be REFUSED where anonymous succeeds.
+    lead_with_token: bool,
+    /// Latched once a token attempt succeeded where anonymous was refused, so the asset download
+    /// that follows takes the same authenticated path the release lookup did. Atomic, not `&mut`,
+    /// because `Downloader` is `&self` and the download pool shares one instance.
+    authed: AtomicBool,
     /// Built with ZERO auto-follow — every redirect, for every request (API calls, public asset
     /// URLs, and the private-asset path's own manual first hop), goes through `transport::fetch`
     /// instead. See that module's doc comment for why ureq's own `.redirects(N)` is not safe to
@@ -43,11 +59,28 @@ pub struct Github {
 }
 
 impl Github {
-    pub fn new(token: Option<&str>) -> Self {
-        Self { token: token.map(str::to_string), agent: agent() }
+    /// The backend for `repo`, credential rule applied. THE one place that rule is decided.
+    pub fn for_repo(settings: &Settings, repo: &str) -> Self {
+        let token = settings.token();
+        Self {
+            lead_with_token: lead_with_token(token, repo, &settings.source_repo),
+            ..Self::new(token)
+        }
     }
 
-    /// The first `bytes` of an asset, for the mirror probe: whether the range was honoured (206)
+    /// A backend with an EXPLICIT credential, and no rule: whatever it is handed, it leads with.
+    /// For tests, and for a caller that has already decided (there is one place a token is chosen
+    /// — `Settings::token` — so "decided" only ever means `for_repo`).
+    pub fn new(token: Option<&str>) -> Self {
+        Self {
+            token: token.map(str::to_string),
+            lead_with_token: token.is_some(),
+            authed: AtomicBool::new(false),
+            agent: agent(),
+        }
+    }
+
+    /// The first `bytes` of an asset, for the source probe: whether the range was honoured (206)
     /// and the body reader.
     ///
     /// It goes through `asset_response` rather than fetching the URL directly so it takes the
@@ -64,21 +97,72 @@ impl Github {
         Ok((resp.status() == 206, resp.into_reader()))
     }
 
+    /// The credential to send WITHOUT asking first: the private source repo's, or one a refusal
+    /// has already proved is needed here. `None` means ask anonymously.
+    fn upfront(&self) -> Option<&str> {
+        (self.lead_with_token || self.authed.load(Ordering::Relaxed))
+            .then(|| self.token.as_deref())
+            .flatten()
+    }
+
+    /// One API call, anonymously then with credentials if the server REFUSED.
+    ///
+    /// A private repo answers 404, indistinguishable from missing, so an HTTP refusal earns the
+    /// retry and nothing else does: credentials can turn a 404 into a 200 but cannot fix DNS, and
+    /// an offline launcher must not pay two connect timeouts. A retry that WORKS latches
+    /// (`authed`), so the asset download that follows takes the path the release lookup proved
+    /// rather than repeating the refusal per file.
+    fn with_credentials<T>(&self, call: impl Fn(Option<&str>) -> Result<T>) -> Result<T> {
+        if let Some(t) = self.upfront() {
+            return call(Some(t));
+        }
+        let e = match call(None) {
+            Ok(v) => return Ok(v),
+            Err(e) => e,
+        };
+        let refused =
+            e.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(_))));
+        let (Some(t), true) = (self.token.as_deref(), refused) else { return Err(e) };
+        let v = call(Some(t)).context("tried anonymously and with a token")?;
+        self.authed.store(true, Ordering::Relaxed);
+        Ok(v)
+    }
+
     /// Common headers for an API request, attaching `Authorization` only when `same_origin` — the
-    /// bearer token this struct holds is minted for `api.github.com` and must not ride along to a
-    /// redirect target that leaves it (a repo rename is the one real case the API might redirect
-    /// on at all; storage redirects, which are exactly the case that must NOT keep it, go through
+    /// bearer token is minted for `api.github.com` and must not ride along to a redirect target
+    /// that leaves it (a repo rename is the one real case the API might redirect on at all;
+    /// storage redirects, which are exactly the case that must NOT keep it, go through
     /// `asset_response`'s own manual first hop instead and never call this).
-    fn api_headers(&self, req: ureq::Request, same_origin: bool) -> ureq::Request {
+    ///
+    /// `token` is a parameter rather than a field read, because whether THIS attempt authenticates
+    /// is `with_credentials`'s decision and changes between the two attempts of one call.
+    fn api_headers(
+        &self,
+        req: ureq::Request,
+        same_origin: bool,
+        token: Option<&str>,
+    ) -> ureq::Request {
         let req = req
             .set("User-Agent", UA)
             .set("Accept", "application/vnd.github+json")
             .set("X-GitHub-Api-Version", "2022-11-28");
-        match (self.token.as_deref(), same_origin) {
+        match (token, same_origin) {
             (Some(t), true) => req.set("Authorization", &format!("Bearer {t}")),
             _ => req,
         }
     }
+}
+
+/// Should the very first request carry the credential, instead of earning it after a refusal?
+///
+/// Only for the SOURCE repo. That is the one the baked credential is scoped to and the one that is
+/// private, so anonymous there is a round trip that exists only to be refused. Everything else is
+/// public, and a repo-scoped credential can be REFUSED where anonymous access succeeds — so those
+/// keep asking anonymously first. A free function so the rule is testable without a credential
+/// baked into the test binary (`Settings::token` is `option_env!`, i.e. `None` in every build a
+/// test runs in).
+fn lead_with_token(token: Option<&str>, repo: &str, source_repo: &str) -> bool {
+    token.is_some() && repo == source_repo
 }
 
 fn agent() -> ureq::Agent {
@@ -176,7 +260,12 @@ fn asset_response(gh: &Github, asset: &Asset, range: Option<String>) -> Result<u
         Some(v) => req.set("Range", v),
         None => req,
     };
-    let Some(t) = gh.token.as_deref() else {
+    // `upfront`, not the raw token: an asset download takes the path the RELEASE LOOKUP already
+    // proved — the private repo's, or the one a refusal latched. Anonymous is not merely the
+    // fallback here, it is the better route for a public repo (the tokenless
+    // `browser_download_url` rides free CDN bandwidth and no API rate budget), so a backend that
+    // simply had a token must not spend it on every file.
+    let Some(t) = gh.upfront() else {
         return transport::fetch(&gh.agent, &asset.browser_download_url, |req, _same_origin| {
             with_range(req.set("User-Agent", UA))
         })
@@ -220,17 +309,28 @@ impl Downloader for Github {
     /// List releases, newest first (GitHub's order). One page, up to 100 — plenty for this project.
     fn fetch_releases(&self, repo: &str) -> Result<Vec<Release>> {
         let url = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
-        let resp = transport::fetch(&self.agent, &url, |req, same_origin| self.api_headers(req, same_origin))
-            .map_err(net_err_fetch)?;
-        resp.into_json().context("parsing the releases JSON")
+        self.with_credentials(|token| {
+            let resp =
+                transport::fetch(&self.agent, &url, |req, same_origin| {
+                    self.api_headers(req, same_origin, token)
+                })
+                .map_err(net_err_fetch)?;
+            resp.into_json().context("parsing the releases JSON")
+        })
     }
 
-    /// Fetch a release by tag (or the latest). `token` is only required for private repos.
+    /// Fetch a release by tag (or the latest). A private repo answers 404 anonymously, so this
+    /// goes through `with_credentials` rather than deciding for itself.
     fn fetch_release(&self, repo: &str, tag: Option<&str>) -> Result<Release> {
         let url = api_url(repo, tag);
-        let resp = transport::fetch(&self.agent, &url, |req, same_origin| self.api_headers(req, same_origin))
-            .map_err(net_err_fetch)?;
-        resp.into_json().context("parsing the release JSON")
+        self.with_credentials(|token| {
+            let resp =
+                transport::fetch(&self.agent, &url, |req, same_origin| {
+                    self.api_headers(req, same_origin, token)
+                })
+                .map_err(net_err_fetch)?;
+            resp.into_json().context("parsing the release JSON")
+        })
     }
 
     /// Download an asset into memory (small files, e.g. manifest.json).
@@ -389,7 +489,7 @@ mod tests {
         transport::fetch(
             &test_agent(),
             &format!("http://127.0.0.1:{}/same", same_host_server.port),
-            |req, same_origin| gh.api_headers(req, same_origin),
+            |req, same_origin| gh.api_headers(req, same_origin, gh.upfront()),
         )
         .expect("same-host redirect should succeed");
         assert!(
@@ -400,7 +500,7 @@ mod tests {
         transport::fetch(
             &test_agent(),
             &format!("http://127.0.0.1:{}/cross", cross_host_server.port),
-            |req, same_origin| gh.api_headers(req, same_origin),
+            |req, same_origin| gh.api_headers(req, same_origin, gh.upfront()),
         )
         .expect("cross-host redirect should still succeed, just without the token");
         assert!(
@@ -445,7 +545,7 @@ mod tests {
         // server is a plain-HTTP loopback listener, which cannot speak TLS. The cap under test is
         // a read-length bound, independent of the scheme check that refuses `http://` in
         // production (proven separately by `github_agent_refuses_non_https_urls_cleanly`).
-        let gh = Github { token: None, agent: test_agent() };
+        let gh = Github { agent: test_agent(), ..Github::new(None) };
         let asset = Asset {
             name: "endless".into(),
             url: String::new(),
@@ -458,5 +558,89 @@ mod tests {
             err.to_string().contains("larger than"),
             "expected the size-cap refusal, got: {err}"
         );
+    }
+
+    // ---- the credential rule, which now lives in this file ----
+
+    /// A private repo answers 404, indistinguishable from missing, so an HTTP REFUSAL earns a
+    /// second try with a token — and nothing else does, because credentials can turn a 404 into a
+    /// 200 but cannot fix DNS, and an offline launcher must not pay two connect timeouts.
+    ///
+    /// Over `with_credentials` itself rather than a socket: the rule is about WHICH attempts are
+    /// made, and the transport it would be made over has nothing to say about that.
+    #[test]
+    fn a_refusal_earns_the_credential_retry_and_being_offline_does_not() {
+        let gh = Github { lead_with_token: false, ..Github::new(Some("t")) };
+        let seen = std::sync::Mutex::new(Vec::<Option<String>>::new());
+        let answer = |kind: NetKind| {
+            move |token: Option<&str>| -> Result<&'static str> {
+                match token {
+                    Some(_) => Ok("served"),
+                    None => Err(anyhow::Error::new(kind).context("scripted refusal")),
+                }
+            }
+        };
+
+        let refused = answer(NetKind::Status(404));
+        let got = gh.with_credentials(|t| {
+            seen.lock().unwrap().push(t.map(str::to_string));
+            refused(t)
+        });
+        assert_eq!(got.unwrap(), "served");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [None, Some("t".to_string())],
+            "anonymously first, then with the credential"
+        );
+
+        let gh = Github { lead_with_token: false, ..Github::new(Some("t")) };
+        let seen = std::sync::Mutex::new(Vec::<Option<String>>::new());
+        let dark = answer(NetKind::Transport);
+        let got = gh.with_credentials(|t| {
+            seen.lock().unwrap().push(t.map(str::to_string));
+            dark(t)
+        });
+        assert!(got.is_err(), "an unreachable host is not a credentials problem");
+        assert_eq!(*seen.lock().unwrap(), [None], "…so it is asked exactly once");
+    }
+
+    /// The private source repo cannot answer anonymously, so asking it that way first is a round
+    /// trip spent to be refused on every check. It gets the credential immediately — and nothing
+    /// else does, because the launcher and game repos are public and a repo-scoped credential can
+    /// be refused where anonymous access works.
+    #[test]
+    fn only_the_source_repo_leads_with_the_credential() {
+        let (tok, src) = (Some("t"), "Pr0j3ctPh03nix/client-dist-staging");
+        assert!(lead_with_token(tok, src, src), "the private source repo leads with the token");
+        assert!(
+            !lead_with_token(tok, "Pr0j3ctPh03nix/phoenix-launcher", src),
+            "a public repo must still be asked anonymously first"
+        );
+        assert!(
+            !lead_with_token(None, src, src),
+            "with no credential there is nothing to lead with"
+        );
+    }
+
+    /// Once a refusal has been answered by the credential, the ASSET download that follows takes
+    /// the same path — `asset_response` reads `upfront()`, so a private release whose lookup only
+    /// worked authenticated does not go on to fetch its files anonymously and 404 every one of
+    /// them. The latch is per-backend, which is exactly the lifetime of one operation.
+    #[test]
+    fn the_credential_latches_for_the_asset_download_that_follows() {
+        let gh = Github { lead_with_token: false, ..Github::new(Some("t")) };
+        assert_eq!(gh.upfront(), None, "nothing has been proved yet");
+        gh.with_credentials(|token| match token {
+            Some(_) => Ok(()),
+            None => Err(anyhow::Error::new(NetKind::Status(404)).context("private")),
+        })
+        .expect("the credential retry serves it");
+        assert_eq!(gh.upfront(), Some("t"), "and the download that follows inherits it");
+
+        // a backend that never had to authenticate stays anonymous: on a public repo the
+        // tokenless browser_download_url is the better route, not merely the fallback
+        let gh = Github { lead_with_token: false, ..Github::new(Some("t")) };
+        gh.with_credentials(|_| Ok(())).unwrap();
+        assert_eq!(gh.upfront(), None);
     }
 }

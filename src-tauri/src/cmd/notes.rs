@@ -37,7 +37,7 @@ pub async fn release_notes(
             engine::NOTES_FILE_SHIM,
             current_tag,
             |known| {
-                let dl = Github::new(settings.token());
+                let dl = Github::for_repo(&settings, &settings.source_repo);
                 engine::fetch_notes_history(&settings, &dl, known)
             },
         )

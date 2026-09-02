@@ -150,7 +150,7 @@ pub async fn game_install(
 
         // chain the shim: its own repo, its own credentials
         let settings = Settings::load();
-        let shim_dl = Github::new(settings.token());
+        let shim_dl = Github::for_repo(&settings, &settings.source_repo);
         let shim =
             install::install(&settings, &shim_dl, None, Some(&emit), Some(&st.game_cancel), None);
         let shim_version = match shim {
@@ -163,7 +163,7 @@ pub async fn game_install(
                 // warm optional content detached, exactly like a normal apply
                 tauri::async_runtime::spawn_blocking(|| {
                     let settings = Settings::load();
-                    let dl = Github::new(settings.token());
+                    let dl = Github::for_repo(&settings, &settings.source_repo);
                     install::warm_cache(&settings, &dl);
                 });
                 Some(r.version)
@@ -314,7 +314,7 @@ pub async fn phoenix_keep(
         // Intact-ness is judged against the SHIM manifest here; unreachable means we cannot tell,
         // and a pin on a file that turns out to be intact is harmless (it matches, so it never
         // reports as a difference in the first place).
-        let dl = Github::new(settings.token());
+        let dl = Github::for_repo(&settings, &settings.source_repo);
         let resolved: Option<std::collections::HashMap<String, String>> =
             engine::fetch(&settings, &dl, None).ok().map(|(_, m)| {
                 engine::resolve(&m, &settings.selections)
@@ -700,7 +700,7 @@ fn shim_plan(
     settings: &Settings,
     game_dir: &std::path::Path,
 ) -> Option<(Vec<FileStateView>, Vec<String>)> {
-    let dl = Github::new(settings.token());
+    let dl = Github::for_repo(settings, &settings.source_repo);
     let (_release, manifest) = engine::fetch(settings, &dl, None).ok()?;
     let resolved = engine::resolve(&manifest, &settings.selections);
     let prev = crate::state::InstalledState::load(game_dir);

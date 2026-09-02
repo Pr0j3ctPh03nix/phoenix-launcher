@@ -15,7 +15,7 @@ pub mod update;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result as AnyResult};
+use anyhow::Result as AnyResult;
 
 use crate::config::{self, Settings, Source};
 use crate::downloader::{Downloader, NetKind, Release};
@@ -85,8 +85,9 @@ pub fn open_all(repo: &str, settings: &Settings) -> AnyResult<Vec<Opened>> {
     let mut opened = Vec::new();
     let mut err = None;
     for candidate in candidates(settings, repo) {
-        match try_candidate(&candidate, |dl| dl.fetch_release(repo, None)) {
-            Ok((dl, release)) => opened.push(Opened { dl, release }),
+        let dl = (candidate.open)();
+        match dl.fetch_release(repo, None) {
+            Ok(release) => opened.push(Opened { dl, release }),
             Err(e) => {
                 // The same rule `walk_sources` follows, and for the same reason: a definite answer
                 // from the authoritative source ends everything, whatever a mirror would have
@@ -116,31 +117,15 @@ pub fn open_all(repo: &str, settings: &Settings) -> AnyResult<Vec<Opened>> {
 /// can reach.
 struct Candidate<'a> {
     open: Box<dyn Fn() -> Box<dyn Downloader> + 'a>,
-    /// The same source re-tried WITH credentials — GitHub only. A private repo answers 404, which
-    /// is indistinguishable from missing, so an HTTP refusal earns this retry; nothing else does,
-    /// because credentials can turn a 404 into a 200 but cannot fix DNS, and offline must not pay
-    /// two connect timeouts.
-    credentials: Option<Box<dyn Fn() -> Box<dyn Downloader> + 'a>>,
     /// Does a DEFINITE answer from this source end the walk?
     ///
-    /// True for the primary and only the primary. A refusal it gives after the credential retry is
-    /// a real answer about the release — "there is no such release", "you may not have it" — and
-    /// falling past that to a mirror, which might serve some other release entirely, would be
-    /// worse than reporting it. A mirror is never authoritative in either direction: its 404 says
-    /// only that THIS host does not carry the payload, which is precisely what the next source is
-    /// for. Being unREACHABLE is not a definite answer from anyone, so it always falls through.
+    /// True for the primary and only the primary. A refusal it gives is a real answer about the
+    /// release — "there is no such release", "you may not have it" — and falling past that to a
+    /// mirror, which might serve some other release entirely, would be worse than reporting it. A
+    /// mirror is never authoritative in either direction: its 404 says only that THIS host does
+    /// not carry the payload, which is precisely what the next source is for. Being unREACHABLE is
+    /// not a definite answer from anyone, so it always falls through.
     authoritative: bool,
-}
-
-/// Should the very first request carry the credential, instead of earning it after a refusal?
-///
-/// Only for the SOURCE repo. That is the one the baked credential is scoped to and the one that is
-/// private, so anonymous there is a round trip that exists only to be refused. Everything else is
-/// public, and a repo-scoped credential can be REFUSED where anonymous access succeeds — so those
-/// keep asking anonymously first. Split out from `candidates` so the rule is testable without a
-/// credential baked into the test binary.
-fn authenticate_first(token: Option<&str>, repo: &str, source_repo: &str) -> bool {
-    token.is_some() && repo == source_repo
 }
 
 /// The sources for `repo`, in priority order.
@@ -155,25 +140,15 @@ fn authenticate_first(token: Option<&str>, repo: &str, source_repo: &str) -> boo
 /// primary alone and every rule below degenerates to what it always was — and only for a repo whose
 /// PAYLOAD this build can name: a mirror is addressed `<base>/<payload>/…`, so a repo that maps to
 /// no payload (the debug CLI's `--repo`) has no mirror path to build at all.
+///
+/// The GitHub candidate carries no credential logic of its own any more: `Github::for_repo` IS the
+/// credential rule (anonymous first, the token only once the server has refused; the private
+/// source repo leads with it), and it lives in the backend so that a caller reaching for one
+/// directly cannot bypass it.
 fn candidates<'a>(settings: &'a Settings, repo: &str) -> Vec<Candidate<'a>> {
-    let token = settings.token();
-    // AUTHENTICATED FIRST, but only for the SOURCE repo. That is the one the baked credential is
-    // scoped to and the one that is private, so an anonymous attempt there cannot succeed — it is
-    // a guaranteed round trip spent to be refused, on every check, before the retry that was always
-    // going to be the answer. Every other repo (launcher, game) is public and keeps anonymous
-    // first, because a repo-scoped credential can be REFUSED where anonymous access works.
-    let authed_first = authenticate_first(token, repo, &settings.source_repo);
-    let with_token = |t: &'a str| {
-        Box::new(move || Box::new(Github::new(Some(t))) as Box<dyn Downloader>)
-            as Box<dyn Fn() -> Box<dyn Downloader> + 'a>
-    };
+    let owned = repo.to_string();
     let primary = Candidate {
-        open: match (authed_first, token) {
-            (true, Some(t)) => with_token(t),
-            _ => Box::new(|| Box::new(Github::new(None)) as Box<dyn Downloader>),
-        },
-        // Already authenticated => nothing left to retry with.
-        credentials: if authed_first { None } else { token.map(with_token) },
+        open: Box::new(move || Box::new(Github::for_repo(settings, &owned)) as Box<dyn Downloader>),
         authoritative: true,
     };
     let Some(payload) = settings.payload_of(repo).filter(|_| mirror::MIRROR_DOWNLOADS_ENABLED)
@@ -197,42 +172,15 @@ fn candidates<'a>(settings: &'a Settings, repo: &str) -> Vec<Candidate<'a>> {
         .filter(|s| s.enabled() && s.carries(payload))
     {
         match source {
-            // The primary keeps its own credential rule wherever the ranking puts it.
             Source::Primary => out.extend(primary.take()),
             Source::Mirror { url, .. } => out.push(Candidate {
                 open: Box::new(move || Box::new(Mirror::new(url, payload))),
-                credentials: None,
                 authoritative: false,
             }),
         }
     }
     out.extend(primary); // a source list somehow without a Primary still gets one, last
     out
-}
-
-/// One candidate's whole attempt: anonymously, then with credentials if it was REFUSED.
-///
-/// ANONYMOUS FIRST, token second: the launcher and game repos are meant to be public, and the dist
-/// token may be a fine-grained PAT scoped to the dist repo alone — sending it could be refused
-/// where anonymous access succeeds.
-fn try_candidate<T>(
-    candidate: &Candidate,
-    call: impl Fn(&dyn Downloader) -> AnyResult<T>,
-) -> AnyResult<(Box<dyn Downloader>, T)> {
-    let dl = (candidate.open)();
-    match call(dl.as_ref()) {
-        Ok(v) => Ok((dl, v)),
-        Err(e) => {
-            let refused =
-                e.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Status(_))));
-            let (true, Some(with_creds)) = (refused, candidate.credentials.as_ref()) else {
-                return Err(e);
-            };
-            let auth = with_creds();
-            let v = call(auth.as_ref()).context("tried anonymously and with a token")?;
-            Ok((auth, v))
-        }
-    }
 }
 
 /// Is this failure a source being DARK rather than a source ANSWERING?
@@ -265,8 +213,9 @@ fn walk_sources<T>(
     let mut first_err: Option<anyhow::Error> = None;
     let mut authoritative_err: Option<anyhow::Error> = None;
     for candidate in chain {
-        let err = match try_candidate(candidate, &call) {
-            Ok(v) => return Ok(v),
+        let dl = (candidate.open)();
+        let err = match call(dl.as_ref()) {
+            Ok(v) => return Ok((dl, v)),
             Err(e) => e,
         };
         // Anything that is not the source being dark IS an answer, and an answer from the
@@ -413,17 +362,9 @@ mod tests {
 
     /// One link of a test chain. The `Arc` is what lets the test still read the peer's call count
     /// after the walk has taken ownership of the box it handed out.
-    fn link(peer: &Arc<Peer>, authoritative: bool, creds: Option<&Arc<Peer>>) -> Candidate<'static> {
+    fn link(peer: &Arc<Peer>, authoritative: bool) -> Candidate<'static> {
         let open = peer.clone();
-        Candidate {
-            open: Box::new(move || Box::new(open.clone())),
-            credentials: creds.map(|c| {
-                let c = c.clone();
-                Box::new(move || Box::new(c.clone()) as Box<dyn Downloader>)
-                    as Box<dyn Fn() -> Box<dyn Downloader>>
-            }),
-            authoritative,
-        }
+        Candidate { open: Box::new(move || Box::new(open.clone())), authoritative }
     }
 
     fn walk(chain: &[Candidate]) -> AnyResult<Release> {
@@ -435,7 +376,7 @@ mod tests {
     #[test]
     fn a_source_that_cannot_be_reached_falls_through_to_the_next() {
         let (down, up) = (Peer::failing(NetKind::Transport), Peer::serving());
-        let chain = [link(&down, true, None), link(&up, false, None)];
+        let chain = [link(&down, true), link(&up, false)];
         assert_eq!(walk(&chain).expect("the second source serves it").tag_name, "v1.0.0");
         assert_eq!(down.calls(), 1);
         assert_eq!(up.calls(), 1);
@@ -447,7 +388,7 @@ mod tests {
     #[test]
     fn a_refusal_from_the_authoritative_source_ends_the_walk() {
         let (refused, mirror) = (Peer::failing(NetKind::Status(404)), Peer::serving());
-        let chain = [link(&refused, true, None), link(&mirror, false, None)];
+        let chain = [link(&refused, true), link(&mirror, false)];
         assert!(walk(&chain).is_err());
         assert_eq!(mirror.calls(), 0, "a mirror must not be asked past a definite answer");
     }
@@ -457,7 +398,7 @@ mod tests {
     #[test]
     fn a_mirrors_refusal_is_only_about_that_mirror() {
         let (stale, primary) = (Peer::failing(NetKind::Status(404)), Peer::serving());
-        let chain = [link(&stale, false, None), link(&primary, true, None)];
+        let chain = [link(&stale, false), link(&primary, true)];
         assert!(walk(&chain).is_ok(), "a stale mirror ranked first must not brick the check");
         assert_eq!(primary.calls(), 1);
     }
@@ -468,46 +409,13 @@ mod tests {
     fn an_exhausted_chain_reports_the_authoritative_failure() {
         let (mirror, primary) =
             (Peer::failing(NetKind::Status(503)), Peer::failing(NetKind::Transport));
-        let chain = [link(&mirror, false, None), link(&primary, true, None)];
+        let chain = [link(&mirror, false), link(&primary, true)];
         let err = walk(&chain).unwrap_err();
         assert!(
             err.chain().any(|c| matches!(c.downcast_ref::<NetKind>(), Some(NetKind::Transport))),
             "expected the primary's transport failure, got: {err:#}"
         );
         assert!(format!("{err:#}").contains("the release"));
-    }
-
-    /// The credential rule, which the chain must not have dissolved: a private repo answers 404,
-    /// indistinguishable from missing, so an HTTP REFUSAL earns a second try with a token — and
-    /// nothing else does, because credentials can turn a 404 into a 200 but cannot fix DNS, and an
-    /// offline launcher must not pay two connect timeouts.
-    #[test]
-    fn a_refusal_earns_the_token_retry_and_being_offline_does_not() {
-        let (anon, auth) = (Peer::failing(NetKind::Status(404)), Peer::serving());
-        assert!(walk(&[link(&anon, true, Some(&auth))]).is_ok());
-        assert_eq!(auth.calls(), 1, "a refusal is retried with credentials");
-
-        let (offline, unused) = (Peer::failing(NetKind::Transport), Peer::serving());
-        assert!(walk(&[link(&offline, true, Some(&unused))]).is_err());
-        assert_eq!(unused.calls(), 0, "an unreachable host is not a credentials problem");
-    }
-
-    /// The private source repo cannot answer anonymously, so asking it that way first is a round
-    /// trip spent to be refused on every check. It gets the credential immediately — and nothing
-    /// else does, because the launcher and game repos are public and a repo-scoped credential can
-    /// be refused where anonymous access works.
-    #[test]
-    fn only_the_source_repo_is_asked_with_credentials_first() {
-        let (tok, src) = (Some("t"), "Pr0j3ctPh03nix/client-dist-staging");
-        assert!(authenticate_first(tok, src, src), "the private source repo leads with the token");
-        assert!(
-            !authenticate_first(tok, "Pr0j3ctPh03nix/phoenix-launcher", src),
-            "a public repo must still be asked anonymously first"
-        );
-        assert!(
-            !authenticate_first(None, src, src),
-            "with no credential there is nothing to lead with"
-        );
     }
 
     /// The deployment gate. `MIRROR_DOWNLOADS_ENABLED` is false, so no configured mirror may enter

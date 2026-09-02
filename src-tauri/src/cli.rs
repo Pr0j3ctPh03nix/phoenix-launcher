@@ -110,7 +110,7 @@ pub fn run_sweep(flags: &[String]) -> Result<()> {
 
 pub fn run_check(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
-    let dl = Github::new(settings.token());
+    let dl = Github::for_repo(&settings, &settings.source_repo);
     let r = engine::check(&settings, &dl, tag.as_deref())?;
     println!("Release {} (version {}) | changes {}", r.tag, r.version, r.changes());
     for f in &r.files {
@@ -129,7 +129,7 @@ pub fn run_check(flags: &[String]) -> Result<()> {
 
 pub fn run_install(flags: &[String]) -> Result<()> {
     let (settings, tag) = settings_from_flags(flags);
-    let dl = Github::new(settings.token());
+    let dl = Github::for_repo(&settings, &settings.source_repo);
     let r = install::install(&settings, &dl, tag.as_deref(), None, None, None)?;
     println!("Installed {}: wrote {}, removed {}", r.version, r.written.len(), r.removed.len());
     // headless: warm the customization cache synchronously (the GUI runs this detached)
