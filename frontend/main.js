@@ -77,7 +77,7 @@ function renderNotes(md) {
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (_, txt, url) =>
       /^https?:\/\//i.test(url) ? `<a href="#" data-url="${url}">${txt}</a>` : txt);
     s = s.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
-    // single-* italics only вЂ” _underscores_ stay literal (file_names are common in changelogs)
+    // single-* italics only — _underscores_ stay literal (file_names are common in changelogs)
     s = s.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
     return s.replace(/\x00(\d+)\x00/g, (_, i) => `<code>${codes[i]}</code>`);
   };
@@ -1421,7 +1421,7 @@ function renderCandidates(found) {
 function cancelAutofind() {
   invoke("autofind_cancel").catch(() => {});
   // Stop button: the running scan returns what it found so far; results stage follows from
-  // runAutofind(). (Escape cancels AND closes вЂ” runAutofind then discards the results.)
+  // runAutofind(). (Escape cancels AND closes — runAutofind then discards the results.)
 }
 
 // ---- base game: fresh download / verify / repair ----
@@ -3847,7 +3847,7 @@ async function boot() {
     const gs = await invoke("game_dir_status");
     // setup only when nothing was ever chosen AND the exe isn't sitting next to a game
     firstRun = !gs.configured && !gs.clientVersion;
-  } catch (e) { /* resolve failed вЂ” treat as first run */ firstRun = true; }
+  } catch (e) { /* resolve failed — treat as first run */ firstRun = true; }
   return firstRun;
 }
 
@@ -3859,7 +3859,7 @@ requestAnimationFrame(() =>
     try {
       await window.__TAURI__.window.getCurrentWindow().show();
     } catch (e) {
-      /* API shape differs вЂ” ignore; not fatal */
+      /* API shape differs — ignore; not fatal */
     }
     setTimeout(() => {
       $("loader").classList.add("hidden");

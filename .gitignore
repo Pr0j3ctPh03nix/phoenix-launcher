@@ -1,5 +1,7 @@
-# Rust / Tauri build output
+# Rust / Tauri build output. Both roots: cargo's default lands under src-tauri/, and a build run
+# with CARGO_TARGET_DIR pointed at the repo root (worktree builds do this) lands here.
 /src-tauri/target/
+/target/
 /src-tauri/gen/
 
 # Node
