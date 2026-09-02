@@ -522,7 +522,8 @@ mod tests {
         assert_eq!(
             s.sources,
             vec![Source::default(), Source::at("https://fi1.example")],
-            "both survive, unmeasured — a v1 bool says nothing this model can use, and a v1              DISABLED mirror comes back usable because there is no such concept any more"
+            "both survive, unmeasured — a v1 bool says nothing this model can use, and a v1 \
+             DISABLED mirror comes back usable because there is no such concept any more"
         );
 
         // and the dead keys retire themselves rather than accumulating on disk
@@ -585,7 +586,9 @@ mod tests {
         assert_eq!(
             rank(None),
             rank(Some(&dead)),
-            "never measured and measured-and-failed are the same non-answer to a SORT; what tells              them apart is whether a pass is due, which is `source`'s question, not this one's"
+            "never measured and measured-and-failed are the same non-answer to a SORT; what \
+             tells them apart is whether a pass is due, which is `source`'s question, not \
+             this one's"
         );
 
         // latency only breaks a tie between two that both deliver

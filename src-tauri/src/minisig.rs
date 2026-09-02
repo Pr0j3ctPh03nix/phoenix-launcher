@@ -1,6 +1,6 @@
 //! The `.minisig` signature FORMAT, and nothing else.
 //!
-//! Split out from `trust.rs` for one reason: `build.rs` `include!`s this file. The build script
+//! Split out from `trust.rs` for one reason: `build.rs` compiles this same file. The build script
 //! decodes the published `.pub` keys and verifies the baked mirror list, and both of those are
 //! exactly the parsing this module does — so a second copy there could only ever agree with this
 //! one or be silently wrong, in the one place whose whole job is refusing things. What stays in
@@ -8,8 +8,9 @@
 //! (`Payload`, `accept`); this module knows neither, which is why `verify` takes its key ring as a
 //! parameter rather than reaching for a table.
 //!
-//! Nothing here may reference the rest of the crate: an `include!`d file is compiled twice, once
-//! inside this binary and once inside a build script that has no `crate::` to reach into.
+//! Nothing here may reference the rest of the crate. This file is compiled TWICE — once as a
+//! module of the binary, and once as a module of the build script, which pulls it in with
+//! `#[path = "src/minisig.rs"]` and has no `crate::` to reach into.
 //!
 //! ## The format — a shared contract, not an implementation detail
 //!

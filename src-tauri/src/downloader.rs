@@ -119,9 +119,11 @@ pub trait Downloader: Send + Sync {
     /// INSTALL paths, which never show notes — one bounded round trip per release open, on the
     /// slow links this whole feature exists for, for a string nobody is reading.
     ///
-    /// `None` is "this release has no notes", which is an answer: a mirror's sync pass writes the
-    /// file even when the body is empty, so its absence is not one and is reported as an error by
-    /// the backend that knows the difference.
+    /// `None` is "this release has no notes", on every backend alike — an absent GitHub body, a
+    /// mirror answering 404. A release genuinely without a changelog is an ordinary release, and
+    /// withholding an update over a missing one would be absurd, so the absence is never a failure.
+    /// An error here means the notes could not be FETCHED, which is a different thing and is what
+    /// the callers treat as "show none" rather than as a reason to refuse the release.
     fn notes(&self, release: &Release) -> Result<Option<String>> {
         Ok(release.body.clone())
     }
