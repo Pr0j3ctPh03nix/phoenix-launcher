@@ -167,7 +167,10 @@ pub fn probe(settings: &Settings, repo: &str, now: u64) -> Measured {
     let started = Instant::now();
     let release = match gh.fetch_release(repo, None) {
         Ok(r) => r,
-        Err(e) => return Measured::failed(now, format!("release lookup: {}", net_reason(&e))),
+        Err(e) => {
+            let why = format!("release lookup: {}", net_reason(&e));
+            return Measured::failed(now, crate::source::short_reason(why));
+        }
     };
     m.latency_ms = Some(started.elapsed().as_millis() as u64);
     m.tag = Some(release.tag_name.clone());
@@ -181,7 +184,7 @@ pub fn probe(settings: &Settings, repo: &str, now: u64) -> Measured {
             m.range_ok = range_ok;
             crate::source::time_read(&mut m, reader, &asset.name);
         }
-        Err(e) => m.error = Some(format!("{}: {e}", asset.name)),
+        Err(e) => m.error = Some(crate::source::short_reason(format!("{}: {e}", asset.name))),
     }
     m
 }

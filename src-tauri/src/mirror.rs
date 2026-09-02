@@ -658,7 +658,7 @@ fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Me
         Ok(r) => r,
         Err(e) => {
             let why = format!("{}: {}", crate::engine::MANIFEST_ASSET, short_fetch(e));
-            return Measured::failed(now, why);
+            return Measured::failed(now, source::short_reason(why));
         }
     };
     // Bounded through `read_all`, NOT `into_json`: ureq bounds `into_string` but not `into_json`,
@@ -672,7 +672,10 @@ fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Me
     // megabyte would start reporting a healthy game mirror as unreadable as that grew.
     let doc = match read_all(resp, crate::trust::MAX_DOC_BYTES) {
         Ok(b) => b,
-        Err(e) => return Measured::failed(now, format!("{}: {e}", crate::engine::MANIFEST_ASSET)),
+        Err(e) => {
+            let why = format!("{}: {e}", crate::engine::MANIFEST_ASSET);
+            return Measured::failed(now, source::short_reason(why));
+        }
     };
     // The strict reader, not a private permissive one: a second parser over the least trusted
     // document in the system is exactly the thing that drifts, and a document this one refuses is a
@@ -680,8 +683,11 @@ fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Me
     let manifest = match Manifest::parse(&doc) {
         Ok(m) => m,
         Err(e) => {
+            // CAPPED, and this is the site the cap exists for: `serde_json` quotes the offending
+            // value in full, so a hostile mirror serving a string where a number belongs writes
+            // that string into settings.json otherwise. See `source::REASON_MAX`.
             let why = format!("{} is not readable: {e:#}", crate::engine::MANIFEST_ASSET);
-            return Measured::failed(now, why);
+            return Measured::failed(now, source::short_reason(why));
         }
     };
     m.latency_ms = Some(started.elapsed().as_millis() as u64);
@@ -708,7 +714,7 @@ fn probe_with(agent: &ureq::Agent, base: &str, payload: Payload, now: u64) -> Me
     }) {
         Ok(r) => r,
         Err(e) => {
-            m.error = Some(format!("{label}: {}", short_fetch(e)));
+            m.error = Some(source::short_reason(format!("{label}: {}", short_fetch(e))));
             return m;
         }
     };
@@ -1727,6 +1733,44 @@ mod tests {
                 .redirects(0) // transport::fetch drives the loop; matches download_agent()
                 .build(),
         )
+    }
+
+    /// WHAT A HOSTILE MIRROR IS ALLOWED TO WRITE INTO settings.json.
+    ///
+    /// A probe's failure reason is persisted, re-parsed on every launch and re-broadcast to the
+    /// webview — and `serde_json`'s type errors quote the offending value verbatim. So a manifest
+    /// that is syntactically valid, verifies nothing (the probe deliberately checks no signature)
+    /// and carries a 50 KB string where a number belongs would otherwise park 50 KB of a stranger's
+    /// text in the user's profile forever. The read is already bounded at `MAX_DOC_BYTES`; what
+    /// this pins is that the SURVIVING record of it is bounded too.
+    #[test]
+    fn a_hostile_manifest_cannot_write_an_unbounded_reason_into_the_settings() {
+        use crate::test_http::{Canned, TestServer};
+        let junk = "A".repeat(50_000);
+        let doc = manifest_doc(
+            &format!(
+                r#"{{"name":"a.vpk","dest":"game/a.vpk","sha256":"{}","size":"{junk}"}}"#,
+                "d".repeat(64)
+            ),
+            "",
+        );
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/mod/manifest.json", Canned::body(doc.clone().into_bytes()));
+            routes
+        });
+
+        let base = format!("http://127.0.0.1:{}", server.port);
+        let m = probe_with(&test_agent(), &base, Payload::Mod, 1_000);
+
+        let why = m.error.expect("an unreadable manifest is a failed measurement");
+        assert!(
+            why.chars().count() <= source::REASON_MAX,
+            "the reason is persisted, so it is capped: {} chars",
+            why.chars().count()
+        );
+        assert!(!why.contains(&junk), "and the host's own text is not what it is made of");
+        assert!(why.contains("is not readable"), "it still says what went wrong: {why}");
     }
 
     /// The layout, stated as URLs. Two things it pins that nothing else can: a payload entry is

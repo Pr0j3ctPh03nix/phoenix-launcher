@@ -714,6 +714,27 @@ fn probe(settings: &Settings, source: &Source, now: u64) -> Measured {
     }
 }
 
+/// The longest a measurement's failure reason may be.
+///
+/// `Measured.error` is not a log line: it is PERSISTED into settings.json, re-read and re-parsed on
+/// every launch, and pushed to the webview on every `sources-changed`. On a mirror it can also
+/// quote bytes that host chose — `serde_json`'s type errors reproduce the offending value in full,
+/// so a manifest carrying a multi-megabyte string where a number belongs (bounded only by
+/// `MAX_DOC_BYTES`) would otherwise land that string in the user's profile permanently. 200 is what
+/// `github::net_err` has capped its own API snippet at since long before this; one rule, applied to
+/// whichever backend is being distrusted rather than to one of them.
+pub(crate) const REASON_MAX: usize = 200;
+
+/// A probe's failure reason, capped at `REASON_MAX`.
+///
+/// CHARS, not bytes: the input is a foreign host's text, and cutting a `String` inside a UTF-8
+/// sequence panics. Applied where each reason is BUILT rather than where a `Measured` is written —
+/// there is one construction site per reason and several ways to store one, so the cap belongs on
+/// the side that has exactly one of them.
+pub(crate) fn short_reason(why: impl AsRef<str>) -> String {
+    why.as_ref().chars().take(REASON_MAX).collect()
+}
+
 /// Read up to `PROBE_BYTES` under a wall-clock budget and record the throughput. Shared by both
 /// probes, because throughput is the one number the ranking sorts on and two ways of measuring it
 /// would be two rankings.
@@ -737,12 +758,12 @@ pub(crate) fn time_read(m: &mut Measured, mut reader: impl Read, what: &str) {
             }
             Err(e) => {
                 if got == 0 {
-                    m.error = Some(format!("{what}: the transfer failed: {e}"));
+                    m.error = Some(short_reason(format!("{what}: the transfer failed: {e}")));
                     return;
                 }
                 // A transfer that dies partway is broken, not slow — but the bytes that did arrive
                 // are a real measurement, so keep both and let the ranking weigh them.
-                m.error = Some(format!("the transfer stalled after {} KiB", got / 1024));
+                m.error = Some(short_reason(format!("the transfer stalled after {} KiB", got / 1024)));
                 break;
             }
         }
