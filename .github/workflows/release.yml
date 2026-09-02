@@ -4,7 +4,9 @@
 # Tag push (v*) -> build + GitHub Release with phoenix-launcher.exe attached.
 # Manual run (workflow_dispatch) -> build only, exe uploaded as a workflow artifact.
 #
-# The Rust cache is WRITTEN by ci.yml (on main), not here — see the rust-cache step below.
+# This job restores no build cache at all, and every remaining input it does take — the actions, the
+# tooling checkout, the Bun version, the Rust toolchain, both lockfiles — names an exact revision.
+# See the block where the Rust cache used to be for why a cache cannot be one of them.
 #
 # NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed BEFORE the
 # shell parses the script, so a tag name is executable code — and this job holds the signing key.
@@ -117,29 +119,61 @@ jobs:
       - name: Install the signer's dependency
         run: python -m pip install --disable-pip-version-check --no-index --find-links .tooling/wheels cryptography
 
+      # PIN THE BUN VERSION. Without `bun-version` this action resolves "latest" at run time, so
+      # whatever Bun shipped that week would run `bun install` and drive the entire Tauri build in
+      # the job that holds PHOENIX_SIGNING_KEY — the one mutable input the SHA pins above exist to
+      # remove. Nothing in the repo declares a version to follow (no `packageManager`, no
+      # `.bun-version`, no `.tool-versions`), so the pin lives here: 1.4.0, current stable.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
-
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
-
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
         with:
-          workspaces: src-tauri
-          # RESTORE-ONLY on tags. Actions caches are ref-scoped: a run may only read caches from
-          # its own ref or from the default branch. A cache saved under refs/tags/v1.2.0 is
-          # invisible to refs/tags/v1.2.1, so saving here would upload ~GBs that nothing ever
-          # reads. ci.yml warms main's cache; every tag run restores from it.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-          # must match ci.yml — the default key includes the job id, which differs per workflow
-          shared-key: tauri-win-release
-          # a failed build still caches the deps that did compile — a retry resumes instead of
-          # starting from zero
-          cache-on-failure: true
+          bun-version: "1.4.0"
 
+      # PIN THE TOOLCHAIN. `toolchain` defaults to `stable` at this SHA, and `stable` is a moving
+      # target: the compiler that builds a release would be whichever rustc was current the morning
+      # somebody pushed the tag. Spelled with all three components — the action rewrites a
+      # two-component `1.98` through its own release-number arithmetic, and only `1.98.0` reaches
+      # rustup unchanged.
+      #
+      # TRAP FOR WHOEVER BUMPS THE SHA: on the action's master (and its `v1` tag) `toolchain` is
+      # `required: true` with no default, and its first step exits with "'toolchain' is a required
+      # input" when it is empty. A bump made while this `with:` block is absent hard-fails every
+      # build — the block being here is what makes bumping safe.
+      #
+      # A `rust-toolchain.toml` in src-tauri/ would be the better home for this: rustup honours it
+      # for local builds too, so CI and a developer's machine could not disagree about the compiler.
+      # That is a change to the crate rather than to CI, so it is not made here.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable branch
+        with:
+          toolchain: "1.98.0"
+
+      # NO RUST CACHE HERE, deliberately. A rust-cache step used to sit at this spot, restoring the
+      # entry ci.yml warms on main.
+      #
+      # A restored cache is not inert data: it carries build-script executables and proc-macro DLLs
+      # that this job then RUNS, in the same job as PHOENIX_SIGNING_KEY, `contents: write` and the
+      # baked read token. And it is addressed by a KEY, not by a digest of its contents — nothing
+      # about a cache can be pinned the way every other input here is pinned. The only thing between
+      # such an entry and this job is Actions' ref-scoping, which is a rule about who may WRITE a
+      # cache, not a statement about what is inside the one you get back. Restore-only did not
+      # change that: restoring is the half that executes.
+      #
+      # The price is a cold dependency build on every release, which is minutes on a thing that
+      # happens rarely. ci.yml keeps its cache — that job holds no key, and warming is its purpose.
+
+      # --frozen-lockfile: install exactly what bun.lock names and fail if package.json disagrees,
+      # instead of resolving `^2` to whatever is newest today and rewriting the lockfile in place.
+      # The lockfile carries integrity hashes, so this also makes the registry fetch content-checked
+      # rather than merely version-constrained.
       - name: Install frontend deps
-        run: bun install
+        run: bun install --frozen-lockfile
 
+      # `-- --locked` is passed THROUGH the tauri CLI to the runner, which is cargo (`[ARGS]...:
+      # command line arguments passed to the runner`). It means: build the dependency graph
+      # Cargo.lock already names, or fail. Without it cargo is free to pick a newer
+      # semver-compatible version of anything at build time — an unpinned input in the job that
+      # signs, and the only one a file in this repo already describes exactly.
       - name: Build (tauri bundle)
-        run: bun run tauri build
+        run: bun run tauri build -- --locked
         env:
           # read-only GitHub access for the PRIVATE client-dist-staging repo, baked into the binary
           # at build time (config.rs). Not a key and not part of trust: it only opens a repo that

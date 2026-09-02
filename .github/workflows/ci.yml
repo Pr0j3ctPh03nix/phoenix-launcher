@@ -1,31 +1,31 @@
-# Build validation for the default branch, on a schedule or on demand — and the only thing that
-# populates the Rust build cache the release builds live on.
+# Build validation for the default branch, on a schedule or on demand: the tests, the frontend
+# gate, and a full compile of the same code a release builds, with the same pinned inputs.
 #
-# WHY THIS EXISTS: GitHub Actions caches are REF-SCOPED. A workflow run can restore caches created
-# on its own ref or on the default branch, and nothing else — sibling refs, including two
-# different tags, cannot see each other's caches. release.yml triggers on tag pushes, so every
-# cache it saved was scoped to that one tag and no later release could ever read it. Result: a
-# cold, from-scratch dependency build on every single release.
+# IT NO LONGER WARMS RELEASE BUILDS, which was its original reason to exist. Actions caches are
+# REF-SCOPED — a run may restore caches from its own ref or from the default branch and nothing
+# else, so a cache saved under refs/tags/v1.2.0 is invisible to v1.2.1, and main was the one ref
+# every tag run could read from. release.yml now restores no cache at all: a cache entry is
+# executable input (build scripts, proc-macro DLLs) that the job holding the signing key would run,
+# and alone among that job's inputs it cannot be pinned to a revision. The full argument is written
+# where that step used to be.
 #
-# main is the one ref every tag run can read from, so cache writes belong here and release.yml is
-# restore-only (`save-if`). The `shared-key` below MUST stay identical to release.yml's — the
-# default rust-cache key embeds the job id, which differs across workflows, and mismatched keys
-# would silently warm nothing.
+# The cache stays HERE, where the trade runs the other way: this job holds no signing key, it lives
+# on one ref, and a warm entry is the difference between a check that costs minutes and one that
+# costs half an hour. It now serves this workflow's own runs and nothing else.
 
 name: ci
 
 on:
-  # Deliberately NOT on push. A full Tauri build on every commit to main is not worth its minutes,
-  # and the cache argument above does not require one: both triggers below also run on the default
-  # branch, which is the ref every tag run restores from. The trade accepted is that main gets no
-  # automatic build validation — a break lands silently and surfaces at the next run below, or at
-  # the next tag.
+  # Deliberately NOT on push. A full Tauri build on every commit to main is not worth its minutes.
+  # The trade accepted is that main gets no automatic build validation — a break lands silently and
+  # surfaces at the next run below, or at the next tag.
   #
-  # GitHub evicts cache entries untouched for 7 days; releases are usually further apart than
-  # that. A weekly build keeps the entry alive and surfaces toolchain drift before a tag needs it.
+  # GitHub evicts cache entries untouched for 7 days, and these two triggers are now the only
+  # things that touch this one. A weekly build keeps it alive and, more usefully, surfaces drift in
+  # what the pinned inputs still resolve to before a tag has to find out.
   schedule:
     - cron: "17 4 * * 1"
-  # Also the way to warm the cache on demand — run this before tagging if main has moved a lot.
+  # Also the way to run the check on demand — before tagging, say, if main has moved a lot.
   workflow_dispatch:
 
 concurrency:
@@ -37,9 +37,9 @@ jobs:
     runs-on: windows-latest
     steps:
       # Third-party actions are pinned to COMMIT SHAs, not tags, for the reason release.yml gives:
-      # a tag is mutable. It applies here too — this workflow warms the cache every release build
-      # then restores, and it holds PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS. Every SHA below is the
-      # one release.yml already uses for the same action; the trailing comment is the
+      # a tag is mutable. It applies here too — this job holds PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS
+      # and writes a cache, and it is the check a release is tagged on the strength of. Every SHA
+      # below is the one release.yml already uses for the same action; the trailing comment is the
       # human-readable version, and the two are updated together.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
@@ -54,20 +54,37 @@ jobs:
           ref: 0e3ad70c6f7cf608ccef833107562b1c771394ad
           path: .tooling
 
+      # Pinned to the same version release.yml builds with, and for a second reason on top of that
+      # one: a Bun that only CI ever sees would make this workflow's green a statement about a
+      # toolchain no release uses. Nothing in the repo declares a version (no `packageManager`, no
+      # `.bun-version`), so the pin is written out in both files and moves in one commit.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6  # v2
+        with:
+          bun-version: "1.4.0"
 
       # `@stable` was the ref, not an input: at this SHA the action's `toolchain` input defaults to
-      # `stable`, so pinning selects the same toolchain the moving ref did.
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
+      # `stable` — a moving compiler, and the one below is what release.yml uses. Keep them equal;
+      # a check that passes on a different rustc than the release build is not a check of it. The
+      # bump trap (master makes `toolchain` required) is written out in release.yml.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable branch
+        with:
+          toolchain: "1.98.0"
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2
         with:
           workspaces: src-tauri
+          # The default key embeds the job id, so a fixed shared-key is what keeps ONE entry across
+          # renames of this job rather than orphaning gigabytes per rename. The name is historical —
+          # it once had to match release.yml's — and still describes the contents: release-profile
+          # artifacts, per the `--release` note below.
           shared-key: tauri-win-release
           cache-on-failure: true
 
+      # --frozen-lockfile here as well as in release.yml, so lockfile drift is a failed check
+      # rather than a failed release: `bun install` without it resolves `^2` afresh and rewrites
+      # bun.lock in place, which on a runner is a change nobody ever sees.
       - name: Install frontend deps
-        run: bun install
+        run: bun install --frozen-lockfile
 
       # The frontend's own gate: EN/RU key parity and every $("id") main.js reaches for exists.
       # It was written to gate commits — a gate nothing runs is not a gate.
@@ -78,18 +95,22 @@ jobs:
       # (src-tauri/manifest-fixtures/) — the reader's compatibility contract with the dist repo is
       # only a contract if something checks it on every push.
       #
-      # --release ON PURPOSE: the cache this workflow shares with release.yml holds
-      # release-profile dependency artifacts (the tauri build below compiles the same profile).
-      # A plain `cargo test` would cold-compile a second, debug copy of the whole tree and near
-      # double the cache for nothing; --release reuses what is already warm.
+      # --release ON PURPOSE: this workflow's cache holds release-profile dependency artifacts (the
+      # tauri build below compiles the same profile). A plain `cargo test` would cold-compile a
+      # second, debug copy of the whole tree and near double the cache for nothing; --release
+      # reuses what is already warm.
+      # --locked: resolve nothing. Cargo.lock is committed, so a dependency that has moved on
+      # crates.io must be brought in by a commit that updates it, not by the next run that happens
+      # to re-resolve. Here it is also the earliest place lock/manifest drift can surface — the
+      # release build passes the same flag, where the same drift would be a failed tag.
       - name: Test
         working-directory: src-tauri
-        run: cargo test --release
+        run: cargo test --release --locked
 
-      # Same cargo invocation as the release build, minus NSIS/MSI packaging: the dependency
-      # artifacts cached here are exactly the ones release.yml restores. Keep the env identical
-      # too, so nothing recompiles on the release side for a differing build input.
+      # Same cargo invocation as the release build, minus NSIS/MSI packaging and its `--locked`
+      # passed through to cargo the same way. Keep the env identical too, so a difference in build
+      # inputs can never be the reason the release side behaves differently from this check.
       - name: Build (no bundling — cache warm + compile check)
-        run: bun run tauri build --no-bundle
+        run: bun run tauri build --no-bundle -- --locked
         env:
           PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS: ${{ secrets.PHOENIX_CLIENT_DIST_STAGING_REPO_ACCESS }}
