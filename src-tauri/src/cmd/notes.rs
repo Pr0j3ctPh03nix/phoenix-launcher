@@ -38,13 +38,13 @@ pub async fn release_notes(
             engine::NOTES_FILE_SHIM,
             current_tag,
             |known| {
-                source::with_active(
-                    &settings,
-                    &settings.source_repo,
-                    Payload::Mod,
-                    None,
-                    |dl, _release| engine::fetch_notes_history(&settings, dl, known),
-                )
+                // `with_active_dl`, not `with_active`: this reads the release LISTING and has no
+                // use for the latest release, so opening one first would be a second GitHub API
+                // call before every one of these — against the same 60/hour anonymous budget the
+                // update check spends.
+                source::with_active_dl(&settings, &settings.source_repo, Payload::Mod, |dl| {
+                    engine::fetch_notes_history(&settings, dl, known)
+                })
             },
         )
     })
@@ -80,7 +80,7 @@ pub async fn launcher_notes(
                 // `known` is ignored on purpose: there is no per-release download to skip on
                 // GitHub — one listing carries every body, so a rebuild is always whole and always
                 // cheap.
-                source::with_active(&settings, &repo, Payload::Launcher, None, |dl, _release| {
+                source::with_active_dl(&settings, &repo, Payload::Launcher, |dl| {
                     let releases = dl.fetch_releases(&repo)?;
                     Ok(engine::launcher_notes_history(dl, &repo, &releases))
                 })

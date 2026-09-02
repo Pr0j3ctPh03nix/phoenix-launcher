@@ -337,6 +337,28 @@ pub fn with_active<T>(
     walk(&dial, &ranking, repo, tag, op)
 }
 
+/// Run `op` against the active source WITHOUT opening a release first, failing over the same way.
+///
+/// `with_active`'s contract is "look the release up, then run `op` against it", and a caller that
+/// does not need the release pays for that lookup anyway. Both notes commands are exactly that:
+/// each binds the release and immediately ignores it to ask the backend something else. On GitHub
+/// that was a `/releases/latest` call before every `/releases` listing — two requests against the
+/// 60/hour anonymous budget the update check already shares — for a value nothing reads.
+///
+/// Everything else is unchanged, because it is the same walk: whatever `op` asks of a source is
+/// what fails that source over, and a source that cannot answer `op` is a source this operation
+/// cannot use. The distinction the release lookup was drawing — unreachable versus unusable — is
+/// one the walk has never acted on.
+pub fn with_active_dl<T>(
+    settings: &Settings,
+    repo: &str,
+    payload: Payload,
+    op: impl Fn(&dyn Downloader) -> Result<T>,
+) -> Result<T> {
+    let (dial, ranking) = dial_for(settings, repo, payload);
+    each_source(&ranking, &mut HashSet::new(), |source| op(dial(source).as_ref()))
+}
+
 /// `with_active` with the dial and the ranking injected — see `Dial`. `pub(crate)` for the tests
 /// in the modules that USE a walk (self-update's failover is a property of self-update, not of
 /// this file), which is the same seam `Wire::with_dial` opens for the same reason.
