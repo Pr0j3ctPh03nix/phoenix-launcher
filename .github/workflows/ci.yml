@@ -110,6 +110,10 @@ jobs:
       # Same cargo invocation as the release build, minus NSIS/MSI packaging and its `--locked`
       # passed through to cargo the same way. Keep the env identical too, so a difference in build
       # inputs can never be the reason the release side behaves differently from this check.
+      #
+      # PHOENIX_MIRRORS_DIR is deliberately NOT set: release.yml bakes the published mirror list in,
+      # and this is the build that proves the other branch of build.rs — no directory, nothing
+      # baked, the launcher falls back to GitHub alone — still compiles.
       - name: Build (no bundling — cache warm + compile check)
         run: bun run tauri build --no-bundle -- --locked
         env:

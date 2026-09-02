@@ -24,6 +24,14 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      # The ONE way to build without a baked mirror list, and it has to be asked for by hand. A
+      # missing list is invisible in the binary and fatal to the users it was built for, so it is
+      # never a thing a failed download may quietly produce — see "Fetch the mirror list to bake in".
+      no_mirror_list:
+        description: "Build WITHOUT a baked mirror list (the exe can then reach GitHub only). Deliberate builds only."
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -118,6 +126,73 @@ jobs:
       # the vendored wheels do not cover — either way loudly, and before the key is read.
       - name: Install the signer's dependency
         run: python -m pip install --disable-pip-version-check --no-index --find-links .tooling/wheels cryptography
+
+      # THE BAKED BOOTSTRAP MIRROR LIST. Fetched here and compiled into the binary by build.rs,
+      # which reads it from PHOENIX_MIRRORS_DIR (a directory holding mirrors.json and its .minisig).
+      #
+      # WHY IT IS BAKED AT ALL. Mirrors are DISCOVERED from the published mirrors.json, and that
+      # document lives on GitHub — or on a mirror the client does not know about yet. A client that
+      # cannot reach GitHub therefore cannot learn that any mirror exists, which is the deadlock in
+      # HANDOFF.md §6c: the users mirrors are for are exactly the users who can never be told where
+      # one is. The list has to arrive WITH the binary or, for them, it does not arrive.
+      #
+      # WHY FROM THE REGISTRY'S RELEASE AND NOT A CHECKOUT. mirrors.d/ in that repo is the SOURCE
+      # the list is rendered from; what a launcher obeys is the rendered document its CI SEALED.
+      # Checking the repo out would bake bytes no key ever signed — build.rs would refuse them —
+      # and would also bake a list that is whatever main said, rather than what is published.
+      # Downloading the release asset bakes the exact document a running launcher would fetch and
+      # verify for itself, so a fresh install starts where an updated one already is.
+      #
+      # NOT VERIFIED HERE, DELIBERATELY. build.rs checks the .minisig against the SAME pinned keys
+      # the launcher trusts at runtime and fails the build if it does not verify, so a tampered or
+      # truncated download breaks a build instead of shipping. A second check written here would be
+      # a weaker copy of a rule that already has an owner — this step's whole job is to fetch.
+      #
+      # THE EXPLICIT FILE TEST IS NOT REDUNDANT. `gh release download` fails only when NO pattern
+      # matched anything; a release carrying mirrors.json but not its signature downloads one file
+      # and exits 0. That release is exactly the one build.rs must never be handed silently.
+      #
+      # NO RELEASE IN THE REGISTRY = FAILED BUILD. A launcher shipped with no list strands the
+      # users mirrors exist for, and strands them quietly — they see GitHub time out, not an error
+      # about mirrors. If a no-list build is genuinely wanted it is asked for, not fallen into:
+      # run this workflow by hand with `no_mirror_list`.
+      - name: Fetch the mirror list to bake in
+        if: ${{ github.event.inputs.no_mirror_list != 'true' }}
+        shell: bash
+        env:
+          # Minted per run. The registry is PUBLIC, so this only spares the run an unauthenticated
+          # rate limit; it grants no access the anonymous API would not already give.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # RUNNER_TEMP, not the workspace: nothing here is an input to the build tree, and a
+          # downloaded document must never be mistakable for something this repo authored. It is a
+          # Windows path, which quoted is equally valid to bash and to the cargo that reads it back.
+          dir="$RUNNER_TEMP/mirrors"
+          mkdir -p "$dir"
+          gh release download --repo Pr0j3ctPh03nix/phoenix-mirror-registry \
+            --pattern mirrors.json --pattern mirrors.json.minisig --dir "$dir" || {
+            echo "could not download the published mirror list from phoenix-mirror-registry."
+            echo "Its latest release must carry mirrors.json and mirrors.json.minisig. If nothing"
+            echo "is published there yet, run that repo's publish workflow first — or, to build"
+            echo "deliberately without a list, re-run this one by hand with no_mirror_list = true."
+            exit 1
+          }
+          for f in mirrors.json mirrors.json.minisig; do
+            [ -s "$dir/$f" ] || { echo "$f is missing or empty in the downloaded release"; exit 1; }
+          done
+          # Small enough to quote in full, and worth quoting: the log then records the exact bytes
+          # this build baked, which is the only record after the runner is gone.
+          cat "$dir/mirrors.json"
+          echo "PHOENIX_MIRRORS_DIR=$dir" >> "$GITHUB_ENV"
+
+      # The other half of that gate, said out loud. PHOENIX_MIRRORS_DIR stays unset, build.rs bakes
+      # nothing, and the log says so — a no-list build is never something you discover afterwards.
+      # Unreachable on a tag push: the input exists only on workflow_dispatch, and its absence there
+      # reads as the empty string, which is not 'true'.
+      - name: No mirror list (asked for explicitly)
+        if: ${{ github.event.inputs.no_mirror_list == 'true' }}
+        run: echo "NO MIRROR LIST — PHOENIX_MIRRORS_DIR is unset, so nothing is baked. This exe can reach GitHub only."
 
       # PIN THE BUN VERSION. Without `bun-version` this action resolves "latest" at run time, so
       # whatever Bun shipped that week would run `bun install` and drive the entire Tauri build in
