@@ -83,7 +83,7 @@ pub async fn launcher_notes(
                 // cheap.
                 source::with_active_dl(&settings, &repo, Payload::Launcher, |dl| {
                     let releases = dl.fetch_releases(&repo)?;
-                    Ok(engine::launcher_notes_history(&repo, &releases))
+                    Ok(engine::launcher_notes_history(&repo, &releases, dl.content_addressed()))
                 })
             },
         )
@@ -116,8 +116,11 @@ fn history(
             })
             .collect::<Vec<_>>()
     };
-    let fresh =
-        |c: &engine::NotesCache| c.repo == repo && current_tag.as_ref().is_none_or(|t| *t == c.latest_tag);
+    // The rule lives on the cache (`NotesCache::serves`), including the part this command must not
+    // get wrong: a PARTIAL history — one release's notes, from a source with no release index —
+    // never answers, whatever tag it names. Its entries are real, so it still seeds the rebuild
+    // below as `known`.
+    let fresh = |c: &engine::NotesCache| c.serves(repo, current_tag.as_deref());
     // memory first, then disk (survives restarts); a stale same-repo cache still seeds the rebuild
     let mut known: Vec<engine::NotesEntry> = Vec::new();
     {
@@ -150,6 +153,8 @@ fn history(
     if let Some(t) = current_tag {
         cache.latest_tag = t;
     }
+    // `save` itself refuses a partial history — the other half of the rule, and the half that
+    // stops one outliving the process that built it.
     cache.save(file);
     let views = to_views(&cache.entries);
     *slot.lock().unwrap() = Some(cache);

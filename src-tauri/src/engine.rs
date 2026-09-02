@@ -347,6 +347,18 @@ pub struct NotesCache {
     /// entry's tag can't serve, since the latest release may carry no notes.
     pub latest_tag: String,
     pub entries: Vec<NotesEntry>,
+    /// Built from a source that has NO RELEASE INDEX, so this is not the archive — it is whatever
+    /// one release could say. A mirror serves exactly one release per payload, so a history built
+    /// through one is a single entry (or none at all, for the launcher, whose notes live in the
+    /// listing). That answer is honest while it is on screen and worthless afterwards: nothing else
+    /// in the cache records WHERE it came from, so a one-entry history written to disk under the
+    /// current tag was then served on every later launch, GitHub perfectly reachable, until the tag
+    /// moved. `cmd::notes` treats it as never fresh and never saves it.
+    ///
+    /// `#[serde(default)]`: a cache written before this field existed reads as complete, which is
+    /// what every cache written by a GitHub-reachable launcher actually was.
+    #[serde(default)]
+    pub partial: bool,
 }
 
 /// The file each history persists to. TWO files, not one keyed by repo: the shim's history and the
@@ -367,8 +379,27 @@ impl NotesCache {
         serde_json::from_str(&text).ok()
     }
 
+    /// Does this cache ANSWER for `repo` at `current_tag`? The freshness rule, on the type it is
+    /// about rather than in the command that happens to ask.
+    ///
+    /// `current_tag` is the newest tag the corresponding check saw; `None` means "accept any cached
+    /// history for this repo" — the UI only opens these views after a check anyway, and a history
+    /// is worth more than a round trip proving it is still the same one. A PARTIAL history never
+    /// answers, whatever tag it names: see the field.
+    pub fn serves(&self, repo: &str, current_tag: Option<&str>) -> bool {
+        !self.partial && self.repo == repo && current_tag.is_none_or(|t| t == self.latest_tag)
+    }
+
     /// Best-effort disk save; a failure only costs a refetch next launch.
+    ///
+    /// A PARTIAL history is not written at all. `serves` already refuses to answer with one, but
+    /// only the two together are enough: without this it would outlive the process that built it
+    /// and sit in the profile of a machine that can reach GitHub perfectly well, waiting to seed a
+    /// rebuild with a single release's notes.
     pub fn save(&self, file: &str) {
+        if self.partial {
+            return;
+        }
         let Some(p) = notes_cache_path(file) else { return };
         if let Some(parent) = p.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -470,6 +501,9 @@ pub fn fetch_notes_history(
         repo: settings.source_repo.clone(),
         latest_tag: releases.first().map(|r| r.tag_name.clone()).unwrap_or_default(),
         entries,
+        // A content-addressed backend has no release index: `fetch_releases` answers with the one
+        // release it serves, so what came back is that release's notes and not a history.
+        partial: dl.content_addressed(),
     })
 }
 
@@ -494,7 +528,7 @@ pub fn fetch_notes_history(
 /// release SIGNED (`selfupdate::available`). An archive assembled from prose a third-party host
 /// hands over was not worth what it cost: nobody signs it, and the launcher renders it as its own
 /// changelog with its links live.
-pub fn launcher_notes_history(repo: &str, releases: &[Release]) -> NotesCache {
+pub fn launcher_notes_history(repo: &str, releases: &[Release], partial: bool) -> NotesCache {
     let published = || releases.iter().filter(|r| r.is_published());
     let entries = published()
         .filter_map(|r| {
@@ -513,6 +547,10 @@ pub fn launcher_notes_history(repo: &str, releases: &[Release]) -> NotesCache {
         repo: repo.to_string(),
         latest_tag: published().next().map(|r| r.tag_name.clone()).unwrap_or_default(),
         entries,
+        // The caller's, because this is a pure transform over a list somebody else fetched and the
+        // fact in question is about the SOURCE it came from — a backend with no release index
+        // yields no history here at all, and an empty answer must not be cached as the archive.
+        partial,
     }
 }
 
@@ -1035,7 +1073,7 @@ mod tests {
             launcher_rel("v1.2.8", None),            // no body at all
             launcher_rel("1.2.7", Some("plain")),    // a tag without the "v" still reports a version
         ];
-        let c = launcher_notes_history("o/r", &rels);
+        let c = launcher_notes_history("o/r", &rels, false);
 
         assert_eq!(c.repo, "o/r");
         // newest first, the listing's own order, with the note-less releases dropped
@@ -1047,7 +1085,7 @@ mod tests {
         // no notes must not silently date the cache to the one below it
         assert_eq!(c.latest_tag, "v1.3.0");
 
-        assert_eq!(launcher_notes_history("o/r", &[]).latest_tag, "");
+        assert_eq!(launcher_notes_history("o/r", &[], false).latest_tag, "");
     }
 
     #[test]
@@ -1058,12 +1096,71 @@ mod tests {
         pre.prerelease = true;
         let rels = vec![draft, pre, launcher_rel("v1.8.0", Some("shipped"))];
 
-        let c = launcher_notes_history("o/r", &rels);
+        let c = launcher_notes_history("o/r", &rels, false);
         assert_eq!(c.entries.len(), 1);
         assert_eq!(c.entries[0].tag, "v1.8.0");
         // and the key dates to the newest PUBLISHED release, which is what /releases/latest —
         // and therefore launcher_check — reports
         assert_eq!(c.latest_tag, "v1.8.0");
+    }
+
+    /// A HISTORY BUILT THROUGH A SOURCE WITH NO RELEASE INDEX IS NOT THE ARCHIVE.
+    ///
+    /// A mirror serves one release per payload, so `fetch_releases` answers with one and the
+    /// "history" is that release's notes. Nothing in the cache recorded where it came from, so that
+    /// single entry was written to disk keyed to the current tag and then served on every later
+    /// launch — GitHub perfectly reachable — until the tag moved. It is marked instead, and a
+    /// marked one neither answers nor persists.
+    #[test]
+    fn a_history_from_a_source_with_no_release_index_is_never_the_archive() {
+        /// A `Fake` that addresses by content, which is the whole of what makes a backend
+        /// index-less — the same answer `Mirror` gives.
+        struct NoIndex(Fake);
+        impl Downloader for NoIndex {
+            fn content_addressed(&self) -> bool {
+                true
+            }
+            fn fetch_release(&self, r: &str, t: Option<&str>) -> Result<Release> {
+                self.0.fetch_release(r, t)
+            }
+            fn fetch_releases(&self, r: &str) -> Result<Vec<Release>> {
+                self.0.fetch_releases(r)
+            }
+            fn download(&self, a: &crate::downloader::Asset) -> Result<Vec<u8>> {
+                self.0.download(a)
+            }
+            fn download_to(
+                &self,
+                a: &crate::downloader::Asset,
+                d: &std::path::Path,
+                r: u64,
+                p: crate::downloader::ChunkProgress,
+            ) -> Result<(u64, String)> {
+                self.0.download_to(a, d, r, p)
+            }
+        }
+
+        let settings = Settings::default();
+        let json =
+            serde_json::json!({ "version": "9.9.9", "notes": "### One", "files": [] }).to_string();
+        let indexed = Fake::new("v9.9.9", &json, vec![]);
+        let complete = fetch_notes_history(&settings, &indexed, &[]).unwrap();
+        assert!(!complete.partial, "a release index yields the archive it lists");
+        assert!(complete.serves(&settings.source_repo, Some("v9.9.9")));
+
+        let partial = fetch_notes_history(&settings, &NoIndex(indexed), &[]).unwrap();
+        assert_eq!(partial.entries.len(), 1, "one release is all there is to have");
+        assert!(partial.partial);
+        assert!(
+            !partial.serves(&settings.source_repo, Some("v9.9.9")),
+            "…and it must not answer for the archive, however current its tag is"
+        );
+        assert!(!partial.serves(&settings.source_repo, None), "not even unkeyed");
+
+        // the launcher's history takes the same fact from its caller, which is the one holding the
+        // backend — and there it is EMPTY, since those notes exist only in a release listing
+        assert!(launcher_notes_history("o/r", &[], true).partial);
+        assert!(!launcher_notes_history("o/r", &[], false).partial);
     }
 
     /// The two histories must not share a file: one slot keyed by repo would make opening either
