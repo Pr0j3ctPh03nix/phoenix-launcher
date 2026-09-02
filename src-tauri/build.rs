@@ -131,11 +131,6 @@ fn generate_pinned_keys() -> Vec<minisig::TrustedKey> {
     ring
 }
 
-/// Where the `.pub` files are read from: `PHOENIX_KEYS_DIR`, else `.tooling/keys` at the repo root.
-///
-/// Both workflows check `release-tooling` out to exactly that path, so the default resolves in CI
-/// with no per-step configuration — which matters because EVERY cargo invocation needs the keys
-/// (`cargo test` compiles this crate too), not just the one that packages a release.
 /// Read the signed mirror list `MIRRORS_DIR_ENV` names, check it, and write
 /// `$OUT_DIR/baked_mirrors.rs` — `None`, or the pair `mirror::BAKED` includes.
 ///
@@ -215,6 +210,11 @@ fn rust_path(path: &Path) -> String {
     format!("{:?}", path.display().to_string())
 }
 
+/// Where the `.pub` files are read from: `PHOENIX_KEYS_DIR`, else `.tooling/keys` at the repo root.
+///
+/// Both workflows check `release-tooling` out to exactly that path, so the default resolves in CI
+/// with no per-step configuration — which matters because EVERY cargo invocation needs the keys
+/// (`cargo test` compiles this crate too), not just the one that packages a release.
 fn keys_dir() -> PathBuf {
     println!("cargo:rerun-if-env-changed={KEYS_DIR_ENV}");
     if let Some(dir) = std::env::var_os(KEYS_DIR_ENV) {
