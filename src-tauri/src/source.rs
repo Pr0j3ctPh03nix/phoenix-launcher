@@ -127,8 +127,15 @@ pub fn on_change(sink: impl Fn() + Send + Sync + 'static) {
 
 /// Fire the sink. ALWAYS outside the registry lock: the sink's whole job is to read the registry
 /// back out, and calling it under the lock is a deadlock with the shape of a hang at boot.
+///
+/// The sink is called while `SINK` is held, so a panic inside it poisons this mutex — and an
+/// `unwrap` here would then turn one bad emit into every later notification panicking, for the rest
+/// of the process. A poisoned `SINK` protects nothing that can be inconsistent (it holds one
+/// `Option<Box<dyn Fn>>`, installed once at setup), so the guard is taken anyway and the launcher
+/// goes on reporting.
 fn notify() {
-    if let Some(sink) = SINK.lock().unwrap().as_ref() {
+    let sink = SINK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(sink) = sink.as_ref() {
         sink();
     }
 }
@@ -550,7 +557,19 @@ impl Wire {
     /// `Ok(false)` = somebody already switched; the caller just re-reads `current()` and retries
     /// the same work against the new source. `Err` = the list is exhausted.
     pub fn fail(&self, seen: u64) -> Result<bool> {
+        // Under a READ lock first. Eight workers fail at once and seven of them are reporting a
+        // generation somebody has already moved past — the case the pool is built around, and the
+        // one that is supposed to cost nothing. Asking the question under the write lock made each
+        // of those seven wait out the whole failover round trip (for the base game: a release
+        // lookup plus `merged_game_release`, or a mirror's two documents and a 4,600-entry parse)
+        // before being told to just retry, and every worker's next `current()` queued behind the
+        // same lock.
+        if self.inner.read().unwrap().gen != seen {
+            return Ok(false);
+        }
         let mut live = self.inner.write().unwrap();
+        // Asked again, because the two locks are not one: the worker that WON the race may have
+        // finished swapping in the gap between them.
         if live.gen != seen {
             return Ok(false);
         }
