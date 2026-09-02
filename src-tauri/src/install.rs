@@ -531,7 +531,12 @@ impl<'a> Origin<'a> {
 /// An `Origin` with its asset lookup table built — the form the download pool uses. The index is
 /// built once for the whole pool rather than per job: thousands of jobs against a release carrying
 /// thousands of assets would otherwise be a linear scan each.
-struct Resolved<'a> {
+///
+/// `pub(crate)` because `asset_for` is THE rule for turning a manifest entry into the asset a given
+/// source can serve, and self-update needs the same answer for the launcher exe: a second copy of
+/// "name on GitHub, hash on a mirror" in selfupdate.rs would be free to drift from this one, and
+/// the symptom would be a launcher that installs from one source and 404s on the other.
+pub(crate) struct Resolved<'a> {
     dl: &'a dyn Downloader,
     /// Empty for a content-addressed backend, which has no release index to build one from.
     index: HashMap<&'a str, &'a Asset>,
@@ -539,7 +544,7 @@ struct Resolved<'a> {
 }
 
 impl<'a> Resolved<'a> {
-    fn of(origin: &Origin<'a>) -> Self {
+    pub(crate) fn of(origin: &Origin<'a>) -> Self {
         let by_hash = origin.dl.content_addressed();
         Self {
             dl: origin.dl,
@@ -557,7 +562,7 @@ impl<'a> Resolved<'a> {
     ///
     /// Owned rather than borrowed because the two arms cannot return the same thing; an `Asset` is
     /// three strings and this happens once per download attempt, not per chunk.
-    fn asset_for(&self, name: &str, sha256: &str, size: u64) -> Option<Asset> {
+    pub(crate) fn asset_for(&self, name: &str, sha256: &str, size: u64) -> Option<Asset> {
         if self.by_hash {
             return Some(Asset {
                 name: sha256.to_string(),

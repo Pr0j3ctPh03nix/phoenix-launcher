@@ -19,7 +19,10 @@
 //! Writing a truncated or corrupt exe over a working launcher leaves the user with neither a
 //! launcher nor a way back, so this mirrors install.rs: no unverified byte is ever committed.
 //!
-//! WHERE that hash comes from has two answers, and the order matters — see `expected_sha`.
+//! WHERE that hash comes from has two answers, and the order matters — see `resolve`. So does
+//! WHERE the exe comes from: GitHub serves it under the asset NAME the release lists, a mirror
+//! under the HASH the signed manifest names, and `resolve` is the one place self-update learns
+//! which it is talking to without ever knowing which it is talking to.
 
 use anyhow::{bail, Context, Result};
 use std::io::Read;
@@ -29,6 +32,8 @@ use std::time::Duration;
 use crate::config::Settings;
 use crate::downloader::{Asset, ChunkProgress, Downloader, Release};
 use crate::engine::{self, version_lt};
+use crate::install::{Origin, Resolved};
+use crate::manifest::{FileEntry, Manifest};
 use crate::trust::Payload;
 
 /// The launcher binary published by release.yml, and the checksum sidecar beside it.
@@ -142,8 +147,7 @@ fn apply_at(
     let dir = exe.parent().context("the launcher executable has no parent directory")?;
     ensure_dir_writable(dir)?;
 
-    let asset = exe_asset(release)?;
-    let (expected, expected_size) = expected_sha(settings, dl, release, &asset.name)?;
+    let Target { asset, sha256: expected, size: expected_size } = resolve(settings, dl, release)?;
 
     let new = sibling(exe, ".new.exe");
     // Deliberately never resumed. A `.part` left by an earlier attempt at a DIFFERENT version
@@ -157,7 +161,7 @@ fn apply_at(
     // help here. Same idea as `install::obtain_to_cache`'s asset cap, reused rather than shared:
     // this path never retries or resumes, so it has no backoff loop to thread the guard through.
     // Only wired when `expected_size` came from the SIGNED manifest — the legacy `.sha256`
-    // sidecar path has no trustworthy size at all (see `expected_sha`) and stays uncapped.
+    // sidecar path has no trustworthy size at all (see `resolve`) and stays uncapped.
     let mut capped = false;
     let result = match expected_size {
         Some(size) => {
@@ -168,9 +172,9 @@ fn apply_at(
                 }
                 progress(written, total)
             };
-            dl.download_to(asset, &new, 0, &mut guarded)
+            dl.download_to(&asset, &new, 0, &mut guarded)
         }
-        None => dl.download_to(asset, &new, 0, progress),
+        None => dl.download_to(&asset, &new, 0, progress),
     };
     if let Err(e) = result {
         // a partial exe next to the launcher is AV bait and cleanup_old deliberately ignores
@@ -229,32 +233,47 @@ fn verify(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-/// The published launcher binary: the canonical name first, else the release's single `.exe`
-/// (the local file may have been renamed by the user, but the ASSET name is ours). Several
-/// unnamed candidates is ambiguous — refuse rather than guess which one to run.
-fn exe_asset(release: &Release) -> Result<&Asset> {
-    if let Some(a) = release.asset(EXE_ASSET) {
-        return Ok(a);
-    }
-    let mut exes = release.assets.iter().filter(|a| a.name.to_ascii_lowercase().ends_with(".exe"));
-    let first = exes.next().context("the launcher release has no .exe asset")?;
-    if exes.next().is_some() {
-        bail!("the launcher release has several .exe assets and none named {EXE_ASSET}");
-    }
-    Ok(first)
+/// What `apply_at` fetches and what it must prove: the exe as THIS source addresses it, the hash
+/// the release commits to for it, and — only when the SIGNED manifest is where both came from —
+/// the size to cap the transfer at.
+struct Target {
+    asset: Asset,
+    sha256: String,
+    size: Option<u64>,
 }
 
-/// The hash the release commits to for the CHOSEN exe asset, and — only when it comes from the
-/// SIGNED manifest — the size to cap its download at. The hash is never optional: a release that
-/// commits to nothing fails loudly (the user can still download it by hand) instead of swapping in
-/// an unchecked binary. The size IS optional, and that is deliberate — see below.
+/// The launcher to install from `release`, resolved for whatever backend `dl` is. The hash is never
+/// optional: a release that commits to nothing fails loudly (the user can still download it by
+/// hand) instead of swapping in an unchecked binary. The size IS optional, and that is deliberate
+/// — see below.
 ///
-/// TWO sources, and the SIGNED one wins. A `.minisig` over the launcher's manifest is a statement
-/// by a key we pinned; the `.sha256` sidecar is a statement by whoever served the release, which
-/// is exactly the party a mirror lets somebody else be. The sidecar is nonetheless still read, and
-/// release.yml must keep publishing it: launchers already installed check it and nothing else, and
-/// self-update is the one path that has to keep working for builds that predate every change made
-/// to it.
+/// TWO sources of the hash, and the SIGNED one wins. A `.minisig` over the launcher's manifest is
+/// a statement by a key we pinned; the `.sha256` sidecar is a statement by whoever served the
+/// release, which is exactly the party a mirror lets somebody else be. The sidecar is nonetheless
+/// still read, and release.yml must keep publishing it: launchers already installed check it and
+/// nothing else, and self-update is the one path that has to keep working for builds that predate
+/// every change made to it.
+///
+/// On the SIGNED branch the manifest also decides WHICH entry is the launcher and the source only
+/// decides how to address it — through `install::Resolved::asset_for`, the same rule every payload
+/// download goes through. GitHub is name-addressed: the entry's `name` is looked up in the
+/// release's asset list. A mirror is content-addressed: it has no asset list at all, and the
+/// entry's `sha256` IS its address (`Mirror::url_of` sends a hash to `blobs/<sha256>`). Reading
+/// the exe out of the release index, as this used to, worked on GitHub and could never work on a
+/// mirror — the synthetic release a mirror opens carries only the two trust documents, so the exe
+/// "was not published" there however faithfully it was mirrored. A second copy of the two-shape
+/// rule here would be free to drift from install.rs's; reusing it is what keeps a launcher that
+/// installs from one source from 404ing on the other.
+///
+/// The LEGACY branch (no manifest) stays name-addressed through `exe_asset`, and that is not a gap
+/// left open for mirrors: a mirror's `fetch_release` always synthesizes `manifest.json` into the
+/// release it reports, so on a mirror this branch is unreachable by construction. It exists for
+/// GitHub releases cut before signing did.
+///
+/// Everything else on the signed branch — a signature that is missing, bad, from an unknown key,
+/// or over a document that names a different payload — is an ERROR, not a fallback. Silently
+/// dropping to the sidecar on a failed check would make the signature decorative: a downgrade
+/// would cost an attacker one deleted file.
 ///
 /// KNOWN AND DELIBERATE GAP: a release publishing no manifest at all falls back to the sidecar, so
 /// an attacker who can choose what we see can strip the signed pair and be believed on the weaker
@@ -272,48 +291,62 @@ fn exe_asset(release: &Release) -> Result<&Asset> {
 /// trust input, it would be a made-up number dressed as one. `apply_at` leaves that branch's
 /// download uncapped rather than pretend otherwise — the known gap stays exactly the shape it
 /// already is, not silently narrowed by a number nobody signed.
-fn expected_sha(
-    settings: &Settings,
-    dl: &dyn Downloader,
-    release: &Release,
-    exe_name: &str,
-) -> Result<(String, Option<u64>)> {
-    if let Some((sha, size)) = signed_sha(settings, dl, release, exe_name)? {
-        return Ok((sha, Some(size)));
-    }
-    Ok((legacy_sha(dl, release, exe_name)?, None))
-}
-
-/// The exe's hash AND size out of the launcher payload's signed manifest, or `None` when this
-/// release publishes no manifest to read.
-///
-/// Everything else — a signature that is missing, bad, from an unknown key, or over a document
-/// that names a different payload — is an ERROR, not a fallback. Silently dropping to the sidecar
-/// on a failed check would make the signature decorative: a downgrade would cost an attacker one
-/// deleted file.
 ///
 /// The entry's `dest` is deliberately not consulted. A launcher payload installs nothing into a
 /// game folder; the producer still emits a legal `dest` because the format demands one. `size`,
-/// unlike `dest`, IS read now — it is the same trust input as `sha256`, just enforced during the
+/// unlike `dest`, IS read — it is the same trust input as `sha256`, just enforced during the
 /// transfer instead of after it (see `apply_at`).
-fn signed_sha(
-    settings: &Settings,
-    dl: &dyn Downloader,
-    release: &Release,
-    exe_name: &str,
-) -> Result<Option<(String, u64)>> {
+fn resolve(settings: &Settings, dl: &dyn Downloader, release: &Release) -> Result<Target> {
     if release.asset(engine::MANIFEST_ASSET).is_none() {
-        return Ok(None);
+        let asset = exe_asset(release)?.clone();
+        let sha256 = legacy_sha(dl, release, &asset.name)?;
+        return Ok(Target { asset, sha256, size: None });
     }
     let manifest = engine::manifest_of(settings, dl, release, Payload::Launcher)?;
-    let entry = manifest
-        .files
-        .iter()
-        .find(|f| f.name.as_deref() == Some(exe_name))
-        .with_context(|| {
-            format!("the signed manifest of {} does not name {exe_name}", release.tag_name)
-        })?;
-    Ok(Some((entry.sha256.clone(), entry.size)))
+    let entry = exe_entry(&manifest, &release.tag_name)?;
+    let name = entry.name.as_deref().expect("exe_entry only ever returns a named entry");
+    let asset = Resolved::of(&Origin::new(dl, release))
+        .asset_for(name, &entry.sha256, entry.size)
+        .with_context(|| format!("release {} publishes no asset named {name}", release.tag_name))?;
+    Ok(Target { asset, sha256: entry.sha256.clone(), size: Some(entry.size) })
+}
+
+/// The launcher entry of a SIGNED manifest: the canonical name first, else the document's single
+/// `.exe`-named entry. Several unnamed candidates is ambiguous — refuse rather than guess which one
+/// to run; none is a broken release, and guessing which hash it meant is the one thing we must
+/// not do. The same rule `exe_asset` applies to a release index, applied to the signed document
+/// instead — which is the one that exists on every source (a mirror publishes no index).
+fn exe_entry<'m>(manifest: &'m Manifest, tag: &str) -> Result<&'m FileEntry> {
+    let named = |f: &&FileEntry| f.name.is_some();
+    if let Some(e) = manifest.files.iter().filter(named).find(|f| f.name.as_deref() == Some(EXE_ASSET)) {
+        return Ok(e);
+    }
+    let mut exes = manifest.files.iter().filter(named).filter(|f| {
+        f.name.as_deref().is_some_and(|n| n.to_ascii_lowercase().ends_with(".exe"))
+    });
+    let first = exes
+        .next()
+        .with_context(|| format!("the signed manifest of {tag} does not name a launcher executable"))?;
+    if exes.next().is_some() {
+        bail!("the signed manifest of {tag} names several .exe entries and none is {EXE_ASSET}");
+    }
+    Ok(first)
+}
+
+/// The published launcher binary of a release index — the LEGACY branch of `resolve`, for a
+/// release with no signed manifest to ask instead. The canonical name first, else the release's
+/// single `.exe` (the local file may have been renamed by the user, but the ASSET name is ours).
+/// Several unnamed candidates is ambiguous — refuse rather than guess which one to run.
+fn exe_asset(release: &Release) -> Result<&Asset> {
+    if let Some(a) = release.asset(EXE_ASSET) {
+        return Ok(a);
+    }
+    let mut exes = release.assets.iter().filter(|a| a.name.to_ascii_lowercase().ends_with(".exe"));
+    let first = exes.next().context("the launcher release has no .exe asset")?;
+    if exes.next().is_some() {
+        bail!("the launcher release has several .exe assets and none named {EXE_ASSET}");
+    }
+    Ok(first)
 }
 
 /// The release's published sha256 sidecar. `<chosen>.sha256` first, so the renamed-exe fallback of
@@ -878,14 +911,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A signed manifest that says nothing about the exe we chose is not an excuse to fall back —
-    /// it is a broken release, and guessing which hash it meant is the one thing we must not do.
+    /// The SIGNED manifest decides which entry is the launcher, and a release whose index does not
+    /// carry that entry is a broken release — not an excuse to fall back to whatever `.exe` the
+    /// index happens to list, whose hash the signed document never vouched for. Guessing which
+    /// hash it meant is the one thing we must not do.
     #[test]
     fn a_signed_manifest_that_does_not_name_the_exe_is_refused() {
         let body: &[u8] = b"MZ\x90\x00NEW LAUNCHER";
         let (dir, fake) = stage_signed("phoenix-selfupdate-unnamed", body, &"d".repeat(64), "launcher");
-        // the manifest's one entry names a different asset. Re-signed rather than edited in
-        // place, so this tests the missing ENTRY and not a broken signature.
+        // the manifest's one entry names an asset the release does not publish. Re-signed rather
+        // than edited in place, so this tests the missing ASSET and not a broken signature.
         let doc = String::from_utf8(fake.assets["manifest.json"].clone())
             .unwrap()
             .replace(EXE_ASSET, "something-else.exe");
@@ -893,14 +928,143 @@ mod tests {
         let exe = dir.join("phoenix-launcher.exe");
         let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
             .unwrap_err();
-        assert!(format!("{err:#}").contains("does not name"), "got: {err:#}");
+        assert!(format!("{err:#}").contains("no asset named something-else.exe"), "got: {err:#}");
         assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER");
+        assert!(!sibling(&exe, ".new.exe").exists(), "nothing was even downloaded");
+
+        // …and a manifest naming NO executable at all is refused before any source is asked
+        let doc = String::from_utf8(fake.assets["manifest.json"].clone())
+            .unwrap()
+            .replace("something-else.exe", "notes.txt");
+        let fake = crate::downloader::fake::Fake::new("v999.0.0", &doc, vec![(EXE_ASSET, body)]);
+        let err = apply_at(&exe, &settings(), &fake, &fake.fetch_release("r", None).unwrap(), &mut |_, _| true)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("does not name a launcher"), "got: {err:#}");
+        assert_eq!(std::fs::read(&exe).unwrap(), b"OLD LAUNCHER");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- which source, which address ----
+
+    /// A launcher release as a MIRROR serves it: the signed manifest and its signature at the
+    /// payload root, the exe under `blobs/<sha256>` — and nothing under the asset's NAME, because
+    /// a content-addressed host has no such path. Returns the server, a `Mirror` over it, and the
+    /// exe's hash.
+    fn launcher_mirror(body: &[u8]) -> (crate::test_http::TestServer, crate::mirror::Mirror, String) {
+        use crate::test_http::{Canned, TestServer};
+        use sha2::Digest;
+        let hash = hex::encode(sha2::Sha256::digest(body));
+        let manifest = serde_json::json!({
+            "schema": 2,
+            "payload_id": "launcher",
+            "serial": 3,
+            "version": "999.0.0",
+            "files": [{
+                "name": EXE_ASSET,
+                "dest": "phoenix-launcher.exe",
+                "sha256": hash,
+                "size": body.len(),
+            }]
+        })
+        .to_string()
+        .into_bytes();
+        let sig = crate::trust::testing::test_sig(&manifest).into_bytes();
+        let blob_path: &'static str = Box::leak(format!("/launcher/blobs/{hash}").into_boxed_str());
+        let blob = body.to_vec();
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert("/launcher/manifest.json", Canned::body(manifest));
+            routes.insert("/launcher/manifest.json.minisig", Canned::body(sig));
+            routes.insert(blob_path, Canned::body(blob));
+            routes
+        });
+        // `download_agent()` is https-only and a loopback listener cannot speak TLS — the same swap
+        // mirror.rs's own tests make, with every other field the real thing
+        let agent = ureq::builder()
+            .timeout_connect(Duration::from_secs(5))
+            .timeout_read(Duration::from_secs(5))
+            .timeout_write(Duration::from_secs(5))
+            .redirects(0)
+            .build();
+        let base = format!("http://127.0.0.1:{}", server.port);
+        (server, crate::mirror::Mirror::with_agent(&base, Payload::Launcher, agent), hash)
+    }
+
+    /// The two shapes the launcher exe resolves to, from ONE signed manifest entry: on a
+    /// name-addressed source (GitHub; the `Fake` here) the asset is the release's, under the
+    /// entry's NAME; on a content-addressed one (a mirror) it is synthesized with the entry's HASH
+    /// as its name, which `Mirror::url_of` sends to `blobs/<sha256>`. The hash and size come from
+    /// the signed document either way — the source only ever decides the address.
+    #[test]
+    fn the_launcher_exe_is_addressed_by_name_on_github_and_by_hash_on_a_mirror() {
+        use sha2::Digest;
+        let body: &[u8] = b"MZ\x90\x00A LAUNCHER, ADDRESSED TWO WAYS";
+        let hash = hex::encode(sha2::Sha256::digest(body));
+
+        let (dir, fake) = stage_signed("phoenix-selfupdate-shape-name", body, &hash, "launcher");
+        assert!(!fake.content_addressed(), "the Fake stands in for GitHub: a release index");
+        let release = fake.fetch_release("r", None).unwrap();
+        let t = resolve(&settings(), &fake, &release).expect("resolves on a name-addressed source");
+        assert_eq!(t.asset.name, EXE_ASSET, "GitHub serves the exe under the asset name");
+        assert_eq!(t.sha256, hash);
+        assert_eq!(t.size, Some(body.len() as u64), "the signed size caps the transfer");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (server, mirror, hash2) = launcher_mirror(body);
+        assert_eq!(hash2, hash);
+        assert!(mirror.content_addressed());
+        let release = mirror.fetch_release("ignored/repo", None).expect("the mirror's one release");
+        assert!(
+            release.asset(EXE_ASSET).is_none(),
+            "a mirror publishes no index, so the exe cannot be found by name — that was the bug"
+        );
+        let t = resolve(&settings(), &mirror, &release).expect("resolves on a content-addressed source");
+        assert_eq!(t.asset.name, hash, "a mirror serves the exe under its hash");
+        assert_eq!(t.sha256, hash);
+        assert_eq!(t.size, Some(body.len() as u64));
+        // only the two trust documents crossed the wire so far — resolving is not downloading
+        assert_eq!(server.hits("/launcher/manifest.json"), 1);
+        assert_eq!(server.hits("/launcher/manifest.json.minisig"), 1);
+        assert_eq!(server.hits(&format!("/launcher/blobs/{hash}")), 0);
+    }
+
+    /// The bug, end to end: a self-update from a mirror. The exe is fetched from `blobs/<sha256>`,
+    /// verified against the signed hash, and swapped in — and the path the old code asked for, the
+    /// asset's NAME at the payload root, is never requested, because it does not exist on any
+    /// mirror. Inert in production while `MIRROR_DOWNLOADS_ENABLED` is false; this is what whoever
+    /// flips it inherits.
+    #[test]
+    fn a_launcher_self_updates_from_a_mirror_by_hash() {
+        let body: &[u8] = b"MZ\x90\x00A LAUNCHER BUILD SERVED BY A MIRROR";
+        let (server, mirror, hash) = launcher_mirror(body);
+        let dir = std::env::temp_dir().join("phoenix-selfupdate-from-mirror");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("phoenix-launcher.exe");
+        std::fs::write(&exe, b"OLD LAUNCHER").unwrap();
+
+        let release = mirror.fetch_release("ignored/repo", None).unwrap();
+        assert!(
+            available(&settings(), &mirror, &release).unwrap().is_some(),
+            "the mirror's signed release is an upgrade, judged by the same gate as GitHub's"
+        );
+        let out = apply_at(&exe, &settings(), &mirror, &release, &mut |_, _| true).unwrap();
+        assert_eq!(out, exe, "the returned path is the one to restart");
+        assert_eq!(std::fs::read(&exe).unwrap(), body);
+        assert_eq!(std::fs::read(sibling(&exe, ".old.exe")).unwrap(), b"OLD LAUNCHER");
+        assert!(!sibling(&exe, ".new.exe").exists(), "staging is consumed");
+
+        assert_eq!(server.hits(&format!("/launcher/blobs/{hash}")), 1, "fetched by hash, once");
+        assert!(!server.saw_authorization(&format!("/launcher/blobs/{hash}")), "a mirror gets no credential");
+        assert_eq!(server.hits(&format!("/launcher/{EXE_ASSET}")), 0, "the name is not a path a mirror has");
+        assert_eq!(server.hits(&format!("/launcher/{SHA_ASSET}")), 0, "nor is the legacy sidecar");
+        assert_eq!(server.hits("/launcher/manifest.json"), 1, "read once, verified once — never twice");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The legacy shape — no manifest at all — still installs from the sidecar. Every launcher in
     /// the wild predates signing, and refusing them would strand exactly the builds that most need
-    /// to update. (See `expected_sha` for how that gap closes.)
+    /// to update. (See `resolve` for how that gap closes.)
     #[test]
     fn a_release_that_predates_signing_still_installs_from_the_sidecar() {
         let (dir, fake) = stage("phoenix-selfupdate-legacy", b"MZ\x90\x00NEW LAUNCHER", None);
