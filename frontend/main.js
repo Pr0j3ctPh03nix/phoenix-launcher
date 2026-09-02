@@ -3829,7 +3829,14 @@ async function boot() {
   // fails to load must not be what decides whether sources get resolved. All this side does is
   // paint what the registry already says, and then follow it — the block changes at moments this
   // side cannot predict (a measuring pass finishing after boot, a failover mid-download).
-  listen("sources-changed", (ev) => {
+  //
+  // SUBSCRIBE FIRST, then ask. The listener is not registered until `listen`'s promise resolves,
+  // so an event emitted before that — in the window `refreshSources()` opens by awaiting an IPC
+  // call of its own — is simply lost. The last one the boot sequence emits is the measuring pass's
+  // own result, after which nothing fires until the scheduler finds something due: up to an hour,
+  // or never on a healthy machine. The pass takes seconds, so the window is usually missed;
+  // usually is not an ordering.
+  await listen("sources-changed", (ev) => {
     state.sourcesView = ev.payload;
     renderSources(state.sourcesView);
   }).catch(() => {});
