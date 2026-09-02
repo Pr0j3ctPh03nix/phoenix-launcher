@@ -7,6 +7,10 @@ license = "GPL-3.0-only"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# build.rs `include!`s src/minisig.rs so the build script and the binary cannot disagree about the
+# signature format. That file verifies Ed25519, so the script needs the same primitive the binary
+# does — the SAME crate, already in the tree; nothing new is pulled in for it.
+ring = "0.17"
 
 [dependencies]
 tauri = { version = "2", features = [] }

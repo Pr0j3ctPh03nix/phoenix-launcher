@@ -247,7 +247,7 @@ pub fn manifest_of(
         .download_limited(sig_asset, trust::MAX_SIG_BYTES)
         .with_context(|| format!("downloading {sig_name}"))?;
     let sig = String::from_utf8(sig)
-        .map_err(|_| anyhow!(trust::TrustError::Malformed("not UTF-8")))?;
+        .map_err(|_| anyhow!(crate::minisig::SigError::Malformed("not UTF-8")))?;
     // WHICH key signed is deliberately not acted on: a release signed by the cold spare installs
     // exactly like one signed by the active key (the spare exists for the day the other is gone,
     // and a client that treated it as suspicious would defeat its only purpose). The id is
@@ -802,14 +802,20 @@ mod tests {
     /// frontend's soft set and therefore never blocks Play on an install that is already clean.
     #[test]
     fn an_unverifiable_manifest_is_refused_as_notfound() {
+        use crate::minisig::SigError;
         use crate::trust::TrustError;
         let settings = Settings::default();
         let doc = r#"{"schema":2,"version":"1.0.0","files":[]}"#;
         let refusal = |dl: &dyn Downloader| -> String {
             let release = dl.fetch_release("r", None).unwrap();
             let e = manifest_of(&settings, dl, &release, Payload::Mod).unwrap_err();
+            // EITHER typed refusal — the signature file's own (`SigError`) or the document's
+            // identity (`TrustError`). The variants below produce both, and `wire_kind` has to
+            // classify each of them; an assertion naming only one type would let the other fall
+            // through to "internal", which the frontend treats as fatal.
             assert!(
-                e.chain().any(|c| c.downcast_ref::<TrustError>().is_some()),
+                e.chain().any(|c| c.downcast_ref::<TrustError>().is_some()
+                    || c.downcast_ref::<SigError>().is_some()),
                 "must carry a typed trust failure so the shell can classify it: {e:#}"
             );
             assert_eq!(crate::views::CmdError::from(e).kind, "notFound");

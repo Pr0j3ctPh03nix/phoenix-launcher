@@ -13,6 +13,24 @@
 
 use std::path::{Path, PathBuf};
 
+/// The runtime's own signature reader, compiled into this script.
+///
+/// Not a copy and not a reimplementation: `src/minisig.rs` is the file the binary uses, pulled in
+/// here so that a disagreement between the build script and the binary about what a `.minisig` (or
+/// its base64) is cannot be expressed.
+///
+/// `#[path]` rather than `include!`: an `include!`d file may not carry `//!` module docs (they are
+/// inner attributes, which macro expansion cannot introduce), and the format's own documentation
+/// is the most useful thing in that file. A build script is an ordinary crate root, so a plain
+/// module declaration with a path works and keeps the file readable as a module.
+///
+/// It is the RUNTIME's module, so the parts this script has no use for are not dead code in any
+/// meaningful sense — the point of sharing it is that there is one implementation, not that both
+/// callers reach every line of it.
+#[allow(dead_code)]
+#[path = "src/minisig.rs"]
+mod minisig;
+
 /// Overrides where the `.pub` files are read from. A local build points it at any
 /// `release-tooling` checkout's `keys/`; CI does not set it — see `keys_dir`.
 const KEYS_DIR_ENV: &str = "PHOENIX_KEYS_DIR";
@@ -34,6 +52,8 @@ const KEYS: [(&str, &str); 2] = [
 ];
 
 fn main() {
+    // the reader this script shares with the binary — a change to it has to re-run the generation
+    println!("cargo:rerun-if-changed=src/minisig.rs");
     // before tauri's codegen: if this build is going to be refused, say so immediately rather than
     // after a round of work whose output is about to be thrown away
     generate_pinned_keys();
@@ -134,7 +154,7 @@ fn parse_pub(text: &str) -> Result<([u8; 8], [u8; 32]), String> {
     if body.next().is_some() {
         return Err("it has more than one key line".into());
     }
-    let blob = b64(line).ok_or("the key line is not standard base64")?;
+    let blob = minisig::b64(line).ok_or("the key line is not standard base64")?;
     if blob.len() != 42 {
         return Err(format!(
             "the key line decodes to {} bytes, not 42 (2-byte algorithm + 8-byte key id + 32-byte key)",
@@ -151,41 +171,6 @@ fn parse_pub(text: &str) -> Result<([u8; 8], [u8; 32]), String> {
         blob[2..10].try_into().expect("10 - 2 == 8"),
         blob[10..].try_into().expect("42 - 10 == 32"),
     ))
-}
-
-/// Standard base64 (RFC 4648), decoded strictly — canonical padding, no whitespace, no wrapping,
-/// no alternate alphabet, and no non-zero bits past the last byte. Deliberately the same
-/// intolerance as `trust::b64`, and deliberately not a dependency: a build script that pulls a
-/// crate in to read 56 characters has bought a supply chain for the one input whose whole job is
-/// to be trustworthy.
-fn b64(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    if b.is_empty() || b.len() % 4 != 0 {
-        return None;
-    }
-    let pad = b.iter().rev().take_while(|&&c| c == b'=').count();
-    if pad > 2 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(b.len() / 4 * 3);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    for &c in &b[..b.len() - pad] {
-        let v = match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None, // including a '=' anywhere but the very end
-        };
-        acc = (acc << 6) | v as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-        }
-    }
-    (acc & ((1 << bits) - 1) == 0).then_some(out)
 }
 
 /// Stop the build, saying what is wrong and what would fix it.

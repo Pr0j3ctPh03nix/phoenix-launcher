@@ -367,7 +367,7 @@ fn mirrors_sig() -> String {
 /// A `.minisig`'s bytes as the text `trust::verify` reads.
 fn sig_text(bytes: Vec<u8>) -> Result<String> {
     String::from_utf8(bytes)
-        .map_err(|_| anyhow::Error::new(crate::trust::TrustError::Malformed("not UTF-8")))
+        .map_err(|_| anyhow::Error::new(crate::minisig::SigError::Malformed("not UTF-8")))
 }
 
 /// The published mirror list, VERIFIED — from the registry repo's release, or from a mirror.

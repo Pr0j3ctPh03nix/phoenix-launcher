@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::downloader::NetKind;
 use crate::engine::{self, Action, Cancelled, GameRunning};
 use crate::manifest::{Label, OptionKind, UnsupportedCodec, UnsupportedSchema};
+use crate::minisig::SigError;
 use crate::state;
 use crate::trust::TrustError;
 
@@ -548,7 +549,12 @@ fn wire_kind(e: &anyhow::Error) -> &'static str {
         // frontend's SOFT_ERR set is `network | auth | notFound`, and those are the failures that
         // let Play proceed on an install that was already clean. A signing scheme whose failure
         // mode is "your game stops working" would be worse than the exposure it removes.
-        if c.downcast_ref::<TrustError>().is_some() {
+        //
+        // BOTH halves of that refusal, and they are two types on purpose (see `minisig`): a
+        // signature file we cannot read, and a document that is not the one that was asked for.
+        // The user-visible answer is the same for either, and an arm that covered only one of them
+        // would leave the other falling through to "internal" — an error the UI treats as fatal.
+        if c.downcast_ref::<TrustError>().is_some() || c.downcast_ref::<SigError>().is_some() {
             return "notFound";
         }
         if c.downcast_ref::<GameRunning>().is_some() {

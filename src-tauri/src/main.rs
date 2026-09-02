@@ -25,6 +25,9 @@ mod install;
 mod keep;
 mod launch;
 mod manifest;
+// The `.minisig` format, split out of trust.rs because `build.rs` includes this same file —
+// see its own module doc.
+mod minisig;
 mod mirror;
 mod selfupdate;
 mod state;
