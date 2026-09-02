@@ -132,6 +132,17 @@ struct Candidate<'a> {
     authoritative: bool,
 }
 
+/// Should the very first request carry the credential, instead of earning it after a refusal?
+///
+/// Only for the SOURCE repo. That is the one the baked credential is scoped to and the one that is
+/// private, so anonymous there is a round trip that exists only to be refused. Everything else is
+/// public, and a repo-scoped credential can be REFUSED where anonymous access succeeds — so those
+/// keep asking anonymously first. Split out from `candidates` so the rule is testable without a
+/// credential baked into the test binary.
+fn authenticate_first(token: Option<&str>, repo: &str, source_repo: &str) -> bool {
+    token.is_some() && repo == source_repo
+}
+
 /// The sources for `repo`, in priority order.
 ///
 /// The user's PIN leads (`config::active_index` resolves which source is the one in use — the same
@@ -144,17 +155,6 @@ struct Candidate<'a> {
 /// primary alone and every rule below degenerates to what it always was — and only for a repo whose
 /// PAYLOAD this build can name: a mirror is addressed `<base>/<payload>/…`, so a repo that maps to
 /// no payload (the debug CLI's `--repo`) has no mirror path to build at all.
-/// Should the very first request carry the credential, instead of earning it after a refusal?
-///
-/// Only for the SOURCE repo. That is the one the baked credential is scoped to and the one that is
-/// private, so anonymous there is a round trip that exists only to be refused. Everything else is
-/// public, and a repo-scoped credential can be REFUSED where anonymous access succeeds — so those
-/// keep asking anonymously first. Split out from `candidates` so the rule is testable without a
-/// credential baked into the test binary.
-fn authenticate_first(token: Option<&str>, repo: &str, source_repo: &str) -> bool {
-    token.is_some() && repo == source_repo
-}
-
 fn candidates<'a>(settings: &'a Settings, repo: &str) -> Vec<Candidate<'a>> {
     let token = settings.token();
     // AUTHENTICATED FIRST, but only for the SOURCE repo. That is the one the baked credential is
