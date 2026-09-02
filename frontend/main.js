@@ -24,10 +24,8 @@ const state = {
   hasToken: false,
   renderer: "dx11",
   launchFlags: [],    // [{id, args, enabled}] as loaded from settings, toggled in place
-  sources: [],         // [{kind, url, enabled}] in priority order, from the backend. DISCOVERED,
-                       // not authored, and INSTANT-APPLY — absent from settingsSnapshot()
-  mirrorProbes: {},    // sourceKey -> last probe. Session-only; an unswept source has none
-  mirrorSweeping: false, // a sweep is in flight (double-start guard)
+  sourcesView: null,   // the download-source status block, PUSHED by the backend. A report of
+                       // the ranking the download path is walking — never a form.
   afTarget: null,      // "setup" | "settings" — where an autofind pick lands
   afUnlisten: null,
   afBusy: false,       // a scan invoke is in flight (double-start guard)
@@ -932,6 +930,9 @@ function rerenderDynamic() {
   if (gv.data) { renderGvChrome(); renderGvTabs(); gvRebuild(); }
   if (state.lastCheck) applyCheck(state.lastCheck);
   else { setIdleStatus(); renderPrimary(); }
+  // the source block is built from live backend data, so re-word it from the value in hand rather
+  // than paying a round trip for a language switch
+  if (state.sourcesView) renderSources(state.sourcesView);
   updateTokenPlaceholder();
   renderLaunchFlags();
   renderOptions();
@@ -1041,17 +1042,15 @@ function renderLaunchFlags() {
 }
 
 // ---- download sources ----
-// Instant-apply, like language and animations: every edit here writes through immediately, so
-// sources never appear in settingsSnapshot() and Save has nothing to do with them.
+// A REPORT, not a form. Sources are discovered from the published mirrors.json and ranked by a
+// real measurement, so there is nothing here to switch, pin or save — the only thing worth doing
+// with the ranking is showing it.
 //
-// The list is discovered, not authored — mirrors arrive in the published mirrors.json and the only
-// choice a user makes about one is whether to use it. The primary has no switch at all.
-
-// Probes are keyed by this, not by url: the primary has none, and a sentinel URL would be a lie
-// waiting to collide with a real mirror.
-function sourceKey(s) {
-  return s.kind === "primary" ? "@primary" : s.url;
-}
+// PUSHED, not polled. It changes at moments this side cannot predict: a measuring pass finishing
+// eight seconds after boot, and a failover in the middle of a three-hour game download. A timer
+// would be either a poll running forever for a block that changes twice a session, or a stale
+// block. `download_sources` is the first paint and the reconnect path for a webview that missed
+// the events it was not there for.
 
 function hostOf(url) {
   try {
@@ -1066,165 +1065,102 @@ function fmtSpeed(bps) {
   return mib >= 1 ? `${mib.toFixed(1)} MiB/s` : `${Math.max(1, Math.round(bps / 1024))} KiB/s`;
 }
 
-// The second line of a row: the last sweep's verdict, or what the source is when never measured.
-// Speed leads because it is what a source is chosen on — a latency figure alone is exactly the
-// reassuring number that a throttled path still passes.
-function mirrorMeta(s) {
-  const p = state.mirrorProbes[sourceKey(s)];
-  if (!p) {
-    if (s.kind === "primary") return { text: t("mirror.primaryHint"), cls: "" };
-    // "acknowledged but not tested" — the state auto-pick leaves behind when it is switched off,
-    // and the reason the manual button exists
-    return { text: s.measured ? s.url : `${t("mirror.untested")} · ${s.url}`, cls: "" };
-  }
-  // Localized verdict + the backend's raw diagnosis, the same grammar onError() uses: the reason
-  // comes from Rust and is English, so on its own it would be the one untranslated line in the pane.
-  if (!p.healthy) {
-    const why = t("mirror.unusable");
-    return { text: p.error ? `${why} · ${p.error}` : why, cls: "bad" };
-  }
-  const bits = [p.bytesPerSec ? fmtSpeed(p.bytesPerSec) : "—", `${p.latencyMs} ms`];
-  if (p.tag) bits.push(p.tag);
-  // no resume means a dropped connection restarts the whole file — on a multi-GiB download that
-  // is the difference between finishing and not, so it is called out rather than folded into "ok"
-  if (!p.rangeOk) bits.push(t("mirror.noResume"));
-  return { text: bits.join(" · "), cls: p.rangeOk ? "good" : "" };
+// How long ago the measurement was taken. Coarse on purpose: the useful question is "is this
+// number from this session or from last week", and a live seconds counter would be the one thing
+// on this screen that never stops moving.
+//
+// Its own function rather than the files view's `fmtAge`: that one dates a file the user last
+// touched, in days, and the granularity that matters here is MINUTES — a measuring pass finishes
+// seconds after boot and the block has to stop saying "measuring…" in a way you can read.
+function srcAge(unixSeconds) {
+  const mins = Math.max(0, Math.round(Date.now() / 1000 - unixSeconds) / 60);
+  if (mins < 1) return t("src.ageNow");
+  if (mins < 60) return t("src.ageMin", { n: Math.round(mins) });
+  if (mins < 60 * 24) return t("src.ageHour", { n: Math.round(mins / 60) });
+  return t("src.ageDay", { n: Math.round(mins / 60 / 24) });
 }
 
-function renderMirrors() {
-  const list = $("mirror-list");
+// The second line of a row: what the last measurement concluded. Speed leads because it is what a
+// source is ranked on — a latency figure alone is exactly the reassuring number that a throttled
+// path still passes.
+function srcMeta(r) {
+  if (r.measuring) return { text: t("src.measuring"), cls: "" };
+  if (r.measuredAt == null) return { text: t("src.untested"), cls: "" };
+  if (!r.healthy) {
+    // localized verdict + the backend's raw diagnosis, the same grammar onError() uses: the reason
+    // comes from Rust and is English, so on its own it would be the one untranslated line here
+    const why = t("src.unusable");
+    return { text: r.error ? `${why} · ${r.error}` : why, cls: "bad" };
+  }
+  const bits = [r.bytesPerSec ? fmtSpeed(r.bytesPerSec) : "—"];
+  if (r.latencyMs != null) bits.push(`${r.latencyMs} ms`);
+  if (r.tag) bits.push(r.tag);
+  // no resume means a dropped connection restarts the whole file — on a multi-GiB download that is
+  // the difference between finishing and not, so it is called out rather than folded into "ok"
+  if (!r.rangeOk) bits.push(t("src.noResume"));
+  bits.push(srcAge(r.measuredAt));
+  return { text: bits.join(" · "), cls: r.rangeOk ? "good" : "" };
+}
+
+function renderSources(v) {
+  const rows = v.sources || [];
+  // Hidden while there is one source and it works. A block that always said "Main source, in use"
+  // would be a label rather than information — and with nothing published this is exactly the UI
+  // the launcher had before mirrors existed, with no flag anywhere.
+  const worth = rows.length > 1 || (rows[0] && (!rows[0].healthy || rows[0].failed));
+  $("sources").classList.toggle("hidden", !worth);
+  if (!worth) return;
+
+  const list = $("src-list");
   list.innerHTML = "";
-  $("mirror-empty").classList.toggle("hidden", state.sources.some((s) => s.kind === "mirror"));
-  for (const s of state.sources) {
-    const primary = s.kind === "primary";
+  for (const r of rows) {
     const row = document.createElement("div");
-    // `active` is resolved by the BACKEND (config::active_index) — the same call the download path
-    // makes — so the pane can never disagree with it about which source is in use.
-    row.className = "mirror-row" + (s.enabled ? " on" : "") + (s.active ? " current" : "");
-    row.tabIndex = 0;
-    row.setAttribute("role", "button");
-    row.title = t("mirror.pickTip");
+    // `active` is resolved by the BACKEND (source::Registry) — the same value the download path
+    // walks — so this block can never disagree with it about which source is in use.
+    row.className = "src-row" + (r.active ? " current" : "");
 
     const text = document.createElement("div");
-    text.className = "mirror-text";
+    text.className = "src-text";
     const host = document.createElement("span");
-    host.className = "mirror-host";
-    // the primary is deliberately nameless — which repo it is is not the user's concern here
-    host.textContent = primary ? t("mirror.primary") : hostOf(s.url);
-    if (!primary) host.title = s.url; // the full URL stays on hover
-    const info = mirrorMeta(s);
+    host.className = "src-host";
+    // the built-in source is deliberately nameless — which repo it is is not the user's concern
+    host.textContent = r.url ? hostOf(r.url) : t("src.github");
+    if (r.url) host.title = r.url; // the full URL stays on hover
+    const info = r.failed && !r.measuring
+      ? { text: t("src.failed"), cls: "bad" }
+      : srcMeta(r);
     const meta = document.createElement("span");
-    meta.className = "mirror-meta" + (info.cls ? " " + info.cls : "");
+    meta.className = "src-meta" + (info.cls ? " " + info.cls : "");
     meta.textContent = info.text;
     text.append(host, meta);
     row.append(text);
 
-    // Picking a source pins it; the pin outlives restarts and background refreshes, and only the
-    // test button clears it. Clicking a switched-off mirror turns it on — a click that visibly
-    // did nothing would be the alternative, since a disabled source can never be active.
-    const pick = () => {
-      if (s.active) return;
-      state.sources.forEach((o) => (o.active = o === s));
-      s.enabled = true;
-      renderMirrors();
-      const ref = primary ? { kind: "primary" } : { kind: "mirror", url: s.url };
-      invoke("set_selected_source", { selected: ref }).catch((e) => setSettingsMsg(errText(e)));
-    };
-    row.addEventListener("click", pick);
-    row.addEventListener("keydown", (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        pick();
-      }
-    });
-
-    if (s.active) {
+    if (r.active) {
       const tag = document.createElement("span");
       tag.className = "tag current";
-      tag.textContent = t("mirror.inUse");
+      tag.textContent = t("src.inUse");
       row.append(tag);
-    } else if (primary) {
-      // No switch: the main source cannot be turned off, and a tag says so rather than leaving a
-      // conspicuous gap where every other row has a control.
-      const tag = document.createElement("span");
-      tag.className = "tag";
-      tag.textContent = t("mirror.always");
-      row.append(tag);
-    }
-    if (!primary) {
-      const sw = document.createElement("button");
-      sw.type = "button";
-      sw.className = "switch" + (s.enabled ? " on" : "");
-      sw.setAttribute("role", "switch");
-      sw.setAttribute("aria-checked", String(s.enabled));
-      sw.setAttribute("aria-label", t("mirror.enable"));
-      sw.addEventListener("click", (e) => {
-        e.stopPropagation(); // the row itself picks; the switch only includes/excludes
-        s.enabled = !s.enabled;
-        renderMirrors();
-        invoke("set_mirror_enabled", { url: s.url, enabled: s.enabled })
-          // switching off the ACTIVE source hands the job to the next one, and the backend owns
-          // that resolution — so re-read rather than guessing at it here
-          .then(refreshSources)
-          .catch((e) => setSettingsMsg(errText(e)));
-      });
-      row.append(sw);
     }
     list.append(row);
   }
+  // A list that could not be refreshed is not a failed measurement: the rows above are real, and
+  // the note says only what could not be updated.
+  $("src-note").textContent = v.refreshError
+    ? `${t("src.refreshFailed")} · ${v.refreshError}`
+    : t("src.auto");
+  $("src-note").classList.toggle("bad", !!v.refreshError);
 }
 
-function setMirrorAuto(on) {
-  const b = $("tgl-mirror-auto");
-  b.classList.toggle("on", on);
-  b.querySelector(".switch").classList.toggle("on", on);
-  b.setAttribute("aria-checked", String(on));
-}
-
-// Re-read the list after a change whose consequences the backend resolves (which source becomes
-// active once another is switched off). Cheap and local — get_settings touches no network.
 async function refreshSources() {
   try {
-    const s = await invoke("get_settings");
-    state.sources = (s.sources || []).map((x) => ({ ...x }));
-    renderMirrors();
+    state.sourcesView = await invoke("download_sources");
+    renderSources(state.sourcesView);
   } catch (e) {
-    /* the row already shows the switch's new state; a repaint is not worth an error line */
+    /* the block is cosmetic — never worth an error line over */
   }
 }
-
-// Refresh the published list and measure everything, in one trip. The backend owns the ordering
-// (it holds both the list and the measurements), so there is nothing to sort or persist here.
-async function sweepMirrors() {
-  if (state.mirrorSweeping) return;
-  state.mirrorSweeping = true;
-  const btn = $("btn-mirror-sweep");
-  btn.disabled = true;
-  btn.textContent = t("btn.mirrorSweeping");
-  setSettingsMsg(null);
-  try {
-    const r = await invoke("sweep_mirrors");
-    state.sources = r.sources;
-    state.mirrorProbes = Object.fromEntries(r.probes.map((p) => [p.primary ? "@primary" : p.url, p]));
-    // A list that could not be refreshed is not a failed sweep — the measurements below it are
-    // real. Say so on the message line and leave the results standing. Nothing usable ANYWHERE
-    // (main source included) outranks that: it is the one result the row colours alone understate.
-    if (!r.probes.some((p) => p.healthy)) setSettingsMsg(t("mirror.allDown"));
-    else if (r.refreshError) setSettingsMsg(`${t("mirror.refreshFailed")} · ${r.refreshError}`);
-  } catch (e) {
-    setSettingsMsg(errText(e));
-  } finally {
-    state.mirrorSweeping = false;
-    btn.textContent = t("btn.mirrorSweep");
-    btn.disabled = false;
-    renderMirrors();
-  }
-}
-
-
 // The form's current content, for the discard-changes guard. Language is excluded — it applies
-// (and persists) instantly on toggle, so it is never "unsaved". Mirrors are excluded for the same
-// reason: the whole pane writes through on every edit.
+// (and persists) instantly on toggle, so it is never "unsaved".
 function settingsSnapshot() {
   return JSON.stringify({
     repo: $("in-repo").value,
@@ -1254,11 +1190,6 @@ async function openSettings() {
   state.renderer = s.renderer || "dx11";
   state.launchFlags = (s.launchFlags || []).map((f) => ({ ...f }));
   renderLaunchFlags();
-  // sources are instant-apply, so this is a pure repaint — measurements from earlier in the
-  // session are deliberately kept, since nothing about them went stale by closing the view
-  state.sources = (s.sources || []).map((x) => ({ ...x }));
-  setMirrorAuto(s.autoPickBest !== false);
-  renderMirrors();
   updateTokenPlaceholder();
   $("btn-token-clear").classList.toggle("hidden", !state.hasToken);
   setSeg($("seg-renderer"), state.renderer);
@@ -3771,15 +3702,6 @@ wireSeg($("seg-anim"), (v) => {
   applyAnimations(v === "on");
   invoke("set_animations", { on: v === "on" }).catch(() => {});
 });
-$("btn-mirror-sweep").addEventListener("click", sweepMirrors);
-// instant-apply. Turning it ON does not test anything now — it arms the next launch that finds a
-// newly published mirror, which is the only moment it acts.
-$("tgl-mirror-auto").addEventListener("click", () => {
-  const on = $("tgl-mirror-auto").getAttribute("aria-checked") !== "true";
-  setMirrorAuto(on);
-  invoke("set_auto_pick_best", { on }).catch(() => {});
-});
-
 // Watch the modals' own class rather than calling syncModalLayer from all seven open/close
 // sites — this cannot be forgotten when a new dialog is added.
 const modalObserver = new MutationObserver(syncModalLayer);
@@ -3901,12 +3823,15 @@ async function boot() {
   setIdleStatus();
   renderPrimary();
 
-  // Fire-and-forget: pull the published mirror list, and time the sources ONLY if that turned up
-  // a mirror nobody has measured yet. Deliberately NOT awaited — boot must not wait on the
-  // network, and nothing on screen depends on it. This is the only thing that keeps the list
-  // current for the vast majority of users, who will never open the mirrors pane. It does not
-  // re-rank on a schedule and does not touch a pinned choice; see cmd::mirrors.
-  invoke("auto_sweep_mirrors").catch(() => {});
+  // The source model is brought up by the SHELL (main.rs's setup), not from here: a webview that
+  // fails to load must not be what decides whether sources get resolved. All this side does is
+  // paint what the registry already says, and then follow it — the block changes at moments this
+  // side cannot predict (a measuring pass finishing after boot, a failover mid-download).
+  listen("sources-changed", (ev) => {
+    state.sourcesView = ev.payload;
+    renderSources(state.sourcesView);
+  }).catch(() => {});
+  refreshSources();
 
   let firstRun = false;
   try {

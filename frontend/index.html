@@ -115,6 +115,16 @@
           <ul class="files" id="files"></ul>
         </div>
 
+        <!-- Where downloads come from. A REPORT, not a form: sources are discovered from the
+             published mirrors.json and ranked by a real measurement, so there is nothing here to
+             switch, pin or save. It stays hidden while there is only one working source — a block
+             that always said "Main source, in use" would be a label, not information. -->
+        <div class="sources rise hidden" id="sources" style="--d:.16s">
+          <div class="files-head"><span class="eyebrow" data-i18n="src.title"></span></div>
+          <div class="src-list" id="src-list"></div>
+          <span class="hint" id="src-note"></span>
+        </div>
+
         <footer class="actions rise" style="--d:.18s">
           <button class="btn" id="btn-primary"></button>
           <button class="btn ghost hidden" id="btn-customize" data-i18n="btn.customize"></button>
@@ -176,16 +186,15 @@
           <span class="brand"><span class="brand-dot"></span><span data-i18n="head.settings"></span></span>
         </header>
 
-        <!-- Tabs, not one long scroll: the panes are four unrelated concerns (what the launcher
-             is pointed at / how the game starts / operations on the game's files / where downloads
-             come from), and only the first two hold form state — the files pane acts immediately
-             and mirrors are instant-apply. Save is tab-agnostic: the form is one settings object
-             no matter which pane is visible, so every field below stays in the DOM. -->
+        <!-- Tabs, not one long scroll: the panes are three unrelated concerns (what the launcher
+             is pointed at / how the game starts / operations on the game's files), and only the
+             first two hold form state — the files pane acts immediately. Save is tab-agnostic: the
+             form is one settings object no matter which pane is visible, so every field below
+             stays in the DOM. -->
         <div class="tabs" id="settings-tabs" role="tablist">
           <button class="tab active" data-tab="general" role="tab" aria-selected="true" data-i18n="tab.general"></button>
           <button class="tab" data-tab="launch" role="tab" aria-selected="false" data-i18n="tab.launch"></button>
           <button class="tab" data-tab="files" role="tab" aria-selected="false" data-i18n="tab.files"></button>
-          <button class="tab" data-tab="mirrors" role="tab" aria-selected="false" data-i18n="tab.mirrors"></button>
         </div>
 
         <div class="panels" id="settings-panels">
@@ -302,38 +311,6 @@
                 <button class="btn ghost inline danger" id="btn-uninstall" data-i18n="btn.uninstallPhoenix"></button>
               </div>
               <span class="hint" data-i18n="set.uninstallHint"></span>
-            </div>
-          </div>
-
-          <!-- Where downloads come from. Nothing here is form state either: every control writes
-               through on the spot (cmd::mirrors), because a sweep re-sorts the list and that order
-               must not have to be reconciled against a half-edited form. -->
-          <div class="fields hidden" data-panel="mirrors" role="tabpanel">
-            <!-- The list is DISCOVERED, never typed: mirrors come from the published mirrors.json,
-                 which describes mirrors only — the main source is not in it and has no switch, so
-                 no published list can take it away. Hence no add and no remove here. -->
-            <div class="field">
-              <span class="label" data-i18n="set.mirrors"></span>
-              <div class="mirror-list" id="mirror-list"></div>
-              <span class="hint" id="mirror-empty" data-i18n="set.mirrorsEmpty"></span>
-              <span class="hint" data-i18n="set.mirrorsHint"></span>
-            </div>
-
-            <div class="field">
-              <div class="row">
-                <button class="btn ghost inline" id="btn-mirror-sweep" data-i18n="btn.mirrorSweep"></button>
-              </div>
-              <span class="hint" data-i18n="set.mirrorSweepHint"></span>
-            </div>
-
-            <div class="field">
-              <div class="flag-list">
-                <button type="button" class="flag-row" id="tgl-mirror-auto" role="switch" aria-checked="true">
-                  <span class="flag-text"><span class="flag-name" data-i18n="set.mirrorAuto"></span></span>
-                  <span class="switch" aria-hidden="true"></span>
-                </button>
-              </div>
-              <span class="hint" data-i18n="set.mirrorAutoHint"></span>
             </div>
           </div>
 
