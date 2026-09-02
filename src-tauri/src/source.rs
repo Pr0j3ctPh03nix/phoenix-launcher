@@ -675,23 +675,41 @@ fn launch_set(sources: &[Source], now: u64) -> Option<HashSet<Option<String>>> {
         .then(|| sources.iter().filter(|s| due(s, now) || stale(s, now)).map(key_of).collect())
 }
 
-/// What a scheduler tick measures, or `None` for "nothing is due".
+/// Is there nothing healthy anywhere? The gate on the short retry interval — and the one question
+/// the scheduler has to ask as well, which is why it is a function and not an inline `any`.
+fn nothing_healthy(sources: &[Source]) -> bool {
+    !sources.iter().any(|s| s.measured.as_ref().is_some_and(Measured::healthy))
+}
+
+/// What a scheduler tick measures (`None` = nothing is due), and whether this tick RESTARTS the
+/// all-dead interval.
 ///
 /// Two rules, and the second is the reason this is not launch-only: while EVERY source is dead
 /// there is no ranking to disturb and nothing to lose, so everything is re-asked every
 /// `ALL_DEAD_RETRY` until one answers. Otherwise only a source whose last measurement FAILED is
 /// re-asked, and only once it is past the TTL. A healthy source is never re-measured on a timer.
+///
+/// The interval's bookkeeping is decided HERE rather than by the caller, because it belongs to the
+/// rule that reads it. It restarts on exactly two edges: a world that still holds a healthy source
+/// — the interval is not running at all then, so it starts from the last moment we knew that — and
+/// an all-dead pass that actually RAN. Never on the hourly retry, which is the other rule entirely:
+/// that coupling was what let an unrelated failure pass reset the clock a dead world was waiting
+/// out, and what left the clock un-restarted through a long healthy stretch so the first all-dead
+/// tick after it fired immediately.
 fn timer_set(
     sources: &[Source],
     now: u64,
-    all_dead_due: bool,
-) -> Option<HashSet<Option<String>>> {
-    if !sources.iter().any(|s| s.measured.as_ref().is_some_and(Measured::healthy)) {
-        return all_dead_due.then(|| sources.iter().map(key_of).collect());
+    since_all_dead: Duration,
+) -> (Option<HashSet<Option<String>>>, bool) {
+    if nothing_healthy(sources) {
+        return match since_all_dead >= ALL_DEAD_RETRY {
+            true => (Some(sources.iter().map(key_of).collect()), true),
+            false => (None, false),
+        };
     }
     let retry: HashSet<Option<String>> =
         sources.iter().filter(|s| due(s, now)).map(key_of).collect();
-    (!retry.is_empty()).then_some(retry)
+    ((!retry.is_empty()).then_some(retry), true)
 }
 
 fn key_of(s: &Source) -> Option<String> {
@@ -950,14 +968,24 @@ fn scheduler() {
     let mut last_all_dead = Instant::now();
     loop {
         std::thread::sleep(SCHEDULER_TICK);
-        // memoized on mtime: one stat per tick for a value that changes twice a session
-        let settings = Settings::load_cached();
-        let all_dead_due = last_all_dead.elapsed() >= ALL_DEAD_RETRY;
-        let Some(want) = timer_set(&settings.sources, unix_now(), all_dead_due) else { continue };
-        if all_dead_due {
+        // THE REGISTRY, never the settings file. The registry is what every walk reads and what the
+        // status block paints; the file is a copy of it, and one that can legitimately be behind —
+        // `Refresh::persist` reports a failure (a read-only or full profile) up a stack that drops
+        // it, and boot adopts its outcome regardless. Measuring the FILE's list and adopting the
+        // result would then silently revert this launch's ranking, mirrors and measurements alike,
+        // on the first tick that found anything due.
+        let sources = snapshot().sources;
+        let (want, restart) = timer_set(&sources, unix_now(), last_all_dead.elapsed());
+        if restart {
             last_all_dead = Instant::now();
         }
-        let mut refresh = mirror::unchanged(&measure(&settings, settings.sources.clone(), &want));
+        let Some(want) = want else { continue };
+        // Read only now that a pass is actually running: a probe needs the settings (which repo
+        // GitHub is timed through, and the credential rule that goes with it), and a pass is rare
+        // while a tick is every 15 seconds. That is what gives `Settings::load_cached` its one
+        // polling caller back — the 3-second game-running poll it was written for.
+        let settings = Settings::load();
+        let mut refresh = mirror::unchanged(&measure(&settings, sources, &want));
         sort(&mut refresh.sources);
         // no list was accepted here, so nothing may raise the serial floor — `unchanged` is what
         // says so, and `persist` is still the only writer
@@ -1222,25 +1250,35 @@ mod tests {
     /// The running schedule (amendment 1): a healthy source is never re-measured on a timer, a
     /// failed one is re-measured hourly, and while NOTHING is healthy everything is re-measured on
     /// the short interval until something answers.
+    ///
+    /// Plus the interval's own bookkeeping, which is the half that used to be the caller's and
+    /// wrong: the clock restarts when a dead world is actually re-measured and while the world is
+    /// not dead at all, and never on the hourly retry — a rule that says nothing about it.
     #[test]
     fn the_scheduler_retries_failures_hourly_and_a_dead_world_every_two_minutes() {
         let hour = MEASUREMENT_TTL.as_secs();
         let now = 10 * hour;
         let healthy = |at: u64| Some(Measured { bytes_per_sec: Some(1), ..Measured::blank(at) });
         let dead = |at: u64| Some(Measured::failed(at, "down"));
+        let long = ALL_DEAD_RETRY;
 
         let one_works = vec![
             Source { url: None, measured: healthy(now) },
             Source { url: Some("https://a".into()), measured: dead(now) },
         ];
-        assert_eq!(timer_set(&one_works, now, true), None, "a fresh failure waits out the TTL");
+        assert_eq!(
+            timer_set(&one_works, now, long),
+            (None, true),
+            "a fresh failure waits out the TTL — and a world with a healthy source in it is not \
+             running the all-dead interval at all, so the clock starts over"
+        );
         let older = vec![
             Source { url: None, measured: healthy(now) },
             Source { url: Some("https://a".into()), measured: dead(now - hour) },
         ];
         assert_eq!(
-            timer_set(&older, now, true),
-            Some(HashSet::from([Some("https://a".to_string())])),
+            timer_set(&older, now, long),
+            (Some(HashSet::from([Some("https://a".to_string())])), true),
             "and only the failure is re-asked — the healthy source is left alone"
         );
 
@@ -1249,10 +1287,15 @@ mod tests {
             Source { url: None, measured: dead(now) },
             Source { url: Some("https://a".into()), measured: dead(now) },
         ];
-        assert_eq!(timer_set(&all_dead, now, false), None, "…only when the interval is up");
         assert_eq!(
-            timer_set(&all_dead, now, true),
-            Some(HashSet::from([None, Some("https://a".to_string())]))
+            timer_set(&all_dead, now, Duration::ZERO),
+            (None, false),
+            "…only when the interval is up, and a tick that measured nothing must not restart it"
+        );
+        assert_eq!(
+            timer_set(&all_dead, now, long),
+            (Some(HashSet::from([None, Some("https://a".to_string())])), true),
+            "the pass that ran is what restarts the clock"
         );
     }
 
@@ -1407,6 +1450,6 @@ mod tests {
         let future = Some(Measured { bytes_per_sec: Some(1), ..Measured::blank(9_000_000) });
         let sources = vec![Source { url: None, measured: future }];
         assert_eq!(launch_set(&sources, 1_000), None);
-        assert_eq!(timer_set(&sources, 1_000, true), None);
+        assert_eq!(timer_set(&sources, 1_000, ALL_DEAD_RETRY).0, None);
     }
 }
