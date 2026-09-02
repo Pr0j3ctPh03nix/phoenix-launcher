@@ -2847,6 +2847,48 @@ mod tests {
         serde_json::json!({ "name": name, "dest": dest, "sha256": sha(bytes), "size": bytes.len() })
     }
 
+    /// A REFUSED MANIFEST IS A SOURCE FAILURE, not the end of the install.
+    ///
+    /// This is the property that justifies putting the trust gate inside the walk, and it is the
+    /// manifest half of the failover the download pool already had: a rewritten document is not a
+    /// bad release, it is a bad HOST, and ending the install there would let one such host block an
+    /// update every other source could finish. The refused source installs NOTHING — its bytes are
+    /// never asked for — and the version that lands is the one that was actually verified.
+    #[test]
+    fn a_refused_manifest_fails_the_source_over() {
+        let dir = tempdir("failover-manifest");
+        let (m, assets) = basic_release();
+        // Signed over the honest bytes and rewritten afterwards: exactly what a host tampering with
+        // a release it mirrors produces, and a case nothing drove before.
+        let mut tampered = Fake::new("v1.0.0", &m, assets.clone());
+        tampered
+            .assets
+            .insert("manifest.json".to_string(), m.replace("1.0.0", "6.6.6").into_bytes());
+        let counting = |inner| arc(Counting { inner, calls: Mutex::new(Vec::new()) });
+        let a = counting(tampered);
+        let b = counting(Fake::new("v1.0.0", &m, assets));
+
+        let wire = wire_over(vec![a.clone(), b.clone()], crate::trust::Payload::Mod);
+        let r = install(&settings(&dir), &wire, None, None, None)
+            .expect("the second source serves a manifest this launcher can believe");
+
+        assert_eq!(r.version, "1.0.0", "the version installed is the one that verified");
+        assert!(
+            a.calls.lock().unwrap().is_empty(),
+            "nothing is installed from the source that was refused"
+        );
+        assert_eq!(
+            a.calls.lock().unwrap().len() + b.calls.lock().unwrap().len(),
+            2,
+            "every file came from the source that answered, once each"
+        );
+        assert!(
+            crate::source::snapshot().failed.contains(&Some("https://wire0.example".to_string())),
+            "…and the refusal is reported as a source failure, like any other"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The canonical test release: a winmm.dll + one content file.
     fn basic_release() -> (String, Vec<(&'static str, &'static [u8])>) {
         let m = serde_json::json!({

@@ -407,6 +407,28 @@ struct Opened {
     release: Release,
 }
 
+/// Open ONE source for `repo` at `tag`. The step a walk repeats, on its own so that a walk which
+/// already knows which source it wants (`Wire::manifest`) opens it by exactly the same rules.
+fn open_one(
+    dial: &Dial,
+    source: &Source,
+    repo: &str,
+    payload: Payload,
+    tag: Option<&str>,
+) -> Result<Opened> {
+    let dl = dial(source);
+    let release = dl.fetch_release(repo, tag)?;
+    // The base game's file assets may live sharded across prereleases (GitHub caps 1000 assets per
+    // release), so each source's list is folded into ITSELF — per source, because the shards are
+    // that source's and a release index published by one host can never be used to address another.
+    // A mirror answers this with the one release it serves, which folds to itself.
+    let release = match payload {
+        Payload::Game => engine::merged_game_release(dl.as_ref(), repo, release)?,
+        _ => release,
+    };
+    Ok(Opened { key: source.url.clone(), dl, release })
+}
+
 /// Open the first source not in `tried` that can serve `repo` at `tag`.
 fn open_next(
     dial: &Dial,
@@ -416,20 +438,7 @@ fn open_next(
     tag: Option<&str>,
     tried: &mut HashSet<Option<String>>,
 ) -> Result<Opened> {
-    each_source(ranking, tried, |source| {
-        let dl = dial(source);
-        let release = dl.fetch_release(repo, tag)?;
-        // The base game's file assets may live sharded across prereleases (GitHub caps 1000 assets
-        // per release), so each source's list is folded into ITSELF — per source, because the
-        // shards are that source's and a release index published by one host can never be used to
-        // address another. A mirror answers this with the one release it serves, which folds to
-        // itself.
-        let release = match payload {
-            Payload::Game => engine::merged_game_release(dl.as_ref(), repo, release)?,
-            _ => release,
-        };
-        Ok(Opened { key: source.url.clone(), dl, release })
-    })
+    each_source(ranking, tried, |source| open_one(dial, source, repo, payload, tag))
 }
 
 // ---------------------------------------------------------------- addressing
@@ -639,25 +648,52 @@ impl Wire {
         Ok(true)
     }
 
-    /// The payload manifest, fetched and VERIFIED through the current source, failing over.
+    /// The payload manifest, fetched and VERIFIED through the source this run is on, failing over.
     ///
-    /// The trust gate is INSIDE the loop, so a refused manifest is a source failure rather than the
+    /// The trust gate is INSIDE the walk, so a refused manifest is a source failure rather than the
     /// end of the operation — which cannot turn a refusal into an acceptance, only into another
     /// attempt at another host.
+    ///
+    /// It is `each_source`'s walk, not a second one of its own. The three rules live there and
+    /// nowhere else precisely because two copies are free to disagree about the case that decides
+    /// everything, and the copy that used to be here had drifted from all three: no `report_active`
+    /// on the source that answered, no marking on an `ours` failure, and an exhausted walk that
+    /// threw away its own error and wrapped a SECOND "every download source failed" around the one
+    /// `open_next` had already added.
+    ///
+    /// What is particular to this walk is only where a backend comes from. The source the run is
+    /// already pulling bytes from is the head of the ranking not in `tried` — a walk inserts only
+    /// the sources it gave up on — so it is what `each_source` asks first, and it is asked through
+    /// the `Resolved` this wire is already holding rather than opened a second time. Any source
+    /// after it is opened exactly as a mid-download swap opens it, pinned to the same tag, and the
+    /// wire is left pointing at whichever one answered: the bytes follow the manifest.
     pub fn manifest(&self) -> Result<Manifest> {
-        loop {
-            let (gen, resolved, release) = self.current();
-            let got = engine::manifest_of(&self.settings, resolved.dl(), &release, self.payload);
-            match got {
-                Ok(m) => return Ok(m),
-                Err(e) if ours(&e) => return Err(e),
-                Err(e) => {
-                    if self.fail(gen).is_err() {
-                        return Err(e.context("every download source failed"));
-                    }
+        // Held for the whole walk, which is also why nothing here calls `fail`: this walk advances
+        // the wire itself, over the same set, and a second lock on it would be this thread waiting
+        // for itself.
+        let mut tried = self.tried.lock().unwrap();
+        each_source(&self.ranking, &mut tried, |source| {
+            let live = {
+                let cur = self.inner.read().unwrap();
+                (cur.key == source.url).then(|| (cur.resolved.clone(), cur.release.clone()))
+            };
+            let (resolved, release) = match live {
+                Some(already_open) => already_open,
+                None => {
+                    let opened =
+                        open_one(&self.dial, source, &self.repo, self.payload, Some(&self.tag))?;
+                    let mut cur = self.inner.write().unwrap();
+                    *cur = Live {
+                        gen: cur.gen + 1,
+                        key: opened.key,
+                        resolved: Arc::new(Resolved::new(opened.dl, &opened.release)),
+                        release: Arc::new(opened.release),
+                    };
+                    (cur.resolved.clone(), cur.release.clone())
                 }
-            }
-        }
+            };
+            engine::manifest_of(&self.settings, resolved.dl(), &release, self.payload)
+        })
     }
 }
 
