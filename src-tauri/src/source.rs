@@ -1018,8 +1018,8 @@ mod tests {
         }
         let snap = snapshot();
         assert_eq!(snap.active, 2, "the last one tried stays active — there is no better answer");
-        assert_eq!(snap.failed.len(), 3);
-        assert!(sources.iter().all(|s| snap.failed.contains(&s.url)));
+        // containment, not a count: the registry is process-wide and other suites report into it
+        assert!(sources.iter().all(|s| snap.failed.contains(&s.url)), "every one is reported");
 
         assert!(read(&sources, &dial).is_err());
         for p in &peers {
@@ -1165,7 +1165,15 @@ mod tests {
         let existing = vec![Source::default(), Source::at("https://a"), Source::at("https://b")];
         adopt(&existing);
         REGISTRY.lock().unwrap().failed.clear();
-        let settings = Settings { sources: existing.clone(), ..Settings::default() };
+        // A machine that has already accepted a list, so the BOOTSTRAP is out of the picture and
+        // what is left is the walk. Without this the assertions below would describe one thing in a
+        // build with a baked list and another in a build without one — and both would be right,
+        // which is the same as neither being tested.
+        let settings = Settings {
+            sources: existing.clone(),
+            max_serial_seen: [("mirrors".to_string(), 1u64)].into_iter().collect(),
+            ..Settings::default()
+        };
         let asked = Mutex::new(Vec::<Option<String>>::new());
 
         // the first two refuse it — a tampered document and a stale serial land in exactly the

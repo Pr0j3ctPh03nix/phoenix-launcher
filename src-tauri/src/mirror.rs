@@ -1372,8 +1372,19 @@ mod tests {
         let settings = Settings::default();
         assert_eq!(settings.sources, vec![Source::default()]);
         assert_eq!(settings.serial_floor(Payload::Mirrors), 0, "a fresh machine's floor");
-        if BAKED.is_none() {
-            assert!(bootstrap(&settings).is_none(), "nothing baked, nothing to bootstrap");
+        match BAKED {
+            None => assert!(bootstrap(&settings).is_none(), "nothing baked, nothing to bootstrap"),
+            // The OTHER build mode, and the only place the suite can see it: whatever this build
+            // baked has to survive the same gate a fetched list does — verified, applied, and
+            // ratcheted — or `PHOENIX_MIRRORS_DIR` is a switch nobody exercises until a user with
+            // no path to GitHub is the one finding out.
+            Some(_) => {
+                let applied = bootstrap(&settings).expect("a baked list applies at floor 0");
+                assert!(applied.sources[0].is_github(), "and never displaces the built-in source");
+                assert!(applied.sources.len() > 1, "…while the baked hosts arrive beside it");
+                assert!(applied.sources[1].measured.is_none(), "unmeasured, so a pass is due");
+                assert!(applied.serial.is_some(), "and it ratchets, like any accepted document");
+            }
         }
         // …and whatever this build baked, a machine that has already accepted a list never sees it
         let taken = Settings {

@@ -2809,12 +2809,12 @@ mod tests {
         payload: crate::trust::Payload,
     ) -> Wire {
         use crate::config::Source;
-        let sources: Vec<Source> = (0..peers.len())
-            .map(|i| match i {
-                0 => Source::default(),
-                _ => Source::at(format!("https://s{i}.example")),
-            })
-            .collect();
+        // A namespace of its own, and never the urlless (GitHub) key. `report_active`/
+        // `report_failed` write to the PROCESS-WIDE registry, and `source.rs`'s own tests assert
+        // on what is in it — two suites running in parallel over one key space would make those
+        // assertions depend on the scheduler.
+        let sources: Vec<Source> =
+            (0..peers.len()).map(|i| Source::at(format!("https://wire{i}.example"))).collect();
         let by_key: HashMap<Option<String>, Arc<dyn Downloader>> = sources
             .iter()
             .map(|s| s.url.clone())
