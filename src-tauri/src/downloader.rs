@@ -15,10 +15,15 @@ pub struct Asset {
     pub url: String,
     /// Direct download URL (used for public downloads).
     pub browser_download_url: String,
-    /// Bytes, as the release index reports them. Used only to CHOOSE an asset — the mirror probe
-    /// needs the BIGGEST one, since a throttled path serves a small file perfectly and would
-    /// otherwise measure as healthy. Never used to size a transfer: `download_to` learns the real
-    /// length from the response. Defaulted, so an index that omits it still parses.
+    /// Bytes, as the release index reports them. On a NAME-ADDRESSED backend (GitHub) that is the
+    /// host's word, so it is used only to CHOOSE an asset — the mirror probe needs the BIGGEST one,
+    /// since a throttled path serves a small file perfectly and would otherwise measure as healthy —
+    /// and never to size a transfer: `download_to` learns the real length from the response.
+    /// Defaulted, so an index that omits it still parses.
+    ///
+    /// On a CONTENT-ADDRESSED backend there is no index to report anything, and the field carries
+    /// what the caller KNOWS instead: `install::Resolved::asset_for` synthesizes the asset with the
+    /// signed manifest's declared size, and `Mirror::download` bounds its read at exactly that.
     #[serde(default)]
     pub size: u64,
 }

@@ -1085,10 +1085,19 @@ pub struct Mirror {
 
 impl Mirror {
     pub fn new(base: &str, payload: Payload) -> Self {
+        Self::with_agent(base, payload, download_agent())
+    }
+
+    /// `new` with the agent injected. In production `new` is its only caller, and there is exactly
+    /// one right agent. It is `pub(crate)` for the TESTS in other modules: `download_agent()` is
+    /// https-only and a loopback listener cannot speak TLS, so every end-to-end test of this
+    /// backend — here and in the modules that consume it, self-update among them — swaps the agent
+    /// and keeps every other field the real thing, the absence of anywhere to put a token included.
+    pub(crate) fn with_agent(base: &str, payload: Payload, agent: ureq::Agent) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
             payload: payload.id(),
-            agent: download_agent(),
+            agent,
             manifest: std::sync::Mutex::new(None),
         }
     }
@@ -1249,19 +1258,31 @@ impl Downloader for Mirror {
         Ok(vec![self.fetch_release(repo, None)?])
     }
 
+    /// A whole asset in memory, bounded at the size the CALLER declared for it — `asset.size`.
+    ///
+    /// On this backend that field is never a release index's claim, because there is no release
+    /// index. An `Asset` a mirror is handed is one of exactly two things: a payload entry
+    /// SYNTHESIZED by `install::Resolved::asset_for`, whose `size` is the signed manifest's declared
+    /// size for that entry; or one of the two documents `fetch_release` produced itself, whose
+    /// `size` is a length this backend measured. Either way it is the caller's knowledge of how
+    /// long the answer may be, and an unbounded read here would hand the least trusted host in the
+    /// system this process's memory on a path where the correct length was known all along. So the
+    /// ceiling is per-entry, not a constant — one number for a 2 KB text file and a multi-hundred-MB
+    /// VPK would have to be the larger, which bounds nothing useful for the smaller.
+    ///
+    /// The signature document is the one asset `fetch_release` sizes at 0, because its length is
+    /// not known until it is read; nothing reads it through here — the trust gate takes it through
+    /// `download_limited` under `trust::MAX_SIG_BYTES`, which is the bound that IS its caller's
+    /// knowledge — so a `download` of it refusing is the safe direction, not a gap.
     fn download(&self, asset: &Asset) -> Result<Vec<u8>> {
-        if asset.name == crate::engine::MANIFEST_ASSET {
-            return self.manifest_bytes();
-        }
-        let mut buf = Vec::new();
-        self.get(&self.url_of(&asset.name), None)?.into_reader().read_to_end(&mut buf)?;
-        Ok(buf)
+        self.download_limited(asset, asset.size)
     }
 
     /// `download` with a hard ceiling, for bytes whose size is a trust input. Overridden rather
     /// than left to the trait's read-then-check default: that default is honest for an in-memory
     /// double, and a mirror is the most distrusted peer in the system — the ceiling has to bound
-    /// the READ, not describe it afterwards.
+    /// the READ, not describe it afterwards. `download` above is this with the asset's own declared
+    /// size as `max`, so the two cannot drift into two ways of reading a body.
     fn download_limited(&self, asset: &Asset, max: u64) -> Result<Vec<u8>> {
         // The manifest is already in hand and already bounded (MAX_DOC_BYTES) — but the caller's
         // own ceiling still applies, since it may be tighter than the one it was fetched under.
@@ -1903,17 +1924,16 @@ mod tests {
     /// and a local listener cannot speak TLS, so the tests below swap the agent — every other field
     /// is the real thing, including the fact that there is nowhere to put a token.
     fn test_mirror(base: &str, payload: crate::trust::Payload) -> Mirror {
-        Mirror {
-            base: base.trim_end_matches('/').to_string(),
-            payload: payload.id(),
-            agent: ureq::builder()
+        Mirror::with_agent(
+            base,
+            payload,
+            ureq::builder()
                 .timeout_connect(CONNECT_TIMEOUT)
                 .timeout_read(IO_TIMEOUT)
                 .timeout_write(IO_TIMEOUT)
                 .redirects(0) // transport::fetch drives the loop; matches download_agent()
                 .build(),
-            manifest: std::sync::Mutex::new(None),
-        }
+        )
     }
 
     /// The layout, stated as URLs. Two things it pins that nothing else can: a payload entry is
@@ -1981,6 +2001,47 @@ mod tests {
         assert_eq!(server.hits(path), 1);
         assert!(!server.saw_authorization(path), "a mirror has no credentials to send");
         let _ = std::fs::remove_file(&dest);
+    }
+
+    /// `download` is bounded by the size the asset DECLARES, per entry — the manifest's signed size
+    /// for a blob — and a host that sends past it is refused, not read to the end and then judged.
+    /// A body exactly at the declared size still comes through whole: the bound is a ceiling on
+    /// what the host may send, not a claim about what it will.
+    #[test]
+    fn a_mirror_refuses_a_body_longer_than_the_asset_declares() {
+        use crate::downloader::{Asset, Downloader};
+        use crate::test_http::{Canned, TestServer};
+        let honest = b"the bytes the manifest signed for".to_vec();
+        let hash = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&honest));
+        // the same address, served with 100 KB tacked on past what the manifest declared
+        let hostile: Vec<u8> = honest.iter().copied().chain(std::iter::repeat(b'X').take(100_000)).collect();
+        let exact_path: &'static str = Box::leak(format!("/mod/blobs/{hash}").into_boxed_str());
+        let long_path: &'static str = Box::leak(format!("/mod/blobs/{}", "e".repeat(64)).into_boxed_str());
+        let (exact_body, long_body) = (honest.clone(), hostile);
+        let server = TestServer::start(move |_port| {
+            let mut routes = std::collections::HashMap::new();
+            routes.insert(exact_path, Canned::body(exact_body));
+            routes.insert(long_path, Canned::body(long_body));
+            routes
+        });
+        let m = test_mirror(&format!("http://127.0.0.1:{}", server.port), crate::trust::Payload::Mod);
+        // exactly what `install::Resolved::asset_for` synthesizes: the name is the hash, the size is
+        // the manifest's declared size, and both URL fields are empty
+        let asset = |name: &str| Asset {
+            name: name.to_string(),
+            url: String::new(),
+            browser_download_url: String::new(),
+            size: honest.len() as u64,
+        };
+
+        let err = m.download(&asset(&"e".repeat(64))).expect_err("an over-long body must be refused");
+        assert!(
+            format!("{err:#}").contains("larger than"),
+            "the refusal must say it was the size, got: {err:#}"
+        );
+        assert_eq!(server.hits(long_path), 1);
+        // …and a body that fits its declaration is read whole, at the exact ceiling
+        assert_eq!(m.download(&asset(&hash)).expect("an honest body"), honest);
     }
 
     /// A resume asks for exactly the bytes it is missing, and the hash it returns still covers the
