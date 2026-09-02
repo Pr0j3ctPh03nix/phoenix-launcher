@@ -102,6 +102,11 @@ pub async fn apply(
     let st = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let _op = st.begin_op("install")?;
+        // A warm from a PREVIOUS install may still be running, and it prunes the cache against the
+        // manifest it was given. Left alone it would finish after this install had seeded the
+        // cache and delete the entries this release needs — the epoch exists so a later install
+        // can say so, and this is where it says it.
+        install::cancel_warm();
         let settings = Settings::load();
         // The backend line behind the frontend not OFFERING Install here: the shim into a folder
         // with no game in it yields a folder that still has no game, reported as "up to date".
@@ -144,15 +149,23 @@ pub async fn apply(
             });
             // warm the asset cache (unselected variants, disabled toggles) DETACHED — optional
             // content can be hundreds of MB and must not delay the install result / Play unlock.
-            // Best-effort by design; uninstall cancels it via install::cancel_warm.
-            tauri::async_runtime::spawn_blocking(|| {
+            // Best-effort by design; uninstall and the next install cancel it via cancel_warm.
+            //
+            // Pinned to the release that was just installed, in both halves: the TAG the wire opens
+            // (so the bytes come from that release) and the MANIFEST the install verified (so the
+            // prune that follows is about the same release). An untagged wire made the warm resolve
+            // "latest" for itself, which is a different release the moment one is published between
+            // the check and this apply.
+            let (tag, manifest) = (r.tag.clone(), r.manifest.clone());
+            tauri::async_runtime::spawn_blocking(move || {
                 let settings = Settings::load();
                 // best-effort like the warm itself: a source that cannot be opened just means the
                 // optional content downloads on demand later. Its own wire, so a background warm
                 // that outlives the install gains failover without sharing the install's swaps.
-                let opened = Wire::open(&settings, &settings.source_repo, Payload::Mod, None);
+                let opened =
+                    Wire::open(&settings, &settings.source_repo, Payload::Mod, Some(&tag));
                 if let Ok(wire) = opened {
-                    install::warm_cache(&settings, &wire);
+                    install::warm_cache(&settings, &wire, &manifest);
                 }
             });
         }

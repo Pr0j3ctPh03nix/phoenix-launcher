@@ -1350,26 +1350,35 @@ fn seed_cache(
 /// has to reset anything.
 static WARM_EPOCH: AtomicU64 = AtomicU64::new(0);
 
-/// Stop a background `warm_cache`. Callers that run `uninstall` while a warm may be in flight
-/// (the GUI shell) call this first; the engine's `uninstall` itself stays flag-free so headless
-/// runs and tests are unaffected by process-global state.
+/// Stop a background `warm_cache`. Every caller that is about to change what the cache should hold
+/// calls this first — an uninstall (which deletes the cache dir), and an install (whose warm is
+/// about to be replaced by one for the release IT installed). The engine's `uninstall` and
+/// `install` themselves stay flag-free, so headless runs and tests are unaffected by process-global
+/// state; it is the shell that knows a previous warm may still be in flight.
 pub fn cancel_warm() {
     WARM_EPOCH.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Warm the asset cache: download every manifest asset not yet cached — unselected variants,
+/// Warm the asset cache: download every asset of `manifest` not yet cached — unselected variants,
 /// disabled toggles — so flipping customization later never waits on the network, then prune
-/// entries the manifest no longer references. Fetches the release itself (one API round trip)
-/// so the shell can run it DETACHED after `install` returns — optional content, possibly
-/// hundreds of MB, must never hold the install result hostage. Entirely best-effort: any
-/// failure just means on-demand download later.
-pub fn warm_cache(settings: &Settings, wire: &Wire) {
+/// entries that manifest no longer references. Runs DETACHED after `install` returns, because
+/// optional content can be hundreds of MB and must never hold the install result hostage. Entirely
+/// best-effort: any failure just means an on-demand download later.
+///
+/// THE MANIFEST IS THE CALLER'S, and it is the one the release that was just installed was
+/// verified against (`InstallReport.manifest`). It used to fetch its own through an untagged wire,
+/// which made the warm a second, independent resolution of "latest" — so a release published
+/// between the check and the apply, an apply pinned to an older tag, or simply a mirror serving
+/// another version left the warm prefetching one release's assets and then pruning the cache
+/// against it, deleting every entry the release actually installed needs. `wire` is opened with
+/// that same release's tag for the same reason: the bytes it prefetches have to be the ones this
+/// manifest names.
+pub fn warm_cache(settings: &Settings, wire: &Wire, manifest: &Manifest) {
     // captured before any work: every check below asks "has anyone cancelled since I started",
     // so a cancel can never be lost and a later install never resurrects this run
     let epoch = WARM_EPOCH.load(Ordering::Relaxed);
     let cancelled = || WARM_EPOCH.load(Ordering::Relaxed) != epoch;
     let Ok(game_dir) = settings.resolve_game_dir() else { return };
-    let Ok(manifest) = wire.manifest() else { return };
     if cancelled() {
         return;
     }
@@ -1377,9 +1386,9 @@ pub fn warm_cache(settings: &Settings, wire: &Wire) {
     if std::fs::create_dir_all(&cache).is_err() {
         return;
     }
-    prefetch_all(&cache, wire, &manifest, &cancelled);
+    prefetch_all(&cache, wire, manifest, &cancelled);
     if !cancelled() {
-        prune_cache(&cache, &manifest);
+        prune_cache(&cache, manifest);
     }
 }
 
@@ -3172,13 +3181,51 @@ mod tests {
         .to_string();
         let dl = arc(Fake::new("v1.0.0", &m, vec![("a.vpk", b"vpk"), ("fx.vpk", b"fx")]));
         let s = settings(&dir);
-        install(&s, &mod_wire(dl.clone()), None, None, None).unwrap();
+        let r = install(&s, &mod_wire(dl.clone()), None, None, None).unwrap();
 
         // install itself no longer prefetches the disabled toggle's asset...
         assert!(!dir.join(CACHE_DIR).join(sha(b"fx")).exists());
-        // ...the detached warm does
-        warm_cache(&s, &mod_wire(dl.clone()));
+        // ...the detached warm does, over the manifest the install reported
+        warm_cache(&s, &mod_wire(dl.clone()), &r.manifest);
         assert!(dir.join(CACHE_DIR).join(sha(b"fx")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE WARM IS ABOUT THE RELEASE THAT WAS INSTALLED, not about whatever its wire serves now.
+    ///
+    /// It prunes: every cache entry the manifest does not name is deleted. Given a manifest of its
+    /// own — which is what an untagged wire resolving "latest" produced — it deletes the entries
+    /// the release actually installed needs, whenever the two differ: a release published between
+    /// the check and the apply, an apply pinned to an older tag, or a mirror serving another
+    /// version. The manifest is handed in now, so a wire pointing elsewhere cannot change what the
+    /// warm is about.
+    #[test]
+    fn a_warm_prunes_against_the_release_that_was_installed() {
+        let dir = tempdir("warm-release");
+        let (m, assets) = basic_release();
+        let a = arc(Fake::new("v1.0.0", &m, assets));
+        let r = install(&settings(&dir), &mod_wire(a.clone()), None, None, None).unwrap();
+        let installed = dir.join(CACHE_DIR).join(sha(b"vpk"));
+        assert!(installed.exists(), "an install seeds the cache with what it wrote");
+
+        // A NEWER release naming none of the same files — published, as far as this warm's wire is
+        // concerned, in the moment between the install finishing and the warm starting.
+        let newer = serde_json::json!({
+            "version": "2.0.0",
+            "files": [ file_json("later.vpk", "game/dota/later.vpk", b"later") ]
+        })
+        .to_string();
+        let b = arc(Fake::new("v2.0.0", &newer, vec![("later.vpk", b"later")]));
+        warm_cache(&settings(&dir), &mod_wire(b), &r.manifest);
+
+        assert!(
+            installed.exists(),
+            "the installed release's cache entry must survive a warm running beside a newer one"
+        );
+        assert!(
+            !dir.join(CACHE_DIR).join(sha(b"later")).exists(),
+            "…and the other release's content is not what this warm is for either"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -131,8 +131,9 @@ pub fn run_install(flags: &[String]) -> Result<()> {
     let wire = Wire::open(&settings, &settings.source_repo, Payload::Mod, tag.as_deref())?;
     let r = install::install(&settings, &wire, None, None, None)?;
     println!("Installed {}: wrote {}, removed {}", r.version, r.written.len(), r.removed.len());
-    // headless: warm the customization cache synchronously (the GUI runs this detached)
-    install::warm_cache(&settings, &wire);
+    // headless: warm the customization cache synchronously (the GUI runs this detached), over the
+    // wire that just installed and the manifest it verified — no second resolution of "latest"
+    install::warm_cache(&settings, &wire, &r.manifest);
     Ok(())
 }
 

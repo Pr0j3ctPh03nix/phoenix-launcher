@@ -123,6 +123,9 @@ pub async fn game_install(
     st.game_cancel.store(false, Ordering::Relaxed);
     tauri::async_runtime::spawn_blocking(move || {
         let _op = st.begin_op("game download")?;
+        // A warm from a previous install prunes the shim cache against the manifest it was handed;
+        // this run is about to seed that cache with another release's. Same reason as `apply`'s.
+        install::cancel_warm();
         let settings = Settings::load();
         let dir = PathBuf::from(&target);
         let (wire, manifest) = open_game(&settings)?;
@@ -156,12 +159,15 @@ pub async fn game_install(
                     tag_name: r.tag.clone(),
                     manifest: r.manifest.clone(),
                 });
-                // warm optional content detached, exactly like a normal apply
-                tauri::async_runtime::spawn_blocking(|| {
+                // warm optional content detached, exactly like a normal apply — pinned to the
+                // release this chain just installed, and pruning against the manifest it verified
+                let (tag, manifest) = (r.tag.clone(), r.manifest.clone());
+                tauri::async_runtime::spawn_blocking(move || {
                     let settings = Settings::load();
-                    let opened = Wire::open(&settings, &settings.source_repo, Payload::Mod, None);
+                    let opened =
+                        Wire::open(&settings, &settings.source_repo, Payload::Mod, Some(&tag));
                     if let Ok(wire) = opened {
-                        install::warm_cache(&settings, &wire);
+                        install::warm_cache(&settings, &wire, &manifest);
                     }
                 });
                 Some(r.version)
