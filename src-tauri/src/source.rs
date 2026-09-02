@@ -292,19 +292,42 @@ pub(crate) fn walk<T>(
     tag: Option<&str>,
     op: impl Fn(&dyn Downloader, &Release) -> Result<T>,
 ) -> Result<T> {
-    let mut tried: HashSet<Option<String>> = HashSet::new();
-    let mut last: Option<anyhow::Error> = None;
-    while let Some(source) = next(ranking, &tried) {
+    each_source(ranking, &mut HashSet::new(), |source| {
         let dl = dial(source);
-        let attempt = dl.fetch_release(repo, tag).and_then(|r| op(dl.as_ref(), &r));
-        match attempt {
+        let release = dl.fetch_release(repo, tag)?;
+        op(dl.as_ref(), &release)
+    })
+}
+
+/// The walk itself: ask each source of `ranking` that is not already in `tried`, in order, until
+/// one answers.
+///
+/// The three rules live HERE and nowhere else, which is the point of the function: a single-shot
+/// read and a `Wire` opening its next source differ only in what they do with the source, and two
+/// copies of "mark it, advance, and stop early when the failure is ours" would be free to disagree
+/// about the case that decides everything.
+///
+///   * an answer ends it, and the source that gave it becomes the active one;
+///   * a failure that is OURS (`ours`) ends it too, and does NOT mark the source — it answered,
+///     and we could not read the answer;
+///   * anything else marks the source failed, adds it to `tried`, and moves on. An exhausted list
+///     reports the LAST error, which is the one from the source closest to being usable.
+///
+/// `tried` is the caller's, so a `Wire` that swaps repeatedly never returns to a source it has
+/// already given up on, while a fresh single-shot read is free to ask everything again — which is
+/// what makes a network that came back need no restart.
+fn each_source<T>(
+    ranking: &[Source],
+    tried: &mut HashSet<Option<String>>,
+    attempt: impl Fn(&Source) -> Result<T>,
+) -> Result<T> {
+    let mut last: Option<anyhow::Error> = None;
+    while let Some(source) = next(ranking, tried) {
+        match attempt(source) {
             Ok(v) => {
                 report_active(source.key());
                 return Ok(v);
             }
-            // Not a source failure: this source answered, and we could not read the answer. It is
-            // still the source in use, and asking the rest would spend N round trips reaching the
-            // same sentence.
             Err(e) if ours(&e) => {
                 report_active(source.key());
                 return Err(e);
@@ -329,9 +352,7 @@ struct Opened {
     release: Release,
 }
 
-/// Open the first source not in `tried` that can serve `repo` at `tag`, marking every failure and
-/// adding it to the set. `tried` is the caller's, so a `Wire` that swaps repeatedly never returns
-/// to a source it has already given up on.
+/// Open the first source not in `tried` that can serve `repo` at `tag`.
 fn open_next(
     dial: &Dial,
     ranking: &[Source],
@@ -340,39 +361,19 @@ fn open_next(
     tag: Option<&str>,
     tried: &mut HashSet<Option<String>>,
 ) -> Result<Opened> {
-    let mut last: Option<anyhow::Error> = None;
-    while let Some(source) = next(ranking, tried) {
+    each_source(ranking, tried, |source| {
         let dl = dial(source);
-        let opened = dl.fetch_release(repo, tag).and_then(|release| {
-            // The base game's file assets may live sharded across prereleases (GitHub caps 1000
-            // assets per release), so each source's list is folded into ITSELF — per source,
-            // because the shards are that source's and a release index published by one host can
-            // never be used to address another. A mirror answers this with the one release it
-            // serves, which folds to itself.
-            match payload {
-                Payload::Game => engine::merged_game_release(dl.as_ref(), repo, release),
-                _ => Ok(release),
-            }
-        });
-        match opened {
-            Ok(release) => {
-                report_active(source.key());
-                return Ok(Opened { key: source.url.clone(), dl, release });
-            }
-            Err(e) if ours(&e) => {
-                report_active(source.key());
-                return Err(e);
-            }
-            Err(e) => {
-                report_failed(source.key());
-                tried.insert(source.url.clone());
-                last = Some(e);
-            }
-        }
-    }
-    Err(match last {
-        Some(e) => e.context("every download source failed"),
-        None => anyhow::anyhow!("no download source is configured"),
+        let release = dl.fetch_release(repo, tag)?;
+        // The base game's file assets may live sharded across prereleases (GitHub caps 1000 assets
+        // per release), so each source's list is folded into ITSELF — per source, because the
+        // shards are that source's and a release index published by one host can never be used to
+        // address another. A mirror answers this with the one release it serves, which folds to
+        // itself.
+        let release = match payload {
+            Payload::Game => engine::merged_game_release(dl.as_ref(), repo, release)?,
+            _ => release,
+        };
+        Ok(Opened { key: source.url.clone(), dl, release })
     })
 }
 
@@ -822,31 +823,34 @@ fn refresh_list_with(
         }
         None => mirror::unchanged(&settings.sources),
     };
-    let order = ranking();
-    let mut tried: HashSet<Option<String>> = HashSet::new();
-    let mut last: Option<String> = None;
-    while let Some(source) = next(&order, &tried) {
+    // The SAME walk every other read takes (`each_source`): mark, advance, retry. A source that
+    // cannot serve the list is a source failure like any other, which cannot turn a refusal into an
+    // application — `mirror::apply` still leaves the list exactly as it was — only into another
+    // attempt at another host. `Refresh` carries its failure in a field rather than a `Result`, so
+    // the two are bridged here and nowhere else.
+    let asked = each_source(&ranking(), &mut HashSet::new(), |source| {
         let attempt = fetch(&base.sources, source);
-        match attempt.error {
-            None => {
-                report_active(source.key());
-                set_refresh_error(None);
-                return base.then(attempt);
-            }
-            Some(why) => {
-                report_failed(source.key());
-                tried.insert(source.url.clone());
-                last = Some(why);
-            }
+        match &attempt.error {
+            None => Ok(attempt),
+            Some(why) => Err(anyhow::anyhow!("{why}")),
+        }
+    });
+    match asked {
+        Ok(applied) => {
+            set_refresh_error(None);
+            base.then(applied)
+        }
+        // Nothing could be asked, or every copy was refused. Silence: the existing list stands, and
+        // the reason is reported rather than acted on. A refused list is never an applied list and
+        // never an empty one.
+        Err(e) => {
+            let why = format!("{e:#}");
+            set_refresh_error(Some(why.clone()));
+            let mut out = base;
+            out.error = Some(why);
+            out
         }
     }
-    // Nothing could be asked, or every copy was refused. Silence: the existing list stands, and the
-    // reason is reported rather than acted on. A refused list is never an applied list and never an
-    // empty one.
-    set_refresh_error(last.clone());
-    let mut out = base;
-    out.error = last;
-    out
 }
 
 /// Bring the source model up, once, from `main.rs`'s Tauri setup — never from the frontend. A

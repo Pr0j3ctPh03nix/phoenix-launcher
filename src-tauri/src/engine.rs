@@ -193,18 +193,6 @@ pub(crate) fn version_lt(a: &str, b: &str) -> bool {
 /// The release asset every payload describes itself with.
 pub const MANIFEST_ASSET: &str = "manifest.json";
 
-/// Fetch the release and its manifest.json. Returned together so an install can reuse the release's
-/// asset list (for private downloads) without a second round trip. Fails with `UnsupportedSchema`
-/// when the manifest declares a format this build cannot read — a stale launcher must refuse a
-/// manifest it doesn't understand rather than misinstall it.
-pub fn fetch(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Result<(Release, Manifest)> {
-    let release = dl
-        .fetch_release(&settings.source_repo, tag)
-        .context("fetching the release")?;
-    let manifest = manifest_of(settings, dl, &release, Payload::Mod)?;
-    Ok((release, manifest))
-}
-
 /// The manifest.json of an already-fetched release, VERIFIED — for callers that resolved the
 /// release themselves (the base-game commands probe repo credentials first and hold a `Release` by
 /// the time they need the manifest, and self-update reads the launcher payload).
@@ -755,15 +743,18 @@ pub fn evaluate(settings: &Settings, tag_name: &str, manifest: &Manifest) -> Res
     })
 }
 
-/// Read-only check: fetch the manifest and evaluate it.
+/// Read-only check against ONE backend: resolve the release, verify its manifest, evaluate it.
 ///
-/// Callers are the debug-only CLI and the test suite — the GUI's `check` command composes
-/// `fetch` + `evaluate` itself (it caches the manifest between the two). Release builds compile
-/// neither caller, so the release-only dead-code silence below is accurate, and a debug build
-/// still warns if this ever becomes genuinely unused.
+/// Callers are the debug-only CLI and the test suite. The GUI's `check` command does the same three
+/// steps through `source::with_active`, so a source that refuses the manifest fails over — which is
+/// exactly the difference between the two, and why this one takes a `&dyn Downloader` rather than
+/// pretending to be the model. Release builds compile neither caller, so the release-only dead-code
+/// silence below is accurate, and a debug build still warns if this ever becomes genuinely unused.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub fn check(settings: &Settings, dl: &dyn Downloader, tag: Option<&str>) -> Result<CheckResult> {
-    let (release, manifest) = fetch(settings, dl, tag)?;
+    let release =
+        dl.fetch_release(&settings.source_repo, tag).context("fetching the release")?;
+    let manifest = manifest_of(settings, dl, &release, Payload::Mod)?;
     evaluate(settings, &release.tag_name, &manifest)
 }
 
@@ -784,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_refuses_a_manifest_schema_it_cannot_read() {
+    fn a_manifest_schema_this_build_cannot_read_is_refused_as_such() {
         use crate::manifest::{UnsupportedSchema, MAX_SCHEMA};
         let settings = Settings::default();
         let future = MAX_SCHEMA + 1;
@@ -793,7 +784,7 @@ mod tests {
             &format!(r#"{{ "schema": {future}, "version": "9.9.9", "files": [] }}"#),
             vec![],
         );
-        let err = fetch(&settings, &too_new, None).unwrap_err();
+        let err = check(&settings, &too_new, None).unwrap_err();
         let refused = err
             .chain()
             .find_map(|c| c.downcast_ref::<UnsupportedSchema>())
@@ -802,9 +793,9 @@ mod tests {
 
         // a supported schema, and a legacy manifest with no `schema` key at all, both pass
         let ok = Fake::new("v1.0.0", r#"{ "schema": 2, "version": "1.0.0", "files": [] }"#, vec![]);
-        assert!(fetch(&settings, &ok, None).is_ok());
+        assert!(check(&settings, &ok, None).is_ok());
         let legacy = Fake::new("v1.0.0", r#"{ "version": "1.0.0", "files": [] }"#, vec![]);
-        assert!(fetch(&settings, &legacy, None).is_ok());
+        assert!(check(&settings, &legacy, None).is_ok());
     }
 
     /// The gate itself: a release whose manifest is not signed by a key we pin is not a release
