@@ -5,13 +5,14 @@
 # REF-SCOPED — a run may restore caches from its own ref or from the default branch and nothing
 # else, so a cache saved under refs/tags/v1.2.0 is invisible to v1.2.1, and main was the one ref
 # every tag run could read from. release.yml now restores no cache at all: a cache entry is
-# executable input (build scripts, proc-macro DLLs) that the job holding the signing key would run,
-# and alone among that job's inputs it cannot be pinned to a revision. The full argument is written
-# where that step used to be.
+# executable input (build scripts, proc-macro DLLs) that the publishing job would run, and alone
+# among that job's inputs it cannot be pinned to a revision — and what that job builds is what gets
+# sealed and installed. The full argument is written where that step used to be.
 #
-# The cache stays HERE, where the trade runs the other way: this job holds no signing key, it lives
-# on one ref, and a warm entry is the difference between a check that costs minutes and one that
-# costs half an hour. It now serves this workflow's own runs and nothing else.
+# The cache stays HERE, where the trade runs the other way: this job publishes nothing and can ask
+# for no signature, it lives on one ref, and a warm entry is the difference between a check that
+# costs minutes and one that costs half an hour. It now serves this workflow's own runs and nothing
+# else.
 
 name: ci
 
@@ -55,7 +56,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 372fbace82ac673335350b59333ef7299469420d
+          ref: 2114fdee707d6281d7d5bd6b78310980335a0428
           path: .tooling
 
       # Pinned to the same version release.yml builds with, and for a second reason on top of that
