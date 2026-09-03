@@ -5,7 +5,7 @@
 # Manual run (workflow_dispatch) -> build only, exe uploaded as a workflow artifact.
 #
 # THE SIGNING KEY IS NOT HERE ANY MORE. This job builds, publishes a DRAFT release, and then ASKS
-# phoenix-release-tooling to seal the manifest (a repository_dispatch; that repo decides from the
+# phoenix-release-tooling to seal the manifest (a workflow_dispatch; that repo decides from the
 # REQUESTING repo what it may seal). The signature and the mirror ping come back on its `sealed`
 # branch, which anybody may read; they are proven HERE against the public key this build compiled
 # in, and only then does the release stop being a draft. A refusal there, a timeout here, or a
@@ -77,10 +77,13 @@ jobs:
       # the trust root of a build is whatever HEAD said that day. Bumping it is a deliberate,
       # reviewable commit here.
       #
-      # It does NOT decide what SIGNS. `repository_dispatch` runs seal.yml on release-tooling's
-      # DEFAULT BRANCH, so the rules the signature is made under are always that repo's HEAD — the
-      # key holder decides what touches the key, and a producer pinning an old SHA cannot ask for
-      # old signing rules.
+      # It does NOT decide what SIGNS. The dispatch below names release-tooling's DEFAULT BRANCH as
+      # the ref to run seal.yml from, so the rules the signature is made under are always that
+      # repo's HEAD — the key holder decides what touches the key, and a producer pinning an old
+      # SHA cannot ask for old signing rules. A `workflow_dispatch` takes that ref from the
+      # REQUESTER rather than forcing the default branch the way a `repository_dispatch` did, but
+      # the PAT that sends it holds Actions: write and nothing else: it cannot create a ref or push
+      # to one, so the only signing rules it can ask for are ones the authority itself published.
       #
       # `path:` is not decorative either: src-tauri/build.rs reads the pinned release keys from
       # `.tooling/keys` by default, so this step is a prerequisite of every cargo invocation below,
@@ -468,10 +471,10 @@ jobs:
             src-tauri/target/release/phoenix-launcher.exe.sha256
             src-tauri/target/release/manifest.json
 
-      # ASK FOR THE SIGNATURE. Exactly the four fields .tooling/docs/sealing.md specifies, and no
+      # ASK FOR THE SIGNATURE. Exactly the four inputs .tooling/docs/sealing.md specifies, and no
       # more — the authority refuses a request carrying anything else. The manifest travels as
-      # base64(gzip(the exact bytes uploaded above)) because GitHub caps a client_payload at 64 KB
-      # of JSON, and because those bytes are what the signature will cover.
+      # base64(gzip(the exact bytes uploaded above)) because GitHub caps a dispatch's inputs at
+      # 65,535 characters, and because those bytes are what the signature will cover.
       #
       # Nothing here says which key to use, or which payload this is: the authority reads the
       # payload_id out of the document and decides from the REQUESTING REPO whether that is a thing
@@ -482,10 +485,20 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
           # gh reads GH_TOKEN, and for this ONE step it is not this run's own token: it is a
-          # fine-grained PAT scoped to Pr0j3ctPh03nix/phoenix-release-tooling alone, with Contents:
-          # write — the permission GitHub requires for POST /dispatches, and the narrowest that
-          # reaches that endpoint. It cannot read a secret: the signing key exists only inside a job
-          # of that repository.
+          # fine-grained PAT scoped to Pr0j3ctPh03nix/phoenix-release-tooling alone, with
+          # Actions: Read and write — the permission GitHub requires for POST
+          # /actions/workflows/{file}/dispatches, and the narrowest that reaches that endpoint.
+          #
+          # WHY THAT ENDPOINT AND NOT /dispatches. A `repository_dispatch` needs Contents: write,
+          # which on the owner's own account means a token that can PUSH to any unprotected branch
+          # of the tooling repo — including the one seal.yml is read from and the `sealed` ledger
+          # the ratchet remembers spent serials in. That made the tooling repo's rulesets the real
+          # boundary of this credential, and a machine account the only way to narrow it further.
+          # Actions: write cannot write a byte of that repository's contents, so the transport
+          # credential is a transport credential by construction rather than by administration.
+          #
+          # It cannot read a secret either: the signing key exists only inside a job of that
+          # repository.
           GH_TOKEN: ${{ secrets.PHOENIX_TOOLING_DISPATCH }}
         run: |
           set -euo pipefail
@@ -493,38 +506,47 @@ jobs:
             echo "secrets.PHOENIX_TOOLING_DISPATCH is not set, so nobody can be asked to sign this"
             echo "release — and this repository no longer holds a key to sign it with. Mint a"
             echo "fine-grained PAT scoped to Pr0j3ctPh03nix/phoenix-release-tooling with"
-            echo "Contents: write and add it as that secret; see .tooling/docs/sealing.md."
+            echo "Actions: Read and write and add it as that secret; see .tooling/docs/sealing.md."
             exit 1
           }
           python - <<'PY'
           import base64, gzip, json, os, sys
 
-          # GitHub's own cap on a client_payload. Checked here as well as at the authority so a
-          # document that outgrew it is named by the run that built it — the release notes embedded
-          # in the manifest are the only part that grows without bound — rather than arriving as an
-          # HTTP 422 with nothing in it to act on.
-          MAX = 64 * 1024
+          # GitHub's own cap on a workflow_dispatch: 65,535 CHARACTERS across the whole `inputs`
+          # object. Checked here as well as at the authority so a document that outgrew it is named
+          # by the run that built it — the release notes embedded in the manifest are the only part
+          # that grows without bound — rather than arriving as an HTTP 422 with nothing in it to
+          # act on.
+          #
+          # Measured in characters, the cap's own unit, over the JSON of `inputs` alone (`ref` is
+          # not an input and does not count against it). `json.dumps` escapes non-ASCII, so a value
+          # carrying any is counted at its longer escaped length — an overcount, which refuses
+          # early rather than one character late.
+          MAX = 65535
           out = os.path.join(os.environ["RUNNER_TEMP"], "dispatch.json")
           with open("src-tauri/target/release/manifest.json", "rb") as fh:
               raw = fh.read()
           tag = os.environ["TAG"]
           # mtime=0: gzip stamps the clock into its header, and a request that differs run to run
           # for no reason is one nobody can compare. What is signed is the decompressed bytes.
-          payload = {"repo": os.environ["GITHUB_REPOSITORY"],
-                     "tag": tag,
-                     "manifest": base64.b64encode(gzip.compress(raw, mtime=0)).decode("ascii"),
-                     "trusted_comment": "phoenix launcher " + tag}
-          size = len(json.dumps(payload).encode("utf-8"))
+          inputs = {"repo": os.environ["GITHUB_REPOSITORY"],
+                    "tag": tag,
+                    "manifest": base64.b64encode(gzip.compress(raw, mtime=0)).decode("ascii"),
+                    "trusted_comment": "phoenix launcher " + tag}
+          size = len(json.dumps(inputs))
           if size > MAX:
-              sys.exit(f"the client_payload is {size} bytes and GitHub caps it at {MAX}. The "
-                       f"manifest is {len(raw)} bytes; its `notes` (this tag's annotation) are the "
-                       f"only field that grows.")
+              sys.exit(f"the dispatch inputs are {size} characters and GitHub caps them at {MAX}. "
+                       f"The manifest is {len(raw)} bytes; its `notes` (this tag's annotation) are "
+                       f"the only field that grows.")
+          # `ref` is release-tooling's default branch, spelled out because a workflow_dispatch has
+          # no default for it. It is the ref seal.yml RUNS FROM, so it is the answer to "under whose
+          # rules is this signed" — see the tooling checkout above.
           with open(out, "w", encoding="utf-8", newline="\n") as fh:
-              json.dump({"event_type": "seal", "client_payload": payload}, fh)
-          print(f"manifest {len(raw)} bytes -> client_payload {size} bytes (cap {MAX})")
+              json.dump({"ref": "main", "inputs": inputs}, fh)
+          print(f"manifest {len(raw)} bytes -> inputs {size} characters (cap {MAX})")
           PY
           gh api --method POST \
-            /repos/Pr0j3ctPh03nix/phoenix-release-tooling/dispatches \
+            /repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches \
             --input "$RUNNER_TEMP/dispatch.json"
           echo "asked release-tooling to seal $GITHUB_REPOSITORY $TAG at serial $SERIAL"
 
