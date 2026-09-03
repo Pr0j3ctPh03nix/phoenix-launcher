@@ -56,7 +56,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 2114fdee707d6281d7d5bd6b78310980335a0428
+          ref: 7d5df6a2fb25098b75b5e1d51b77ca3af810fd4f
           path: .tooling
 
       # Pinned to the same version release.yml builds with, and for a second reason on top of that
