@@ -202,8 +202,10 @@ jobs:
                git -C .tooling worktree add --quiet "$RUNNER_TEMP/ledger" FETCH_HEAD
                # The number alone on stdout. It imports nothing outside the stdlib, deliberately,
                # so that a producer can read the ledger without installing anything first.
+               # `tr -d '\r'`: python on Windows can print CRLF into a pipe, and command
+               # substitution strips only the LF — a CR would break the arithmetic below.
                sealed=$(python .tooling/tools/ping.py ledger --payload launcher \
-                          --sealed "$RUNNER_TEMP/ledger") ;;
+                          --sealed "$RUNNER_TEMP/ledger" | tr -d '\r') ;;
             2) echo "no '$LEDGER_BRANCH' branch yet — nothing has ever been sealed there"
                sealed=0 ;;
             *) echo "cannot tell whether '$LEDGER_BRANCH' exists (git ls-remote exited $rc) —"
