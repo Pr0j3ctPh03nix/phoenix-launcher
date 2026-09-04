@@ -4,18 +4,24 @@
 # Tag push (v*) -> build + GitHub Release with phoenix-launcher.exe attached.
 # Manual run (workflow_dispatch) -> build only, exe uploaded as a workflow artifact.
 #
-# THE SIGNING KEY IS NOT HERE ANY MORE. This job builds, publishes a DRAFT release, and then ASKS
-# phoenix-release-tooling to seal the manifest (a workflow_dispatch; that repo decides from the
-# REQUESTING repo what it may seal). The signature and the mirror ping come back on its `sealed`
-# branch, which anybody may read; they are proven HERE against the public key this build compiled
-# in, and only then does the release stop being a draft. A refusal there, a timeout here, or a
-# signature this build cannot verify all end the same way: a draft release, which no client can
-# see. The producer-facing contract is `.tooling/docs/sealing.md` — read it before reordering
-# anything below.
+# THE SIGNING KEY IS NOT HERE, AND NEITHER IS THE PUBLISHING CHOREOGRAPHY ANY MORE. Everything from
+# "draft the release" through "ping the mirrors" is ONE step — the action
+# `Pr0j3ctPh03nix/phoenix-release-tooling@v1`. It drafts, asks that repo's signing authority to seal
+# the manifest, waits, PROVES the answer against the public half this build compiled in, attaches
+# the sealed document and its signature, and only then undrafts. Every failure before that leaves a
+# draft, which no client can see. What this job owns is everything above that step: build the exe,
+# and write the seal request naming it.
+# The producer-facing contract is `.tooling/docs/publishing.md` and the step's own `action.yml`;
+# read them before reordering anything below.
+#
+# THIS JOB PICKS NO SERIAL. A request carries serial 0, which names no release; the authority
+# assigns the number, writes it into the document and signs those bytes, and what is published is
+# the document that comes back. There is no ledger to read here and no arithmetic to get wrong.
 #
 # This job restores no build cache at all, and every remaining input it does take — the actions, the
-# tooling checkout, the Bun version, the Rust toolchain, both lockfiles — names an exact revision.
-# See the block where the Rust cache used to be for why a cache cannot be one of them.
+# Bun version, the Rust toolchain, both lockfiles — names an exact revision; the tooling is the one
+# deliberate exception, and its checkout below says why. See the block where the Rust cache used to
+# be for why a cache cannot be one of them.
 #
 # NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed BEFORE the
 # shell parses the script, so a tag name is executable code — and this job holds `contents: write`,
@@ -55,11 +61,6 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      # The signing authority's answer, and its ledger: one world-readable branch of
-      # release-tooling carrying `sealed/<owner>/<name>/<tag>/`. Read twice below — once to pick a
-      # serial no seal has already spent, once to collect this release's signature.
-      LEDGER_BRANCH: sealed
     steps:
       # Third-party actions are pinned to COMMIT SHAs, not tags. A tag is mutable, and this job
       # holds `contents: write`, the baked token, and the PAT that asks for a signature. The
@@ -71,33 +72,25 @@ jobs:
       # to be vendored into tools/ here; a copy's only possible states are "identical" and "silently
       # stale", and keeping it identical needed a drift check in a third repo.
       #
-      # A SHA, never a branch, because this pin decides everything this job READS from there: the
-      # public keys compiled into the binary, the ledger reader that picks a serial, the verifier
-      # that proves the signature which comes back, and the mirror notifier. A moving ref would mean
-      # the trust root of a build is whatever HEAD said that day. Bumping it is a deliberate,
-      # reviewable commit here.
-      #
-      # It does NOT decide what SIGNS. The dispatch below names release-tooling's DEFAULT BRANCH as
-      # the ref to run seal.yml from, so the rules the signature is made under are always that
-      # repo's HEAD — the key holder decides what touches the key, and a producer pinning an old
-      # SHA cannot ask for old signing rules. A `workflow_dispatch` takes that ref from the
-      # REQUESTER rather than forcing the default branch the way a `repository_dispatch` did, but
-      # the PAT that sends it holds Actions: write and nothing else: it cannot create a ref or push
-      # to one, so the only signing rules it can ask for are ones the authority itself published.
+      # `v1` IS A MOVING TAG — that repo re-points it at every green push to its PR-protected `main`
+      # — and it replaces the commit SHA this used to pin. The old rationale for a SHA (a build's
+      # trust root must not be whatever HEAD said that day) is gone because the publish step below
+      # is `@v1` as well: what this checkout supplies is the `keys/` build.rs compiles into the
+      # binary, and what that step proves the seal against is `keys/` at the ref IT runs from. Two
+      # different refs would let those be two different vintages of the key — one ref, one trust
+      # root. The trade `@v1` makes is written out in .tooling/docs/publishing.md.
       #
       # `path:` is not decorative either: src-tauri/build.rs reads the pinned release keys from
-      # `.tooling/keys` by default, so this step is a prerequisite of every cargo invocation below,
-      # and of the verification after the build. It must come AFTER the main checkout, which cleans
-      # the workspace it lands in.
+      # `.tooling/keys` by default, so this step is a prerequisite of every cargo invocation below.
+      # It must come AFTER the main checkout, which cleans the workspace it lands in.
       #
       # No `token:`, which is only correct while release-tooling is PUBLIC — the job's default
-      # GITHUB_TOKEN is scoped to this repository alone and cannot read a sibling private one. The
-      # `sealed` branch is fetched through this checkout's own `origin`, so the same goes for it.
+      # GITHUB_TOKEN is scoped to this repository alone and cannot read a sibling private one.
       - name: Fetch release tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 0eb43683fc0969902a4ead9e9ef05c16979b1c90
+          ref: v1
           path: .tooling
 
       # The version lives in three files and the git tag, and self-update compares the TAG against
@@ -124,105 +117,6 @@ jobs:
             Write-Error "tag $tag does not match: $($bad -join ', ')"
             exit 1
           }
-
-      # THE VERIFIER's ONE non-stdlib dependency: phoenix_minisign imports Ed25519 from
-      # `cryptography` at module scope, so neither it nor tools/ping.py can be imported without it —
-      # and the Windows runner image does not ship it. Nothing here signs any more; what needs this
-      # is "Prove the seal" below, the step that stops a signature this build cannot verify from
-      # ever reaching a client. Without it that gate dies with ModuleNotFoundError, having already
-      # asked another repository to sign something.
-      #
-      # Installed HERE rather than beside that step so a broken install costs seconds instead of
-      # landing after the multi-minute Tauri build — the same reason the version check above runs
-      # this early.
-      #
-      # NOT `zstandard`: that is the `.phxb` writer's dependency, and only the mod and the base game
-      # build bundles. This payload's manifest indexes one loose exe, so nothing on the path
-      # gen_launcher_manifest -> build_manifest -> manifest_schema -> phoenix_minisign imports phxb
-      # at all.
-      #
-      # FROM THE PINNED CHECKOUT, NOT FROM AN INDEX. This is the code that decides whether a
-      # signature is good, so fetching it by name would leave one mutable reference in a job where
-      # every action is pinned to a commit SHA precisely to have none. release-tooling vendors the
-      # wheel for the interpreter this image ships (windows-2025: CPython 3.12) and `--no-index`
-      # keeps any index out of the run; from here on the job's only inputs are two git checkouts at
-      # pinned SHAs. See .tooling/wheels/README.md.
-      #
-      # "Could not find a version that satisfies the requirement ... (from versions: none)" here
-      # means the release-tooling SHA pinned above predates wheels/, or the image moved to a Python
-      # the vendored wheels do not cover — either way loudly, and before anything is built.
-      - name: Install the verifier's dependency
-        run: python -m pip install --disable-pip-version-check --no-index --find-links .tooling/wheels cryptography
-
-      # THE SERIAL, read from TWO places and taking the higher. Which number comes next is this
-      # producer's business, not the release format's: the format says only that a serial is a u64,
-      # and ordering is enforced by the launcher's own per-payload high-water mark. So the rule
-      # lives here rather than in shared tooling, and the launcher line is free to number
-      # differently from the mod's or the game's.
-      #
-      #     serial = max(highest serial ever SEALED for `launcher`, the PUBLISHED one) + 1
-      #
-      # `published + 1` alone was correct only while sealing and publishing were the same job. They
-      # are not: a run can be sealed at N and then die before it undrafts, leaving N spent on the
-      # ledger and nothing published — after which `published + 1` proposes N forever and the
-      # authority's ratchet correctly refuses it forever. The ledger is the only record of a serial
-      # that was signed but never shipped, and taking the max also survives the other direction (a
-      # deleted release, which makes `releases/latest` answer with an older one).
-      #
-      # NO SEED PATH: this line already has releases, so failing to read the last serial is never a
-      # reason to start over at 1. Every failure below exits non-zero instead.
-      #
-      # BEFORE THE BUILD, for the reason the version check above is: a serial that cannot be
-      # computed must not cost a Tauri build first. It is exported for every later step, because
-      # the ping that comes back has to carry THIS number and nothing else.
-      #
-      # Computed HERE rather than in `env:` because GitHub's expression language has no arithmetic
-      # operators at all: adding inside an expression is a workflow PARSE error that rejects the
-      # whole file before any step runs. (Deliberately not spelled with the literal expression
-      # syntax even in this comment — see the header: substitution happens before bash sees the
-      # script, so an example written out here would itself be evaluated.)
-      - name: Pick the serial
-        shell: bash
-        env:
-          # Minted per run and scoped to this repository — exactly the access needed to read its own
-          # releases for the published serial, and nothing else.
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # `--exit-code` is what tells "no `sealed` branch yet" (exit 2 — legitimate exactly once,
-          # before anything has ever been sealed) from "the ledger could not be read" (anything
-          # else). The difference is the whole point: an unreadable ledger treated as an empty one
-          # proposes a serial that may already be spent, and that request is refused ten minutes
-          # later, after the build.
-          set +e
-          git -C .tooling ls-remote --exit-code --heads origin "$LEDGER_BRANCH" >/dev/null 2>&1
-          rc=$?
-          set -e
-          case "$rc" in
-            0) git -C .tooling fetch --quiet origin "$LEDGER_BRANCH"
-               # A worktree rather than a checkout: the ledger is an orphan history and must not be
-               # mistakable for the pinned tree the tools are read from.
-               git -C .tooling worktree add --quiet "$RUNNER_TEMP/ledger" FETCH_HEAD
-               # The number alone on stdout. It imports nothing outside the stdlib, deliberately,
-               # so that a producer can read the ledger without installing anything first.
-               # `tr -d '\r'`: python on Windows can print CRLF into a pipe, and command
-               # substitution strips only the LF — a CR would break the arithmetic below.
-               sealed=$(python .tooling/tools/ping.py ledger --payload launcher \
-                          --sealed "$RUNNER_TEMP/ledger" | tr -d '\r') ;;
-            2) echo "no '$LEDGER_BRANCH' branch yet — nothing has ever been sealed there"
-               sealed=0 ;;
-            *) echo "cannot tell whether '$LEDGER_BRANCH' exists (git ls-remote exited $rc) —"
-               echo "refusing to treat an unreadable ledger as an empty one."
-               exit 1 ;;
-          esac
-          asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
-                    --jq '.assets[] | select(.name == "manifest.json") | .url')
-          [ -n "$asset" ] || { echo "the latest release carries no manifest.json"; exit 1; }
-          published=$(gh api "$asset" -H "Accept: application/octet-stream" --jq '.serial')
-          case "$published" in ''|*[!0-9]*) echo "published serial is not a number: '$published'"; exit 1 ;; esac
-          serial=$(( (sealed > published ? sealed : published) + 1 ))
-          echo "sealed $sealed, published $published -> this run publishes $serial"
-          echo "SERIAL=$serial" >> "$GITHUB_ENV"
 
       # THE BAKED BOOTSTRAP MIRROR LIST. Fetched here and compiled into the binary by build.rs,
       # which reads it from PHOENIX_MIRRORS_DIR (a directory holding mirrors.json and its .minisig).
@@ -379,9 +273,9 @@ jobs:
       # The annotated tag's message IS the changelog, and the RELEASE BODY is where it must land:
       # the launcher renders release notes in its update banner (lu-banner), and self-update reads
       # `release.body` — a body-less release shows the user a version number and nothing else.
-      # softprops does not copy tag annotations itself, so extract it here. `contents:body` skips
-      # the subject line (redundant with the release title). The re-fetch is required: checkout
-      # peels annotated tags to their commit, so the annotation isn't present without it.
+      # The publish step takes that body as a FILE, so extract it here. `contents:body` skips the
+      # subject line (redundant with the release title). The re-fetch is required: checkout peels
+      # annotated tags to their commit, so the annotation isn't present without it.
       - name: Extract tag message as the release body (tag pushes)
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
@@ -392,6 +286,24 @@ jobs:
           git tag -l --format='%(contents:body)' "$env:TAG" | Out-File -Encoding utf8 release_body.md
           Get-Content release_body.md
 
+      # WHAT THE RELEASE SHIPS, gathered into ONE directory because that is the shape the publish
+      # step takes: `assets:` is a directory and every regular file directly in it is attached.
+      # Pointing it at target/release would attach the .pdb and everything else cargo leaves there,
+      # so the shipped set is named here — and a file that failed to be produced is a failed copy
+      # rather than a release no client can auto-install.
+      #
+      # The manifest is written into this directory too (next step) and is deliberately NOT one of
+      # the attachments: it is the seal REQUEST, and the action skips it and uploads the sealed
+      # document that comes back in its place.
+      - name: Stage what the release ships
+        shell: bash
+        run: |
+          set -euo pipefail
+          out=src-tauri/target/release
+          mkdir -p staging
+          cp "$out/phoenix-launcher.exe" "$out/phoenix-launcher.exe.sha256" staging/
+          ls -l staging
+
       # WHY THE LAUNCHER IS SIGNED AT ALL. selfupdate.rs prefers a signed manifest and falls back to
       # the .sha256 sidecar when a release publishes none — and until sealing existed here, none
       # ever did, so every self-update was decided by a bare hash published by whoever served the
@@ -401,37 +313,35 @@ jobs:
       # it, and self-update is the one path that has to keep working for builds older than every
       # change made to it. Clients move onto the signed path as they update through this one.
       #
-      # These are the bytes that get uploaded, dispatched and SIGNED, in that order, and nothing
-      # re-serialises them anywhere: a signature covers bytes, so a document rebuilt on either side
-      # of the request would be a signature over a file nobody has.
+      # WHAT THIS WRITES IS A SEAL REQUEST: serial 0, naming no release. The authority assigns the
+      # number, writes it into these exact bytes and signs the result; the publish step proves that
+      # what came back is this document at that serial by rendering it again itself. So nothing here
+      # chooses a number, and nothing re-serialises the document on either side of the request.
       #
       # NOT tag-gated, on purpose. A run that publishes nothing still builds its manifest and still
-      # checks it (below), so the serial rule and the document can be exercised WITHOUT cutting a
-      # release — otherwise the first time either is exercised is a real one.
+      # checks it (below), so the document can be exercised WITHOUT cutting a release — otherwise
+      # the first time it is exercised is a real one.
       - name: Build the release manifest
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          out=src-tauri/target/release
           # The notes come from the annotated tag, so a manual run has none — the field is optional
           # and its absence is the only difference between a dry run and the real thing.
           notes=()
           [ -f release_body.md ] && notes=(--notes-file release_body.md)
           # This repo's own discovery step (dev/): hashes the exe and builds ONE files[] entry
-          # through release-tooling's build_manifest.py, which owns every format rule (schema,
-          # envelope shape, what a serial may BE). Which serial comes next was decided above,
-          # because that is a publishing decision rather than a format one. This script only ever
-          # knows "hash an exe, name it".
+          # through release-tooling's `phoenix_tooling`, which owns every format rule — schema,
+          # envelope shape, what a serial may be. This script only ever knows "hash an exe, name
+          # it". It hashes the STAGED copy, which is the file that is actually attached.
           python dev/gen_launcher_manifest.py \
             --version  "$TAG" \
-            --serial   "$SERIAL" \
             --exe      phoenix-launcher.exe \
-            --exe-path "$out/phoenix-launcher.exe" \
+            --exe-path staging/phoenix-launcher.exe \
             "${notes[@]}" \
-            --out      "$out/manifest.json" \
-            --tools    .tooling/tools
+            --out      staging/manifest.json \
+            --tooling  .tooling
 
       # A run that publishes nothing asks nobody to sign anything: the authority seals a TAG, and
       # there is no release for the answer to land on. What it can still do is ask the same question
@@ -443,239 +353,40 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python .tooling/tools/build_manifest.py validate src-tauri/target/release/manifest.json
-          echo "exercised: the tooling checkout, the serial rule (ledger + published release), the"
-          echo "manifest build, and the document check the seal job runs before it reads the key."
-          echo "NOT exercised: the dispatch, the signature, the ping, and the mirror notification —"
-          echo "all of those need a tag, because they need a release to be attached to."
+          python .tooling/phx.py manifest validate staging/manifest.json
+          echo "exercised: the tooling checkout, the manifest build, and the document check the"
+          echo "authority runs before it reads the key — the publish step below then dry-runs the"
+          echo "same request as a dispatch. NOT exercised: the seal, the signature, the ping and"
+          echo "the mirror notification — all of those need a tag, because they need a release."
 
-      # DRAFT first, and now for two reasons. This action creates the release and then uploads in
-      # PARALLEL, so a non-draft release is reachable by clients while its assets are still going up
-      # — and a client that sees the manifest before the exe reads it as a release it cannot
-      # install. On top of that, the signature does not exist yet: the release must not be visible
-      # until it has been sealed and that seal has been proven here, and a draft is exactly the
-      # state in which a run may still fail with nothing published.
-      - name: Publish release as a draft (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+      # DRAFT, SEAL, PROVE, PUBLISH, PING — one step, and none of it is this repository's code any
+      # more. It creates the release as a draft (invisible to `releases/latest`, which is every
+      # client's entry point), attaches the staged files, asks the signing authority to seal the
+      # request, waits, proves the answer against `keys/phoenix-active.pub` — the same public half
+      # build.rs compiled into the exe beside it — attaches the sealed manifest and its .minisig,
+      # and only then undrafts. Every failure before that last move leaves a draft, which no client
+      # can see. Its inputs and its promises are in that repo's action.yml.
+      #
+      # `@v1` is the moving tag, matching the checkout at the top of this job for the reason given
+      # there: one ref, one trust root.
+      #
+      # A run that publishes nothing dry-runs it instead — validating the request as a dispatch and
+      # stopping before anything is created, uploaded or asked for. That is the only part of the
+      # publishing path that can be exercised without spending a serial, so it is exercised on every
+      # manual run rather than first tried on a real one.
+      - name: Publish the release
+        uses: Pr0j3ctPh03nix/phoenix-release-tooling@v1
         with:
-          # a release missing the .sha256 cannot be auto-installed by any client — fail the run
-          # rather than publish one, instead of relying on the checksum step having failed first.
-          # manifest.json.minisig is deliberately not in this list: it does not exist yet, and it is
-          # uploaded below, before the release stops being a draft.
-          fail_on_unmatched_files: true
-          draft: true
-          body_path: release_body.md
-          files: |
-            src-tauri/target/release/phoenix-launcher.exe
-            src-tauri/target/release/phoenix-launcher.exe.sha256
-            src-tauri/target/release/manifest.json
-
-      # ASK FOR THE SIGNATURE. Exactly the four inputs .tooling/docs/sealing.md specifies, and no
-      # more — the authority refuses a request carrying anything else. The manifest travels as
-      # base64(gzip(the exact bytes uploaded above)) because GitHub caps a dispatch's inputs at
-      # 65,535 characters, and because those bytes are what the signature will cover.
-      #
-      # Nothing here says which key to use, or which payload this is: the authority reads the
-      # payload_id out of the document and decides from the REQUESTING REPO whether that is a thing
-      # this repository may seal. A stolen launcher token therefore cannot mint a mod release.
-      - name: Ask release-tooling to seal the manifest (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-          # gh reads GH_TOKEN, and for this ONE step it is not this run's own token: it is a
-          # fine-grained PAT scoped to Pr0j3ctPh03nix/phoenix-release-tooling alone, with
-          # Actions: Read and write — the permission GitHub requires for POST
-          # /actions/workflows/{file}/dispatches, and the narrowest that reaches that endpoint.
-          #
-          # WHY THAT ENDPOINT AND NOT /dispatches. A `repository_dispatch` needs Contents: write,
-          # which on the owner's own account means a token that can PUSH to any unprotected branch
-          # of the tooling repo — including the one seal.yml is read from and the `sealed` ledger
-          # the ratchet remembers spent serials in. That made the tooling repo's rulesets the real
-          # boundary of this credential, and a machine account the only way to narrow it further.
-          # Actions: write cannot write a byte of that repository's contents, so the transport
-          # credential is a transport credential by construction rather than by administration.
-          #
-          # It cannot read a secret either: the signing key exists only inside a job of that
-          # repository.
-          GH_TOKEN: ${{ secrets.PHOENIX_TOOLING_DISPATCH }}
-        run: |
-          set -euo pipefail
-          test -n "$GH_TOKEN" || {
-            echo "secrets.PHOENIX_TOOLING_DISPATCH is not set, so nobody can be asked to sign this"
-            echo "release — and this repository no longer holds a key to sign it with. Mint a"
-            echo "fine-grained PAT scoped to Pr0j3ctPh03nix/phoenix-release-tooling with"
-            echo "Actions: Read and write and add it as that secret; see .tooling/docs/sealing.md."
-            exit 1
-          }
-          python - <<'PY'
-          import base64, gzip, json, os, sys
-
-          # GitHub's own cap on a workflow_dispatch: 65,535 CHARACTERS across the whole `inputs`
-          # object. Checked here as well as at the authority so a document that outgrew it is named
-          # by the run that built it — the release notes embedded in the manifest are the only part
-          # that grows without bound — rather than arriving as an HTTP 422 with nothing in it to
-          # act on.
-          #
-          # Measured in characters, the cap's own unit, over the JSON of `inputs` alone (`ref` is
-          # not an input and does not count against it). `json.dumps` escapes non-ASCII, so a value
-          # carrying any is counted at its longer escaped length — an overcount, which refuses
-          # early rather than one character late.
-          MAX = 65535
-          out = os.path.join(os.environ["RUNNER_TEMP"], "dispatch.json")
-          with open("src-tauri/target/release/manifest.json", "rb") as fh:
-              raw = fh.read()
-          tag = os.environ["TAG"]
-          # mtime=0: gzip stamps the clock into its header, and a request that differs run to run
-          # for no reason is one nobody can compare. What is signed is the decompressed bytes.
-          inputs = {"repo": os.environ["GITHUB_REPOSITORY"],
-                    "tag": tag,
-                    "manifest": base64.b64encode(gzip.compress(raw, mtime=0)).decode("ascii"),
-                    "trusted_comment": "phoenix launcher " + tag}
-          size = len(json.dumps(inputs))
-          if size > MAX:
-              sys.exit(f"the dispatch inputs are {size} characters and GitHub caps them at {MAX}. "
-                       f"The manifest is {len(raw)} bytes; its `notes` (this tag's annotation) are "
-                       f"the only field that grows.")
-          # `ref` is release-tooling's default branch, spelled out because a workflow_dispatch has
-          # no default for it. It is the ref seal.yml RUNS FROM, so it is the answer to "under whose
-          # rules is this signed" — see the tooling checkout above.
-          with open(out, "w", encoding="utf-8", newline="\n") as fh:
-              json.dump({"ref": "main", "inputs": inputs}, fh)
-          print(f"manifest {len(raw)} bytes -> inputs {size} characters (cap {MAX})")
-          PY
-          # NO LEADING SLASH on the endpoint, and it is not a style choice: this step runs under
-          # `shell: bash` on a WINDOWS runner, where bash is MSYS and rewrites any argument that
-          # looks like an absolute Unix path into a Windows one. `/repos/...` reaches gh as
-          # `C:/Program Files/Git/repos/...` and is refused as an invalid endpoint — after the
-          # draft is already up. gh accepts the path without the slash on every platform, which is
-          # how every other `gh api` call in this file is already written.
-          gh api --method POST \
-            repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches \
-            --input "$RUNNER_TEMP/dispatch.json"
-          echo "asked release-tooling to seal $GITHUB_REPOSITORY $TAG at serial $SERIAL"
-
-      # WAIT FOR THE ANSWER, by fetching the branch — never raw.githubusercontent, whose CDN cache
-      # will happily keep answering "not there yet" for minutes after the commit has landed.
-      #
-      # Ten minutes, then give up. Every way this can fail leaves the same recoverable state: a
-      # DRAFT release, which no client can see. A refused request (bad authorization, a document
-      # that repo's builder would not produce, a serial that does not rise) leaves the ledger
-      # untouched and lands here as a timeout.
-      - name: Wait for the seal (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          entry="sealed/$GITHUB_REPOSITORY/$TAG"
-          found=0
-          i=0
-          while [ "$i" -lt 60 ]; do
-            # `|| true`: one failed fetch in a ten-minute wait is a blip, not an answer.
-            git -C .tooling fetch --quiet origin "$LEDGER_BRANCH" || true
-            if git -C .tooling cat-file -e "FETCH_HEAD:$entry/manifest.json.minisig" 2>/dev/null \
-               && git -C .tooling cat-file -e "FETCH_HEAD:$entry/ping.json" 2>/dev/null; then
-              found=1
-              break
-            fi
-            i=$(( i + 1 ))
-            sleep 10
-          done
-          if [ "$found" != 1 ]; then
-            echo "no seal for $entry appeared on '$LEDGER_BRANCH' within ten minutes."
-            echo
-            echo "The release is still a DRAFT — no client can see it, and nothing has shipped."
-            echo "Look at the seal workflow in Pr0j3ctPh03nix/phoenix-release-tooling: a refusal"
-            echo "there (authorization, a document its builder would not produce, or a serial that"
-            echo "does not rise) leaves the ledger untouched and this run waiting."
-            echo "To retry: re-run this workflow. The serial is recomputed from the ledger, so the"
-            echo "next attempt asks for a number above anything already sealed."
-            exit 1
-          fi
-          # `cat-file blob` rather than `git show`: these are bytes a signature covers, and blob
-          # output is raw by definition — no eol conversion, whatever any git config says.
-          git -C .tooling cat-file blob "FETCH_HEAD:$entry/manifest.json.minisig" \
-            > src-tauri/target/release/manifest.json.minisig
-          # The ping is NOT a release asset — it is delivered to mirrors, not installed by anyone —
-          # so it stays out of the directory the release is published from.
-          git -C .tooling cat-file blob "FETCH_HEAD:$entry/ping.json" > "$RUNNER_TEMP/ping.json"
-          echo "collected $entry from '$LEDGER_BRANCH'"
-
-      # PROVE IT, before a single byte of it is published. This is the half of seal.py that used to
-      # run in this job, and it is the check that catches a signature made under a key clients do
-      # not pin — whose only other symptom is an update channel that has quietly died. The public
-      # half comes from the same pinned checkout that build.rs compiled trust::PINNED from, so what
-      # is proven here is exactly what the exe beside it will believe.
-      - name: Prove the seal (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        run: |
-          set -euo pipefail
-          out=src-tauri/target/release
-          tools=.tooling/tools
-          pub=.tooling/keys/phoenix-active.pub
-          # THE SERIAL FIRST, because it is the one failure with a benign explanation: a tag can
-          # already carry an entry from an earlier attempt, and the signature checks below would
-          # then fail as "does not match the signed bytes", which is true and says nothing. The
-          # ledger is not signature-checked here and nothing is decided on this number — it only
-          # names the cause before the cryptography has to be interpreted.
-          python - <<'PY'
-          import json, os, sys
-
-          with open(os.path.join(os.environ["RUNNER_TEMP"], "ping.json"), encoding="utf-8") as fh:
-              doc = json.load(fh)
-          # ASCII only in what this prints: a SystemExit message goes out through stderr under the
-          # runner's console codepage, not utf-8, and a mojibake dash in the one line that explains
-          # a failed release helps nobody.
-          if doc["serial"] != os.environ["SERIAL"]:
-              sys.exit(f"the sealed ping carries serial {doc['serial']} and this run built "
-                       f"{os.environ['SERIAL']}: the ledger entry is from an earlier attempt at "
-                       f"this tag. Re-run it; the serial is recomputed from the ledger, so the "
-                       f"next attempt asks for a number above it.")
-          print(f"the ledger entry is this run's: launcher serial {doc['serial']}")
-          PY
-          python "$tools/phoenix_minisign.py" verify "$out/manifest.json" \
-            --pub "$pub" --sig "$out/manifest.json.minisig"
-          python "$tools/ping.py" verify "$RUNNER_TEMP/ping.json" --pub "$pub"
-
-      # `gh release upload` rather than a second run of the release action: the release already
-      # exists, one file is being added to it, and re-running the action would restate the body and
-      # the whole file list to say nothing new.
-      - name: Upload the signature to the draft (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" src-tauri/target/release/manifest.json.minisig
-
-      # Everything a client needs is on the release now, and all of it has been proven here.
-      - name: Undraft the release (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
-          GH_TOKEN: ${{ github.token }}
-        run: gh release edit "$TAG" --draft=false
-
-      # THE MIRRORS, last and never fatal. It announces a release a mirror will immediately try to
-      # fetch, so it runs AFTER the release stops being a draft — a mirror told about something it
-      # cannot see yet learns nothing and has to be told again.
-      #
-      # `continue-on-error` because the release is already published by the time this runs: a mirror
-      # that is down must not turn a shipped release into a red run, and nobody can fix it from
-      # here. The script itself already exits 0 for any mirror outcome, so this covers only the case
-      # where the registry's list could not be read at all — and the ping is signed and can be
-      # delivered by anybody, so a missed one costs nothing a later delivery cannot redo.
-      - name: Ping the mirrors (tag pushes)
-        if: startsWith(github.ref, 'refs/tags/')
-        continue-on-error: true
-        shell: bash
-        env:
-          # The script's --token-env default, read ONLY to raise the rate limit on the public
-          # registry's latest release. Nothing else it does carries a credential.
-          GITHUB_TOKEN: ${{ github.token }}
-        run: python .tooling/tools/notify_mirrors.py notify --ping-file "$RUNNER_TEMP/ping.json"
+          tag: ${{ github.ref_name }}
+          document: staging/manifest.json
+          assets: staging
+          # Written only on a tag push; a dry run never reads it.
+          notes-file: release_body.md
+          token: ${{ github.token }}
+          # A fine-grained PAT scoped to Pr0j3ctPh03nix/phoenix-release-tooling alone with
+          # Actions: write, which is the whole of what asking for a signature needs — it cannot
+          # write a byte of that repository, and it cannot read the key, which exists only inside
+          # a job there. Unset means a refused publish, with that message, before anything is
+          # created.
+          dispatch-token: ${{ secrets.PHOENIX_TOOLING_DISPATCH }}
+          dry-run: ${{ !startsWith(github.ref, 'refs/tags/') }}
