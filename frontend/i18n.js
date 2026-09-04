@@ -70,7 +70,7 @@ const I18N = {
     // shows the composed path
     "dlg.pickTarget": "Choose where to download the game",
     "gd.confirm": "{gb} GB download · {disk} GB on disk · {n} files\nThe game goes here:\n{dir}",
-    "gd.confirmResume": "Already downloaded: {have} of {gb} GB · {df} of {n} files · {disk} GB on disk\nResuming here:\n{dir}",
+    "gd.confirmResume": "Already downloaded: {have} of {gb} GB · {disk} GB on disk\nResuming here:\n{dir}",
 
     // ---- destination stage ----
     // The switch, then what each answer means. Only ONE of these is ever the quiet line: every
@@ -97,8 +97,10 @@ const I18N = {
     "gd.noSpace": "Not enough free space: needs ~{need} GB, the volume has {free} GB",
     "gd.starting": "Starting…",
     "gd.checking": "Checking existing files… {i}/{n}",
-    "gd.dl": "{done} / {total} GB · files done: {i}/{n}",
+    "gd.dl": "{done} / {total} GB",
     "gd.eta": "~{t} left",
+    "unit.mbs": "{v} MB/s",
+    "unit.kbs": "{v} KB/s",
     "time.hm": "{h} h {m} min",
     "time.m": "{m} min",
     "time.s": "{s} s",
@@ -420,7 +422,7 @@ const I18N = {
     "dlg.pickGame": "Выберите папку игры (ту, что содержит game\\)",
     "dlg.pickTarget": "Выберите, куда скачать игру",
     "gd.confirm": "Загрузка: {gb} ГБ · на диске: {disk} ГБ · файлов: {n}\nИгра будет здесь:\n{dir}",
-    "gd.confirmResume": "Уже скачано: {have} из {gb} ГБ · файлов: {df} из {n} · на диске: {disk} ГБ\nПродолжится здесь:\n{dir}",
+    "gd.confirmResume": "Уже скачано: {have} из {gb} ГБ · на диске: {disk} ГБ\nПродолжится здесь:\n{dir}",
 
     "gd.destNest": "Отдельная папка для игры",
     "gd.destNestHint": "Игра и всё, что лаунчер для неё пишет, останутся внутри одной этой папки.",
@@ -442,8 +444,10 @@ const I18N = {
     "gd.noSpace": "Недостаточно места: нужно ~{need} ГБ, на диске {free} ГБ",
     "gd.starting": "Начинаю…",
     "gd.checking": "Проверяю имеющиеся файлы… {i}/{n}",
-    "gd.dl": "{done} / {total} ГБ · файлов готово: {i}/{n}",
+    "gd.dl": "{done} / {total} ГБ",
     "gd.eta": "осталось ~{t}",
+    "unit.mbs": "{v} МБ/с",
+    "unit.kbs": "{v} КБ/с",
     "time.hm": "{h} ч {m} мин",
     "time.m": "{m} мин",
     "time.s": "{s} с",

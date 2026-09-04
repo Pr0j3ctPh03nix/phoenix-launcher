@@ -166,9 +166,9 @@ window.addEventListener("load", () => {
       gd.perFile = new Map();
       // bytes are WIRE bytes since the bundle format (schema 3): 7.92 GB crosses the network
       // for 14.77 GB on disk, and a mid-run item is as often a packed bundle as a file
-      gd.sum = 2.9 * GB; gd.doneFiles = 1289; gd.files = 4635; gd.bytes = 7.92 * GB;
+      gd.sum = 2.9 * GB; gd.bytes = 7.92 * GB;
       gd.samples = [{ t: performance.now() - 20000, b: 2.4 * GB }];
-      gd.etaText = ""; gd.etaAt = 0;
+      gd.rateText = ""; gd.etaText = ""; gd.paceAt = 0;
       onGdProgress({ payload: { op: "game", item: "b002-txt-736453e4cf3c.phxb", current: 12,
         total: 146, bytesDone: 12 * 1024 * 1024, bytesTotal: 200 * 1024 * 1024, done: false } });
     } else if (h.startsWith("dest")) {
@@ -196,10 +196,16 @@ window.addEventListener("load", () => {
         const base = "D:\\SteamLibrary\\steamapps\\common\\dota 2 beta\\downloads";
         gdDestRender({ ...view, prefix: base + "\\", path: base + "\\dota2_688f" });
       }
-    } else if (h === "gd") {
+    } else if (h === "gd" || h === "gd:resume") {
+      // Two confirms, one stage: a fresh download states the SCALE of the install (files included
+      // — that is what they are a true statement about), a resumed one states what the folder
+      // already holds, in wire bytes and nothing else. See install::base_cached for why the second
+      // one names no file count.
       document.getElementById("gd-title").textContent = t("gd.title");
-      document.getElementById("gd-summary").textContent =
-        t("gd.confirm", { gb: "7.9", disk: "14.8", n: 4635, dir: "D:\\Games\\Dota 2 6.88" });
+      const dir = "D:\\Games\\Dota 2 6.88";
+      document.getElementById("gd-summary").textContent = h === "gd:resume"
+        ? t("gd.confirmResume", { have: "3.2", gb: "7.9", disk: "14.8", dir })
+        : t("gd.confirm", { gb: "7.9", disk: "14.8", n: 4635, dir });
       document.getElementById("gd-modal").classList.remove("hidden");
       gdStage("confirm");
     }

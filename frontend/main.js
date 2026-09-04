@@ -1055,9 +1055,14 @@ function renderLaunchFlags() {
 // report. `download_sources` is the first paint and the reconnect path for a webview that missed
 // the events it was not there for.
 
+// A byte rate, in this app's units: binary math behind a decimal-looking label, exactly like every
+// "GB" on the download screen — and TRANSLATED, because the line it now also serves prints "ГБ"
+// two words away. A true zero prints as zero (on a live download that is the honest report of a
+// stall); anything above it floors at 1, so a trickling source never reads as dead.
 function fmtSpeed(bps) {
-  const mib = bps / (1024 * 1024);
-  return mib >= 1 ? `${mib.toFixed(1)} MiB/s` : `${Math.max(1, Math.round(bps / 1024))} KiB/s`;
+  const mb = bps / (1024 * 1024);
+  if (mb >= 1) return t("unit.mbs", { v: mb.toFixed(1) });
+  return t("unit.kbs", { v: bps > 0 ? Math.max(1, Math.round(bps / 1024)) : 0 });
 }
 
 // How long ago the measurement was taken. Coarse on purpose: the useful question is "is this
@@ -1475,41 +1480,45 @@ const gd = {
   origin: null,    // "setup" | "settings" — where to land after a successful install
   dir: null,
   bytes: 0,        // planned unique download bytes (the bar's full extent)
-  files: 0,        // planned file count
   restore: [],     // repair only: the dests the user checked
   keep: [],        // repair only: the differences they are deliberately leaving alone
   thenPhoenix: null, // repair only: the same selection's shim half, run after the game half lands
   perFile: null,   // Map dest -> bytesDone (ticks fan out per dest; clamp the sum to `bytes`)
   sum: 0,          // running total of perFile's values, maintained by delta (never re-summed)
   phase: "plan",   // "plan" -> "fetch": which half of the run the line describes (onGdProgress)
-  doneFiles: 0,
   unlisten: null,
-  samples: null,   // [{t, b}] byte-total snapshots for the ETA's sliding-window rate
-  etaText: "",     // last rendered ETA (repainted at most once a second)
-  etaAt: 0,
+  samples: null,   // [{t, b}] byte-total snapshots for the sliding-window rate
+  rateText: "",    // last rendered pace, both repainted at most once a second
+  etaText: "",
+  paceAt: 0,
 };
 
-// ---- ETA ----
+// ---- pace: the rate the line shows, and the ETA spent out of it ----
 // Rate over the last ~30 s of ticks, NOT the whole run: a resumed run starts with a byte jump,
 // and the small-file stretches are request-bound — a whole-run average would haunt the estimate
-// long after conditions changed. Repainted at most once a second: an ETA that flickers with
-// every tick reads as noise. Says nothing for the first seconds — early guesses are wrong in
-// both directions, and a number that appears and stabilizes beats one that thrashes.
-function gdEta(now) {
+// long after conditions changed. Repainted at most once a second: figures that flicker with
+// every tick read as noise. Silent for the first seconds — early guesses are wrong in both
+// directions, and a number that appears and stabilizes beats one that thrashes.
+//
+// The rate is SHOWN, not merely spent on the ETA, because it is what answers "is this stuck" —
+// the question the file counter that used to hold this slot could not answer. Files land a whole
+// ASSET at a time (139 bundles carry 4,815 files, and the bundles carrying most of them are the
+// smallest, so they are scheduled last), which left "files done: 0/4815" sitting at zero for most
+// of a run beside a byte total that was moving.
+function gdPace(now) {
   const s = gd.samples;
   s.push({ t: now, b: Math.min(gd.sum, gd.bytes) });
   while (s.length > 2 && now - s[0].t > 30000) s.shift();
   const span = now - s[0].t;
-  if (span < 3000) return gd.etaText;
-  // etaAt 0 = never painted -> paint now; afterwards at most once a second
-  if (!gd.etaAt || now - gd.etaAt >= 1000) {
-    const rate = (s[s.length - 1].b - s[0].b) / (span / 1000);
-    if (rate > 0) {
-      gd.etaAt = now;
-      gd.etaText = t("gd.eta", { t: fmtDuration((gd.bytes - s[s.length - 1].b) / rate) });
-    }
-  }
-  return gd.etaText;
+  // paceAt 0 = never painted -> paint now; afterwards at most once a second
+  if (span < 3000 || (gd.paceAt && now - gd.paceAt < 1000)) return;
+  gd.paceAt = now;
+  const done = s[s.length - 1].b;
+  const rate = (done - s[0].b) / (span / 1000);
+  gd.rateText = fmtSpeed(Math.max(0, rate));
+  // A stalled window cannot date the remainder, so the last estimate stands — the rate beside it
+  // is already saying why it stopped changing.
+  if (rate > 0) gd.etaText = t("gd.eta", { t: fmtDuration((gd.bytes - done) / rate) });
 }
 
 // Coarse on purpose (nearest unit, minutes rounded): "~14 min left" is a promise the link can
@@ -1731,15 +1740,14 @@ async function gdOpen(origin, dir) {
   // WIRE bytes: bundles compress, so what downloads and what lands on disk are two different
   // numbers now — the bar/ETA/"downloaded so far" all speak the wire, the confirm names both
   gd.bytes = plan.bytes;
-  gd.files = plan.files;
   const disk = (plan.diskBytes / GB).toFixed(1);
-  // an interrupted attempt left verified-size entries/.parts in the cache: say how much of the
-  // plan is already here — bytes AND files ("did my 5 GB survive the restart?"). The files
-  // number is completely-fetched only; a .part counts toward the bytes, not the files.
+  // an interrupted attempt left entries and .parts in the cache: say how much of the plan is
+  // already here ("did my 5 GB survive the restart?"). In BYTES, and only bytes — a file is not
+  // fetched until its whole asset is, so this line used to answer "0 of 4815 files" over
+  // gigabytes on disk. See install::base_cached.
   $("gd-summary").textContent = plan.cachedBytes > 0
     ? t("gd.confirmResume", {
-        have: (plan.cachedBytes / GB).toFixed(1), gb: (plan.bytes / GB).toFixed(1),
-        df: plan.cachedFiles, n: plan.files, disk, dir,
+        have: (plan.cachedBytes / GB).toFixed(1), gb: (plan.bytes / GB).toFixed(1), disk, dir,
       })
     : t("gd.confirm", { gb: (plan.bytes / GB).toFixed(1), n: plan.files, disk, dir });
   // refuse up front what the backend would refuse a click later — its exact demand (decoded
@@ -1778,7 +1786,6 @@ async function startGameRepair(v, restore, keep, thenPhoenix) {
     if (f && f.wireKey) keys.set(f.wireKey, f.wire);
   }
   gd.bytes = [...keys.values()].reduce((a, b) => a + b, 0);
-  gd.files = restore.length;
   $("gd-title").textContent = t("gd.repairTitle");
   $("gd-modal").classList.remove("hidden");
   gdRun();
@@ -1814,16 +1821,22 @@ function onGdProgress(ev) {
       // the negative it was added to prevent.
       gd.sum += p.bytesDone - (gd.perFile.get(p.item) || 0);
       gd.perFile.set(p.item, p.bytesDone);
-      if (p.done) gd.doneFiles = Math.min(gd.files, gd.doneFiles + 1);
       const sum = Math.min(gd.sum, gd.bytes); // shared-content dests double-tick; the bar must not
       const pct = gd.bytes ? (sum / gd.bytes) * 100 : 100;
       $("gd-fill").style.width = pct.toFixed(1) + "%";
-      const eta = gdEta(performance.now());
-      $("gd-line1").textContent = t("gd.dl", {
-        done: (sum / GB).toFixed(2), total: (gd.bytes / GB).toFixed(2),
-        i: gd.doneFiles, n: gd.files,
-      }) + (eta ? " · " + eta : "");
-      $("gd-line2").textContent = p.item || "";
+      // A `have` tick is where this run STARTS, not something it did: an earlier run's bytes,
+      // credited before a connection is open. On the bar, out of the rate — a step with no
+      // elapsed time behind it is the whole window's worth of "progress" in one frame.
+      if (p.phase !== "have") gdPace(performance.now());
+      // composed, not formatted: the pace is silent for the first seconds, and a separator with
+      // nothing behind it is how a line ends in "3.24 / 8.15 GB ·"
+      $("gd-line1").textContent = [
+        t("gd.dl", { done: (sum / GB).toFixed(2), total: (gd.bytes / GB).toFixed(2) }),
+        gd.rateText,
+        gd.etaText,
+      ].filter(Boolean).join(" · ");
+      // the pre-credit names an asset nothing is doing anything to yet
+      if (p.phase !== "have") $("gd-line2").textContent = p.item || "";
     }
   } else if (p.op === "install") {
     // the chained shim install after a fresh download — small, so one settled bar + a line
@@ -1842,10 +1855,10 @@ async function gdRun() {
   gd.perFile = new Map();
   gd.sum = 0;      // running byte total; reset with the map or a resumed run inherits it
   gd.phase = "plan"; // "plan" -> "fetch", one way, per run — see onGdProgress
-  gd.doneFiles = 0;
   gd.samples = []; // fresh rate window — a retry must not inherit the failed run's rate
+  gd.rateText = "";
   gd.etaText = "";
-  gd.etaAt = 0;
+  gd.paceAt = 0;
   $("gd-fill").style.width = "0%";
   $("gd-line1").textContent = t("gd.starting");
   $("gd-line2").textContent = "";

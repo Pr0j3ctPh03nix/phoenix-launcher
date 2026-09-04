@@ -27,6 +27,10 @@ pub struct OpProgress {
     /// (downloading what is missing). A base run does both under one `op`, and the UI has one
     /// progress line for them, so it has to be able to tell them apart.
     ///
+    /// `have` is the fetch half's opening statement: bytes an EARLIER run already put in the
+    /// cache. They belong on the bar and nowhere near a rate — a step with no elapsed time behind
+    /// it reads as a gigabyte a second.
+    ///
     /// It must be stated, never inferred. The UI used to infer it from "does this tick carry
     /// bytes", which is wrong in the one direction that matters: the PLAN narrates bytes too, for
     /// files big enough that hashing them would otherwise freeze the counter. One 300 MB VPK
