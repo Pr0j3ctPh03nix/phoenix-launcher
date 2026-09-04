@@ -89,7 +89,7 @@ pub async fn game_plan(
         // footprint, `need_bytes` the space warning — same math as the backend preflight
         let (wire, disk, need) =
             install::base_costs(&manifest, &statuses).map_err(CmdError::from)?;
-        let (cached_bytes, cached_files) = install::base_cached(&dir, &manifest, &statuses);
+        let cached_bytes = install::base_cached(&dir, &manifest, &statuses);
         Ok(GamePlanView {
             version: manifest.version,
             files: statuses.iter().filter(|s| s.action.writes()).count() as u32,
@@ -98,7 +98,6 @@ pub async fn game_plan(
             disk_bytes: disk,
             need_bytes: need,
             cached_bytes,
-            cached_files: cached_files as u32,
             free_bytes: install::free_space(&dir),
         })
     })

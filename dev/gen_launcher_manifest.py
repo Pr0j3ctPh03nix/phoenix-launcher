@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Discovery step for the launcher's release manifest: hashes the built exe and hands ONE Entry to
-build_manifest.write() (release-tooling, checked out to --tools by CI). Carries no format knowledge
-of its own -- no schema number, no serial floor, no envelope keys -- all of that lives in
-build_manifest.py; a serial below its floor is refused there, not here.
+build_manifest.write() (release-tooling, checked out to --tooling by CI). Carries no format knowledge
+of its own -- no schema number, no envelope keys -- all of that lives in phoenix_tooling.
 
-    python dev/gen_launcher_manifest.py --version v1.5.2 --serial 2000042 \\
+NO SERIAL, and that is the point: what this writes is a SEAL REQUEST, which carries serial 0 and so
+names no release. The signing authority assigns the real number, writes it into the document and
+signs those bytes; what gets published is the document that comes back, never this one.
+
+    python dev/gen_launcher_manifest.py --version v1.5.2 \\
         --exe phoenix-launcher.exe --exe-path path/to/phoenix-launcher.exe \\
-        [--notes-file body.md] --out manifest.json [--tools .tooling/tools]
+        [--notes-file body.md] --out manifest.json [--tooling .tooling]
 """
 import argparse
 import hashlib
@@ -30,14 +33,14 @@ def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--version", required=True, help="release tag, e.g. v1.5.2")
-    ap.add_argument("--serial", required=True, type=int)
     ap.add_argument("--exe", required=True,
                      help="the release ASSET name the reader matches on (e.g. phoenix-launcher.exe)")
     ap.add_argument("--exe-path", required=True, help="the built exe to hash")
     ap.add_argument("--notes-file", help="release notes to embed for the updater's What's new")
     ap.add_argument("--out", required=True, help="manifest.json to write")
-    ap.add_argument("--tools", default=".tooling/tools",
-                     help="release-tooling's tools/ dir, for build_manifest (default: %(default)s)")
+    ap.add_argument("--tooling", default=".tooling",
+                     help="the release-tooling checkout ROOT, which `phoenix_tooling` is imported "
+                          "from (default: %(default)s)")
     a = ap.parse_args()
 
     if not os.path.isfile(a.exe_path):
@@ -48,8 +51,10 @@ def main():
     if "/" in a.exe or "\\" in a.exe or a.exe in ("", ".", ".."):
         die("--exe {!r} must be a bare asset name".format(a.exe))
 
-    sys.path.insert(0, os.path.abspath(a.tools))
-    import build_manifest  # noqa: E402
+    # The checkout ROOT, not a directory inside it: `phoenix_tooling` is a package there, and the
+    # module names under it are the surface that repo promises not to move.
+    sys.path.insert(0, os.path.abspath(a.tooling))
+    from phoenix_tooling import build_manifest  # noqa: E402
 
     notes = None
     if a.notes_file:
@@ -61,9 +66,11 @@ def main():
 
     ver = a.version[1:] if a.version.startswith("v") else a.version
     exe_entry = build_manifest.Entry(a.exe, sha256(a.exe_path), os.path.getsize(a.exe_path), name=a.exe)
-    doc = build_manifest.write(a.out, "launcher", ver, a.serial, [exe_entry], notes=notes)
-    print("gen_launcher_manifest: wrote {} (schema {}, version {}, serial {}, {} -> {})".format(
-        a.out, doc["schema"], ver, a.serial, a.exe, doc["files"][0]["sha256"][:12]))
+    # `serial` is left at write()'s default of 0 -- see the module docstring.
+    doc = build_manifest.write(a.out, "launcher", ver, entries=[exe_entry], notes=notes)
+    print("gen_launcher_manifest: wrote {} (schema {}, version {}, serial {} -- a seal request, "
+          "{} -> {})".format(a.out, doc["schema"], ver, doc["serial"], a.exe,
+                             doc["files"][0]["sha256"][:12]))
 
 
 if __name__ == "__main__":

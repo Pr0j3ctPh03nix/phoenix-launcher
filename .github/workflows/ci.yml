@@ -46,17 +46,18 @@ jobs:
 
       # Not optional here either: src-tauri/build.rs generates trust::PINNED from `.tooling/keys`
       # and REFUSES to build without it, so both cargo steps below depend on this. The rationale for
-      # fetching rather than vendoring, and for a SHA rather than a branch, is written out in
+      # fetching rather than vendoring, and for `v1` rather than a commit SHA, is written out in
       # release.yml.
       #
-      # THE TWO PINS MOVE TOGETHER, in one commit: this ref decides which `keys/` gets compiled into
-      # the binary this workflow checks, and a check built on a different trust root than the
-      # release is a check of a different binary.
+      # THE SAME REF AS THE RELEASE BUILD, which is what makes this a check of that binary: this ref
+      # decides which `keys/` gets compiled in, and a check built on a different trust root than the
+      # release is a check of a different binary. `v1` moves, so this workflow's scheduled run is
+      # also where a tooling change that breaks the build surfaces before a tag has to find it.
       - name: Fetch release tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 0eb43683fc0969902a4ead9e9ef05c16979b1c90
+          ref: v1
           path: .tooling
 
       # Pinned to the same version release.yml builds with, and for a second reason on top of that

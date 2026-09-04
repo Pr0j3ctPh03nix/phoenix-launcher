@@ -743,6 +743,25 @@ fn obtain_all_tagged(
     // members of a bundle whose other two thousand still have to be sized to be skipped over
     let sizes: HashMap<&str, u64> = manifest.payload_entries().map(|(_, s, z)| (s, z)).collect();
 
+    // What each job's ticks are NAMED after, and its full wire extent (known from the manifest, so
+    // a bar has its span from the very first tick). A raw asset ticks per DEST; a bundle ticks as
+    // ONE item under its asset name — fanning every packed chunk out to two thousand member dests
+    // would multiply the event stream by the member count for no information. Computed once here
+    // because two readers need the same answer: the pre-credit below, and whichever worker takes
+    // the job.
+    let items_of: Vec<(Vec<&str>, u64)> = jobs
+        .iter()
+        .map(|job| match job {
+            Acq::Raw { sha256, size, .. } => (dests_of[sha256].clone(), *size),
+            Acq::Bundle { bundle, .. } => (vec![bundle.name.as_str()], bundle.psize),
+            Acq::Empty { .. } => (Vec::new(), 0),
+        })
+        .collect();
+    // ...and what each already has on disk, which is where its bar STARTS. Read once, up front:
+    // both the pre-credit below and the worker's own opening tick have to name the same figure, or
+    // the second walks the first back down to zero the moment the pool starts.
+    let cached_of: Vec<u64> = jobs.iter().map(|job| acq_cached(cache, job)).collect();
+
     let next = AtomicUsize::new(0);
     let done = AtomicU64::new(0);
     let abort = AtomicBool::new(false); // cheap flag mirrored from first_err, checked per chunk
@@ -755,6 +774,32 @@ fn obtain_all_tagged(
         }
     };
 
+    // What the folder ALREADY holds, said before the first worker starts.
+    //
+    // A resumed run's cache is worth gigabytes, and the progress line used to learn about them
+    // only as workers happened to reach those jobs — so a download the confirm had just reported
+    // as "3.2 of 8.1 GB already downloaded" opened at 0.00 and climbed back in lurches. Each tick
+    // is attributed to the SAME item its job reports under, which is what makes the completion
+    // tick that follows a zero delta rather than a double count.
+    for (i, have) in cached_of.iter().copied().enumerate() {
+        if have == 0 {
+            continue;
+        }
+        let (items, wire_cost) = &items_of[i];
+        for item in items {
+            report(engine::OpProgress {
+                op,
+                phase: "have",
+                current: 0,
+                total,
+                item: Some((*item).to_string()),
+                bytes_done: Some(have),
+                bytes_total: Some(*wire_cost),
+                done: false,
+            });
+        }
+    }
+
     std::thread::scope(|s| {
         for _ in 0..DL_WORKERS.min(jobs.len()) {
             s.spawn(|| loop {
@@ -766,18 +811,9 @@ fn obtain_all_tagged(
                     return;
                 }
                 let job = &jobs[i];
-                // What a byte tick names, and its full extent (known from the manifest, so the
-                // bar has its span from the very first tick). A raw asset ticks per dest; a
-                // bundle ticks as ONE item under its asset name — fanning every packed chunk to
-                // two thousand member dests would multiply the event stream by the member count
-                // for no information.
-                let (items, wire_cost): (Vec<&str>, u64) = match job {
-                    Acq::Raw { sha256, size, .. } => (dests_of[sha256].clone(), *size),
-                    Acq::Bundle { bundle, .. } => (vec![bundle.name.as_str()], bundle.psize),
-                    Acq::Empty { .. } => (Vec::new(), 0),
-                };
+                let (items, wire_cost) = (&items_of[i].0, items_of[i].1);
                 let tick = |current: u64, bytes_done: u64, bytes_total: u64, is_done: bool| {
-                    for item in &items {
+                    for item in items {
                         report(engine::OpProgress {
                             op,
                             phase: "fetch",
@@ -790,10 +826,13 @@ fn obtain_all_tagged(
                         });
                     }
                 };
+                // Opening tick: gives the item's bar its full extent, AT the point this job starts
+                // from. Reporting 0 here would undo the pre-credit above for exactly the jobs it
+                // was written for — the resume would jump forward and snap back on the same frame.
+                let mut last = cached_of[i];
                 if !items.is_empty() {
-                    tick(done.load(Ordering::Relaxed), 0, wire_cost, false);
+                    tick(done.load(Ordering::Relaxed), last, wire_cost, false);
                 }
-                let mut last = 0u64;
                 let mut chunk = |d: u64, t: Option<u64>| {
                     if abort.load(Ordering::Relaxed) || cancelled() {
                         return false; // a sibling failed or the user cancelled — stop this stream
@@ -2188,20 +2227,59 @@ pub fn target_of(base: &str, sub: Option<&str>) -> (String, String) {
     (prefix, target)
 }
 
-/// What the plan's to-download set ALREADY has in the base cache: (WIRE bytes, fully-fetched
-/// files). Accounted per ASSET, not per file (R6): a partly-fetched bundle is progress toward
-/// all of its members and toward none of them individually — without asset tracking, a bundle
-/// killed at 90% read as "0 bytes downloaded" with gigabytes sitting on disk.
+/// The WIRE bytes one acquisition job ALREADY has on disk. Accounted per ASSET, not per file
+/// (R6): a partly-fetched bundle is progress toward all of its members and toward none of them
+/// individually — without asset tracking, a bundle killed at 90% read as "0 bytes downloaded"
+/// with gigabytes sitting on disk.
 ///
-/// Bytes are wire currency, capped at each asset's wire size (an over-long leftover must not
-/// report more than the plan asked for): a raw entry or `.part` counts its length; a bundle
-/// counts its full `psize` once nothing more of it must cross the network (packed asset
-/// present, or every wanted member already extracted), else its packed `.part`'s length.
-/// FILES count dests (that is what every visible counter counts), and a dest is "fetched" only
-/// when its bytes are obtainable with no network — a complete raw entry, an extracted member,
-/// or any member of a fully-present packed bundle. Metadata only. Drives the resume confirm's
-/// "X of Y GB · N of M files already downloaded".
-pub fn base_cached(game_dir: &Path, manifest: &Manifest, statuses: &[BaseStatus]) -> (u64, usize) {
+/// Capped at the job's wire cost, because an over-long leftover must not report more than the
+/// plan asked for. A raw entry counts its length, else its `.part`'s; a bundle counts its full
+/// `psize` once nothing more of it must cross the network (packed asset present, or every wanted
+/// member already extracted), else its packed `.part`'s length.
+///
+/// METADATA ONLY — a length, never a hash. Deliberate, and the reason both callers are safe with
+/// it: this is a claim about what needs no network, and `cache_ok` inside the worker is what
+/// actually verifies the bytes. A cache entry that then fails its hash is deleted and refetched,
+/// and the progress accounting is built to walk back down for exactly that (see `obtain_all`'s
+/// chunk closure).
+fn acq_cached(cache: &Path, acq: &Acq) -> u64 {
+    let entry_len = |name: String| std::fs::metadata(cache.join(name)).ok().map(|m| m.len());
+    let complete = |sha: &str, size: u64| entry_len(sha.to_string()).is_some_and(|l| l >= size);
+    match acq {
+        // costs nothing to download, so it is never progress toward anything
+        Acq::Empty { .. } => 0,
+        Acq::Raw { sha256, size, .. } => entry_len(sha256.to_string())
+            .or_else(|| entry_len(format!("{sha256}.part")))
+            .map_or(0, |len| len.min(*size)),
+        Acq::Bundle { bundle, wanted } => {
+            if complete(&bundle.psha256, bundle.psize)
+                || wanted.iter().all(|(sha, size)| complete(sha, *size))
+            {
+                // nothing more of this bundle crosses the network — and a present packed asset
+                // makes every wanted member obtainable offline
+                bundle.psize
+            } else {
+                // extracted members do NOT discount the bytes: the packed asset still has to
+                // cross whole for the members that are missing
+                entry_len(format!("{}.part", bundle.psha256)).map_or(0, |len| len.min(bundle.psize))
+            }
+        }
+    }
+}
+
+/// What the plan's to-download set already has in the base cache, in WIRE bytes. Drives the
+/// resume confirm's "X of Y GB already downloaded".
+///
+/// Bytes, and ONLY bytes. It used to report a second number — how many of the plan's FILES were
+/// already fetched — and that number was worse than useless on this payload: file completion is
+/// quantized by asset (a file is fetched when its whole bundle is), the bundles carrying most of
+/// the files are the smallest and so are scheduled last, and a `.part` of any size credits
+/// nothing at all. A stop inside the first gigabyte therefore produced "3.2 of 8.1 GB · 0 of 4815
+/// files" — two numbers contradicting each other about the same folder, on the screen whose job
+/// is to say what resuming will cost. Bytes are the download's currency (R7); files are a fact
+/// about the install, and they are stated as a total on the fresh-download confirm where they
+/// mean something.
+pub fn base_cached(game_dir: &Path, manifest: &Manifest, statuses: &[BaseStatus]) -> u64 {
     let cache = game_dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
     let writes: Vec<&FileEntry> = statuses
         .iter()
@@ -2212,57 +2290,9 @@ pub fn base_cached(game_dir: &Path, manifest: &Manifest, statuses: &[BaseStatus]
         &manifest.bundles,
         writes.iter().map(|fe| (fe.name.as_deref(), fe.sha256.as_str(), fe.size)),
     ) else {
-        return (0, 0);
+        return 0;
     };
-    let entry_len = |name: String| std::fs::metadata(cache.join(name)).ok().map(|m| m.len());
-    let complete = |sha: &str, size: u64| entry_len(sha.to_string()).is_some_and(|l| l >= size);
-
-    let mut bytes = 0u64;
-    // hashes whose bytes need no further network — dests holding them count as fetched below
-    let mut fetched: HashSet<&str> = HashSet::new();
-    for acq in &acqs {
-        match acq {
-            Acq::Raw { sha256, size, .. } => {
-                if let Some(len) = entry_len(sha256.to_string()) {
-                    bytes += len.min(*size);
-                    if len >= *size {
-                        fetched.insert(sha256);
-                    }
-                } else if let Some(len) = entry_len(format!("{sha256}.part")) {
-                    bytes += len.min(*size);
-                }
-            }
-            // costs nothing to download; "fetched" once its entry was materialized
-            Acq::Empty { sha256 } => {
-                if entry_len(sha256.to_string()).is_some() {
-                    fetched.insert(sha256);
-                }
-            }
-            Acq::Bundle { bundle, wanted } => {
-                let have: Vec<&str> = wanted
-                    .iter()
-                    .filter(|(sha, size)| complete(sha, *size))
-                    .map(|(sha, _)| *sha)
-                    .collect();
-                if complete(&bundle.psha256, bundle.psize) || have.len() == wanted.len() {
-                    // nothing more of this bundle crosses the network — and a present packed
-                    // asset makes every wanted member obtainable offline
-                    bytes += bundle.psize;
-                    fetched.extend(wanted.iter().map(|(sha, _)| *sha));
-                } else {
-                    // extracted members do NOT discount the bytes: the packed asset still has
-                    // to cross whole for the members that are missing. They do count as
-                    // fetched FILES — their dests need no further network.
-                    fetched.extend(have);
-                    if let Some(len) = entry_len(format!("{}.part", bundle.psha256)) {
-                        bytes += len.min(bundle.psize);
-                    }
-                }
-            }
-        }
-    }
-    let files = writes.iter().filter(|fe| fetched.contains(fe.sha256.as_str())).count();
-    (bytes, files)
+    acqs.iter().map(|acq| acq_cached(&cache, acq)).sum()
 }
 
 /// What `build_identity` concluded about a folder.
@@ -4758,7 +4788,7 @@ mod tests {
     }
 
     #[test]
-    fn base_cached_counts_bytes_by_hash_and_files_by_dest() {
+    fn base_cached_counts_wire_bytes_once_per_asset() {
         let dir = tempdir("cached-bytes");
         let (m, _) = base_release();
         let manifest = crate::manifest::Manifest::parse(m.as_bytes()).unwrap();
@@ -4769,16 +4799,15 @@ mod tests {
         // EXE (3 bytes) fully cached; PAK has a 2-byte .part; the shared CFG asset absent
         std::fs::write(cache.join(sha(b"EXE")), b"EXE").unwrap();
         std::fs::write(cache.join(format!("{}.part", sha(b"PAK"))), b"PA").unwrap();
-        // bytes: 3 (full) + 2 (part). files: only EXE — a .part is byte progress, not a file
-        assert_eq!(base_cached(&dir, &manifest, &statuses), (5, 1));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), 5, "3 full + 2 of a .part");
 
-        // the CFG asset landing makes BOTH its dests fetched files, but its bytes count once
+        // the CFG asset serves TWO dests and still crosses the wire once
         std::fs::write(cache.join(sha(b"CFG")), b"CFG").unwrap();
-        assert_eq!(base_cached(&dir, &manifest, &statuses), (8, 3));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), 8);
 
         // an over-long leftover must not report more than the plan asked for
         std::fs::write(cache.join(sha(b"EXE")), b"EXE-OVERLONG").unwrap();
-        assert_eq!(base_cached(&dir, &manifest, &statuses), (8, 3));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), 8);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5049,8 +5078,8 @@ mod tests {
     }
 
     /// R6 in `base_cached`'s terms: a packed bundle on disk is wire progress toward all of its
-    /// members; extracted members alone are fetched FILES but discount no wire bytes while the
-    /// bundle still has missing members.
+    /// members, while extracted members discount no wire bytes at all until the bundle has none
+    /// missing — until then the packed asset still has to cross whole.
     #[test]
     fn base_cached_accounts_bundles_per_asset() {
         let dir = tempdir("bundle-cached");
@@ -5070,18 +5099,104 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
 
         // nothing cached
-        assert_eq!(base_cached(&dir, &manifest, &statuses), (0, 0));
-        // one extracted member, packed gone: its dest needs no network, but the packed asset
-        // still crosses whole for the other member — zero wire bytes discounted
+        assert_eq!(base_cached(&dir, &manifest, &statuses), 0);
+        // one extracted member, packed gone: the packed asset still crosses whole for the other
+        // member, so nothing is discounted
         std::fs::write(cache.join(sha(x)), x).unwrap();
-        assert_eq!(base_cached(&dir, &manifest, &statuses), (0, 1));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), 0);
         // a packed .part is byte progress
         std::fs::write(cache.join(format!("{psha}.part")), &packed[..2]).unwrap();
-        assert_eq!(base_cached(&dir, &manifest, &statuses), (2, 1));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), 2);
         // the full packed asset present: the whole bundle is offline-obtainable
         std::fs::remove_file(cache.join(format!("{psha}.part"))).unwrap();
         std::fs::write(cache.join(&psha), &packed).unwrap();
-        assert_eq!(base_cached(&dir, &manifest, &statuses), (packed.len() as u64, 2));
+        assert_eq!(base_cached(&dir, &manifest, &statuses), packed.len() as u64);
+        // and so is a bundle whose every wanted member is extracted, packed asset long deleted
+        std::fs::remove_file(cache.join(&psha)).unwrap();
+        std::fs::write(cache.join(sha(y)), y).unwrap();
+        assert_eq!(base_cached(&dir, &manifest, &statuses), packed.len() as u64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A RESUMED run states what the folder already holds BEFORE it fetches anything.
+    ///
+    /// The confirm has just told the user "X of Y GB already downloaded" (`base_cached`), and the
+    /// run's own line used to open at 0.00 GB and climb back only as workers happened to reach the
+    /// cached jobs — two screens in a row disagreeing about the same folder, with an ETA whose
+    /// first window measured that catch-up instead of the link. This replays the frontend's own
+    /// accounting (`onGdProgress`: a running total kept by per-item delta) over the real tick
+    /// stream, which is what makes the second half of the property testable at all — the
+    /// completion ticks that follow the pre-credit must be a zero delta, never a double count.
+    #[test]
+    fn a_resumed_run_credits_its_warm_cache_before_the_first_byte() {
+        let dir = tempdir("resume-credit");
+        let (x, y, z) = (b"XXXXXXXXXX" as &[u8], b"YYYYYYYY" as &[u8], b"ZZZZ" as &[u8]);
+        let raw = b"RAWRAWRAW" as &[u8];
+        let (packed_a, psha_a, dsize_a) = pack(&[x, y]);
+        let (packed_b, psha_b, dsize_b) = pack(&[z]);
+        let m = serde_json::json!({
+            "schema": 3, "version": "1805",
+            "bundles": [
+                { "name": "a.phxb", "codec": "zstd", "psize": packed_a.len(),
+                  "psha256": psha_a, "size": dsize_a, "members": [sha(x), sha(y)] },
+                { "name": "b.phxb", "codec": "zstd", "psize": packed_b.len(),
+                  "psha256": psha_b, "size": dsize_b, "members": [sha(z)] },
+            ],
+            "files": [
+                bundled_json("game/dota/x.txt", x),
+                bundled_json("game/dota/y.txt", y),
+                bundled_json("game/dota/z.txt", z),
+                file_json("raw.bin", "game/dota/raw.bin", raw),
+            ],
+        })
+        .to_string();
+        let manifest = Manifest::parse(m.as_bytes()).unwrap();
+        let dl = arc(base_fake(
+            "v1805",
+            &m,
+            vec![("a.phxb", &packed_a), ("b.phxb", &packed_b), ("raw.bin", raw)],
+        ));
+
+        // exactly what a STOPPED run leaves behind for bundle A: decoded, so its members are cache
+        // entries and the packed asset it came from is long deleted. Bundle B and the raw asset
+        // were never started, so this run has to fetch them.
+        let cache = dir.join(CACHE_DIR).join(BASE_CACHE_SUBDIR);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(sha(x)), x).unwrap();
+        std::fs::write(cache.join(sha(y)), y).unwrap();
+
+        let statuses = base_plan(&dir, &manifest, None, "plan", None).unwrap();
+        let (wire_bytes, _, _) = base_costs(&manifest, &statuses).unwrap();
+        let cached = base_cached(&dir, &manifest, &statuses);
+        assert_eq!(cached, packed_a.len() as u64, "the confirm's number: bundle A costs nothing");
+
+        let ticks: Mutex<Vec<engine::OpProgress>> = Mutex::new(Vec::new());
+        let record = |p: engine::OpProgress| ticks.lock().unwrap().push(p);
+        let sink: &(dyn Fn(engine::OpProgress) + Send + Sync) = &record;
+        install_base(&dir, &game_wire(dl.clone()), &manifest, Some(sink), None, None).unwrap();
+        let ticks = ticks.into_inner().unwrap();
+
+        // The pre-credit is emitted before a single worker is spawned, so it is a PREFIX of the
+        // stream — and one job is cacheable here, so it is exactly one tick.
+        let credits: Vec<_> = ticks.iter().filter(|p| p.phase == "have").collect();
+        assert_eq!(credits.len(), 1, "one cached job, one credit");
+        let first = credits[0];
+        let opens = ticks.iter().find(|p| p.phase != "plan").expect("the fetch half reported");
+        assert!(std::ptr::eq(opens, first), "credited before the pool opens a connection");
+        assert_eq!(first.item.as_deref(), Some("a.phxb"), "named as the job reports, not per dest");
+        assert_eq!(first.bytes_done, Some(cached), "the line opens where the confirm left it");
+        assert!(!first.done, "a length is not a verification — only the worker settles a file");
+
+        // and now onGdProgress itself, over the whole stream: everything that is not the plan half
+        // reaches the byte accounting, `have` included — it is the bar's starting position.
+        let mut per: HashMap<&str, i64> = HashMap::new();
+        let mut sum = 0i64;
+        for p in ticks.iter().filter(|p| p.phase != "plan") {
+            let item = p.item.as_deref().unwrap_or("");
+            let bytes = p.bytes_done.unwrap_or(0) as i64;
+            sum += bytes - per.insert(item, bytes).unwrap_or(0);
+        }
+        assert_eq!(sum, wire_bytes as i64, "the bar lands on its own total: no double count");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
