@@ -545,8 +545,14 @@ jobs:
               json.dump({"ref": "main", "inputs": inputs}, fh)
           print(f"manifest {len(raw)} bytes -> inputs {size} characters (cap {MAX})")
           PY
+          # NO LEADING SLASH on the endpoint, and it is not a style choice: this step runs under
+          # `shell: bash` on a WINDOWS runner, where bash is MSYS and rewrites any argument that
+          # looks like an absolute Unix path into a Windows one. `/repos/...` reaches gh as
+          # `C:/Program Files/Git/repos/...` and is refused as an invalid endpoint — after the
+          # draft is already up. gh accepts the path without the slash on every platform, which is
+          # how every other `gh api` call in this file is already written.
           gh api --method POST \
-            /repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches \
+            repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches \
             --input "$RUNNER_TEMP/dispatch.json"
           echo "asked release-tooling to seal $GITHUB_REPOSITORY $TAG at serial $SERIAL"
 
