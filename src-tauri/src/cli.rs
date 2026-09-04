@@ -69,7 +69,10 @@ pub fn run_sources(flags: &[String]) -> Result<()> {
     // guess at, which is the whole point of the model.
     for (i, s) in outcome.sources().iter().enumerate() {
         let in_use = if i == 0 { "  <- IN USE" } else { "" };
-        println!("{}{in_use}", s.key().unwrap_or("<github>"));
+        // Address AND published name: this is the one place addresses are still printed (the GUI is
+        // named-only, deliberately), so it is also the only place the two can be lined up.
+        let named = s.name.as_deref().map(|n| format!(" [{n}]")).unwrap_or_default();
+        println!("{}{named}{in_use}", s.key().unwrap_or("<github>"));
         let Some(m) = &s.measured else {
             println!("  NOT MEASURED");
             continue;

@@ -115,15 +115,18 @@
           <ul class="files" id="files"></ul>
         </div>
 
-        <!-- Where downloads come from. A REPORT, not a form: sources are discovered from the
-             published mirrors.json and ranked by a real measurement, so there is nothing here to
-             switch, pin or save. It stays hidden while there is only one working source — a block
-             that always said "Main source, in use" would be a label, not information. -->
-        <div class="sources rise hidden" id="sources" style="--d:.16s">
-          <div class="files-head"><span class="eyebrow" data-i18n="src.title"></span></div>
-          <div class="src-list" id="src-list"></div>
-          <span class="hint" id="src-note"></span>
-        </div>
+        <!-- Where downloads come from, in ONE line: what the last operation used, what it measured,
+             and a word when something is wrong. The ranking itself is a page of its own
+             (#view-sources) — it is a report nobody acts on, so it has no business taking column
+             height from the thing this screen is about. Hidden only until the first answer from
+             `download_sources` arrives; after that it is always here, because it is the one door to
+             that page. -->
+        <button class="src-line rise hidden" id="src-line" style="--d:.16s">
+          <span class="src-line-label" data-i18n="src.line"></span>
+          <span class="src-line-name" id="src-line-name"></span>
+          <span class="src-line-meta" id="src-line-meta"></span>
+          <svg class="fchev" viewBox="0 0 12 12" aria-hidden="true"><path d="M4.5 2 8.5 6l-4 4"/></svg>
+        </button>
 
         <footer class="actions rise" style="--d:.18s">
           <button class="btn" id="btn-primary"></button>
@@ -477,6 +480,25 @@
 
         <footer class="actions">
           <button class="btn" id="btn-whatsnew-back" data-i18n="btn.back"></button>
+        </footer>
+      </section>
+
+      <!-- ===================== DOWNLOAD SOURCES ===================== -->
+      <!-- A REPORT, not a form: sources are discovered from the published mirrors.json and ranked
+           by a real measurement, so there is nothing here to switch, pin or save. A source is named
+           by what the list CALLS it and never by its address — see `SourceRowView`, which is not
+           sent one. -->
+      <section id="view-sources" class="view hidden">
+
+        <header class="head">
+          <span class="brand"><span class="brand-dot"></span><span data-i18n="head.sources"></span></span>
+        </header>
+
+        <div class="src-list" id="src-list"></div>
+        <span class="hint" id="src-note"></span>
+
+        <footer class="actions">
+          <button class="btn" id="btn-sources-back" data-i18n="btn.back"></button>
         </footer>
       </section>
 

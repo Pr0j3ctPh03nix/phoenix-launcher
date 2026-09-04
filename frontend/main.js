@@ -24,8 +24,8 @@ const state = {
   hasToken: false,
   renderer: "dx11",
   launchFlags: [],    // [{id, args, enabled}] as loaded from settings, toggled in place
-  sourcesView: null,   // the download-source status block, PUSHED by the backend. A report of
-                       // the ranking the download path is walking — never a form.
+  sourcesView: null,   // the download sources, PUSHED by the backend. A report of the ranking the
+                       // download path is walking — never a form. Paints main's line AND its page.
   afTarget: null,      // "setup" | "settings" — where an autofind pick lands
   afUnlisten: null,
   afBusy: false,       // a scan invoke is in flight (double-start guard)
@@ -144,7 +144,7 @@ function syncModalLayer() {
 }
 
 // ---- views ----
-const VIEWS = ["main", "setup", "settings", "options", "autoexec", "whatsnew", "gv"];
+const VIEWS = ["main", "setup", "settings", "options", "autoexec", "whatsnew", "gv", "sources"];
 function showView(name) {
   for (const v of VIEWS) $("view-" + v).classList.toggle("hidden", v !== name);
 }
@@ -1046,21 +1046,14 @@ function renderLaunchFlags() {
 // ---- download sources ----
 // A REPORT, not a form. Sources are discovered from the published mirrors.json and ranked by a
 // real measurement, so there is nothing here to switch, pin or save — the only thing worth doing
-// with the ranking is showing it.
+// with the ranking is showing it. TWO surfaces, one payload: a line on main (the source in use)
+// and a page behind it (the whole ranking).
 //
 // PUSHED, not polled. It changes at moments this side cannot predict: a measuring pass finishing
 // eight seconds after boot, and a failover in the middle of a three-hour game download. A timer
-// would be either a poll running forever for a block that changes twice a session, or a stale
-// block. `download_sources` is the first paint and the reconnect path for a webview that missed
+// would be either a poll running forever for something that changes twice a session, or a stale
+// report. `download_sources` is the first paint and the reconnect path for a webview that missed
 // the events it was not there for.
-
-function hostOf(url) {
-  try {
-    return new URL(url).host;
-  } catch {
-    return url;
-  }
-}
 
 function fmtSpeed(bps) {
   const mib = bps / (1024 * 1024);
@@ -1073,7 +1066,7 @@ function fmtSpeed(bps) {
 //
 // Its own function rather than the files view's `fmtAge`: that one dates a file the user last
 // touched, in days, and the granularity that matters here is MINUTES — a measuring pass finishes
-// seconds after boot and the block has to stop saying "measuring…" in a way you can read.
+// seconds after boot and the row has to stop saying "measuring…" in a way you can read.
 function srcAge(unixSeconds) {
   const mins = Math.max(0, Math.round(Date.now() / 1000 - unixSeconds) / 60);
   if (mins < 1) return t("src.ageNow");
@@ -1104,37 +1097,76 @@ function srcMeta(r) {
   return { text: bits.join(" · "), cls: r.rangeOk ? "good" : "" };
 }
 
-function renderSources(v) {
-  const rows = v.sources || [];
-  // Hidden while there is one source and it works. A block that always said "Main source, in use"
-  // would be a label rather than information — and with nothing published this is exactly the UI
-  // the launcher had before mirrors existed, with no flag anywhere.
-  const worth = rows.length > 1 || (rows[0] && (!rows[0].healthy || rows[0].failed));
-  $("sources").classList.toggle("hidden", !worth);
-  if (!worth) return;
+// What a source is CALLED. The published name (`phx-ca-1`), rendered in caps by the stylesheet —
+// never an address: a mirror is registered by URL and those URLs are commonly bare IPs, so the
+// backend does not send one (see `SourceRowView`) and there is nothing here that could print one.
+// `src.mirror` covers the seconds before the first list refresh on a launcher upgraded from a
+// version that did not keep names.
+function srcName(r) {
+  return r.builtin ? t("src.github") : r.name || t("src.mirror");
+}
 
+// Down: it failed an operation this session, or its last measurement says it cannot serve one.
+// UNMEASURED IS NOT DOWN — on a first launch nothing has an answer yet, and reading that as a dead
+// world would open the app on "no source is working" every single time.
+function srcDown(r) {
+  return r.failed || (r.measuredAt != null && !r.healthy);
+}
+
+// The suffix on main's one-liner, and ONLY when there is something to say — an ordinary line is a
+// name and a speed. Ordered by what it costs the user: the source in use being unusable outranks a
+// sibling that is, and "nothing works at all" outranks both because it is the state where the next
+// download fails.
+function srcLineState(r, rows) {
+  if (r.measuring) return { text: t("src.measuring"), cls: "warn" };
+  if (rows.every(srcDown)) return { text: t("src.allDown"), cls: "bad" };
+  if (srcDown(r)) return { text: r.failed ? t("src.failed") : t("src.unusable"), cls: "bad" };
+  if (r.measuredAt == null) return { text: t("src.untested"), cls: "" };
+  // r is fine, so every one of these is a sibling
+  const down = rows.filter(srcDown).length;
+  return down ? { text: t("src.nDown", { n: down }), cls: "" } : null;
+}
+
+// Main's line: which source the last operation used, how fast it measured, and a word when
+// something is wrong. `active` is resolved by the BACKEND (source::Registry) — the same value the
+// download path walks — so this can never name a source the installer is not using.
+function renderSourceLine(v) {
+  const rows = v.sources || [];
+  const r = rows.find((s) => s.active) || rows[0];
+  if (!r) return; // no ranking at all: nothing to say, and nothing behind the line to open
+  $("src-line").classList.remove("hidden");
+  $("src-line-name").textContent = srcName(r);
+  const bits = [];
+  // The speed rides along because it is what the ranking sorted on and it is nearly always already
+  // measured — the line costs a round trip to nothing.
+  if (r.healthy && r.bytesPerSec) bits.push(fmtSpeed(r.bytesPerSec));
+  const state = srcLineState(r, rows);
+  if (state) bits.push(state.text);
+  const meta = $("src-line-meta");
+  meta.textContent = bits.join(" · ");
+  meta.className = "src-line-meta" + (state && state.cls ? " " + state.cls : "");
+}
+
+// The page behind it: every source, in the order the walk uses them.
+function renderSourceList(v) {
   const list = $("src-list");
   list.innerHTML = "";
-  for (const r of rows) {
+  for (const r of v.sources || []) {
     const row = document.createElement("div");
-    // `active` is resolved by the BACKEND (source::Registry) — the same value the download path
-    // walks — so this block can never disagree with it about which source is in use.
     row.className = "src-row" + (r.active ? " current" : "");
 
     const text = document.createElement("div");
     text.className = "src-text";
-    const host = document.createElement("span");
-    host.className = "src-host";
-    // the built-in source is deliberately nameless — which repo it is is not the user's concern
-    host.textContent = r.url ? hostOf(r.url) : t("src.github");
-    if (r.url) host.title = r.url; // the full URL stays on hover
+    const name = document.createElement("span");
+    name.className = "src-name";
+    name.textContent = srcName(r);
     const info = r.failed && !r.measuring
       ? { text: t("src.failed"), cls: "bad" }
       : srcMeta(r);
     const meta = document.createElement("span");
     meta.className = "src-meta" + (info.cls ? " " + info.cls : "");
     meta.textContent = info.text;
-    text.append(host, meta);
+    text.append(name, meta);
     row.append(text);
 
     if (r.active) {
@@ -1151,6 +1183,14 @@ function renderSources(v) {
     ? `${t("src.refreshFailed")} · ${v.refreshError}`
     : t("src.auto");
   $("src-note").classList.toggle("bad", !!v.refreshError);
+}
+
+// Both, on every push. The page is a handful of rows, so keeping it painted while it is hidden
+// costs nothing and buys two things: it is correct the instant it opens, and a measuring pass that
+// finishes while the user is looking at it lands on the screen instead of going stale behind them.
+function renderSources(v) {
+  renderSourceLine(v);
+  renderSourceList(v);
 }
 
 async function refreshSources() {
@@ -3628,6 +3668,15 @@ $("btn-whatsnew").addEventListener("click", () => !state.busy && openWhatsNew())
 $("btn-customize").addEventListener("click", () => { if (!state.busy) { renderOptions(); showView("options"); } });
 $("btn-options-back").addEventListener("click", () => showView("main"));
 $("btn-whatsnew-back").addEventListener("click", () => showView("main"));
+// The sources page is already painted by every push, so opening it is only the navigation — and it
+// is reached from exactly one place, so Back has one place to return to.
+//
+// NOT gated on `state.busy`, unlike every other view: it fetches nothing, and mid-operation is
+// precisely when a failover is worth looking at. Leaving main does not disturb a running install
+// either — `showView` only toggles a section's `hidden`, so the file rows keep their live progress
+// in the DOM and are exactly where they were left on the way back.
+$("src-line").addEventListener("click", () => showView("sources"));
+$("btn-sources-back").addEventListener("click", () => showView("main"));
 $("btn-save").addEventListener("click", saveSettings);
 $("btn-back").addEventListener("click", () => maybeCloseSettings());
 $("btn-browse").addEventListener("click", () => browseInto($("in-game")));
@@ -3762,7 +3811,7 @@ document.addEventListener("keydown", (e) => {
     const v = currentView();
     if (v === "autoexec") { e.preventDefault(); maybeCloseAutoexec(); }
     else if (v === "settings") { e.preventDefault(); maybeCloseSettings(); }
-    else if (v === "whatsnew" || v === "options") { e.preventDefault(); showView("main"); }
+    else if (v === "whatsnew" || v === "options" || v === "sources") { e.preventDefault(); showView("main"); }
   } else if (e.key === "Enter" && currentView() === "settings" && !state.busy
              && e.target.tagName !== "TEXTAREA" && e.target.tagName !== "BUTTON") {
     // Enter commits the form from a FIELD. A focused button already means Enter, and swallowing

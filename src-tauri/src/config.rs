@@ -63,6 +63,16 @@ pub struct Source {
     /// by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// What the published list CALLS this mirror (`phx-ca-1`), and the only thing the UI is allowed
+    /// to name it by: a mirror is registered by address, and an address is frequently a bare IP —
+    /// which is nobody's business but the launcher's.
+    ///
+    /// Never identity: two rows are one source when their URLs match, whatever they are called, so
+    /// nothing here ranks, dedupes or routes on it. `None` is GitHub — the built-in source is named
+    /// by the UI, in the user's language — or a mirror read out of a settings file written before
+    /// names were kept, which the next refresh fills in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// The last measurement. `None` = never measured, which is what triggers a measuring pass — on
     /// a fresh install GitHub itself is `None`, which is why the first launch measures at all.
     ///
@@ -76,9 +86,15 @@ pub struct Source {
 }
 
 impl Source {
-    /// A mirror at `url`, never measured.
+    /// A mirror at `url`, unnamed and never measured — the debug CLI's `--mirror`, which is handed
+    /// an address and nothing else.
     pub fn at(url: impl Into<String>) -> Self {
-        Self { url: Some(url.into()), measured: None }
+        Self { url: Some(url.into()), name: None, measured: None }
+    }
+
+    /// A mirror as the published list registers it: address and name together, never measured.
+    pub fn named(url: impl Into<String>, name: impl Into<String>) -> Self {
+        Self { url: Some(url.into()), name: Some(name.into()), measured: None }
     }
 
     /// The built-in GitHub entry.
@@ -91,10 +107,23 @@ impl Source {
     pub fn key(&self) -> Option<&str> {
         self.url.as_deref()
     }
+
+    /// How a MESSAGE names this source. English, like every other diagnosis the engine builds — the
+    /// frontend prefixes it with a localized verdict, exactly as it does for a measurement's reason.
+    ///
+    /// Never the URL, on any branch. The UI's own labels come from `SourceRowView`, so this is only
+    /// for the reasons that ride along inside an error string.
+    pub fn label(&self) -> &str {
+        match (self.name.as_deref(), self.is_github()) {
+            (Some(name), _) => name,
+            (None, true) => "the main source",
+            (None, false) => "a mirror",
+        }
+    }
 }
 
 /// What one measurement concluded. PERSISTED — a restart must not re-time the world, and the
-/// status block has to have something to show before the first pass finishes.
+/// sources report has to have something to show before the first pass finishes.
 ///
 /// This is the old `mirror::Probe` and the old `Source::measured: bool` collapsed into one value.
 /// Two representations of one fact is what let the settings pane say "not tested" beside a live
@@ -492,6 +521,7 @@ mod tests {
     fn measured(url: &str, at: u64) -> Source {
         Source {
             url: Some(url.to_string()),
+            name: None,
             measured: Some(Measured { bytes_per_sec: Some(1), ..Measured::blank(at) }),
         }
     }

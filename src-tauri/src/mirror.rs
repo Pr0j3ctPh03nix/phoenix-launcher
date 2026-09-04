@@ -247,29 +247,39 @@ fn entry(name: &str, url: &str, payloads: &str) -> String {
 /// published ones land at the end unmeasured — which is precisely the signal that a measuring pass
 /// is due (`source::launch_set`).
 ///
+/// What a surviving entry does NOT keep is its NAME: the document is the authority on what a host
+/// is called, so a re-registration under a new one reaches the UI on the next launch. That is safe
+/// precisely because the name is not identity — the merge below is by URL throughout, so a rename
+/// moves a label and nothing else.
+///
 /// The GitHub entry is preserved from `existing` wherever it sits, and re-inserted if somehow
 /// absent. It is never drawn from the document, which is what makes it unremovable by one: every
 /// entry in the document is a URL, and GitHub's identity is the absence of one.
 fn rebuild(existing: &[Source], hosts: &[signed::Host]) -> Vec<Source> {
-    let published: Vec<String> = {
+    let published: Vec<(String, &str)> = {
         let mut seen = std::collections::HashSet::new();
         hosts
             .iter()
-            .filter_map(|h| normalize_mirror_url(&h.url))
-            .filter(|u| seen.insert(u.clone()))
+            .filter_map(|h| normalize_mirror_url(&h.url).map(|u| (u, h.name.as_str())))
+            .filter(|(u, _)| seen.insert(u.clone()))
             .collect()
     };
     let mut out: Vec<Source> = existing
         .iter()
-        .filter(|s| s.is_github() || s.key().is_some_and(|u| published.iter().any(|p| p == u)))
-        .cloned()
+        .filter_map(|s| match s.is_github() {
+            true => Some(s.clone()),
+            false => published
+                .iter()
+                .find(|(u, _)| Some(u.as_str()) == s.key())
+                .map(|(_, name)| Source { name: Some((*name).to_string()), ..s.clone() }),
+        })
         .collect();
     if !out.iter().any(Source::is_github) {
         out.insert(0, Source::default());
     }
-    for url in published {
+    for (url, name) in published {
         if !out.iter().any(|s| s.key() == Some(url.as_str())) {
-            out.push(Source::at(url));
+            out.push(Source::named(url, name));
         }
     }
     out
@@ -352,6 +362,12 @@ fn fetch_list_from_github(settings: &Settings, floor: u64) -> Result<Option<sign
 /// `mirrors.json` on every run, so its absence means the host is broken, and one host that had not
 /// synced yet was enough to make the mirror set stop changing for everyone who reached it. Only
 /// GitHub gets to say "nothing is published"; a mirror only ever gets to fail.
+///
+/// NOTHING HERE NAMES THE HOST. These errors reach the screen (`Registry::refresh_error`), and a
+/// mirror is registered by ADDRESS — frequently a bare IP, which is the launcher's business and not
+/// the user's. Which source failed is still said, once, by the walk that chose it
+/// (`source::refresh_list_with`), which is the layer holding the `Source` and therefore its
+/// published name.
 fn fetch_list_from_mirror(base: &str, floor: u64) -> Result<Option<signed::SignedList>> {
     let agent = probe_agent();
     // `Ok(None)` inside this closure is a 404 and nothing else: every other failure is an error, so
@@ -363,16 +379,16 @@ fn fetch_list_from_mirror(base: &str, floor: u64) -> Result<Option<signed::Signe
         }) {
             Ok(r) => Ok(Some(read_all(r, max)?)),
             Err(FetchError::Http(ureq::Error::Status(404, _))) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("{base}: {}", short_fetch(e))),
+            Err(e) => Err(anyhow::anyhow!("{name}: {}", short_fetch(e))),
         }
     };
     let Some(doc) = get(MIRRORS_ASSET, MIRRORS_MAX_BYTES)? else {
-        anyhow::bail!("{base}: this host serves no {MIRRORS_ASSET}");
+        anyhow::bail!("this host serves no {MIRRORS_ASSET}");
     };
     let sig = get(&mirrors_sig(), crate::trust::MAX_SIG_BYTES)?.ok_or_else(|| {
         anyhow::Error::new(crate::trust::TrustError::Unsigned(MIRRORS_ASSET.to_string()))
     })?;
-    signed::verify(&doc, &sig_text(sig)?, floor).map(Some).with_context(|| base.to_string())
+    signed::verify(&doc, &sig_text(sig)?, floor).map(Some)
 }
 
 /// Read a small document whole, under a ceiling the CALLER states.
@@ -456,19 +472,24 @@ mod signed {
         payloads: Vec<String>,
     }
 
-    /// One published mirror, reduced to what the client acts on: WHERE IT IS. That is the whole
-    /// of it.
+    /// One published mirror, reduced to what the client uses: WHERE IT IS, and WHAT IT IS CALLED.
     ///
     /// `payloads` is validated and then discarded, and the asymmetry is deliberate. Validating it
     /// is a check on our own PRODUCER — an entry advertising nothing is a registration that would
     /// serve nothing, and the registry repo exists to make that unshippable. ACTING on it is a
     /// different thing, and the launcher does not: every mirror carries every payload (see
     /// `source::dial_for`), so a per-host payload list would be a field the client has to keep in
-    /// step with a fact it never asks. `name` and `country` are discarded for the plainer reason
-    /// that nothing renders them.
+    /// step with a fact it never asks. `country` is discarded for the plainer reason that nothing
+    /// renders it.
+    ///
+    /// `name` is kept because the UI names a source by it and by nothing else — a registration is
+    /// by address, and the addresses in this document are frequently bare IPs. It is a LABEL and
+    /// never an identity: `rebuild` still merges on the URL, so a renamed host stays the same host.
+    /// `verify` has already refused an entry whose name is empty.
     #[derive(Debug)]
     pub(super) struct Host {
         pub(super) url: String,
+        pub(super) name: String,
     }
 
     /// A mirror list that has been verified, identified and found current. `verify` is its sole
@@ -567,7 +588,7 @@ mod signed {
                     m.base_url
                 );
             }
-            hosts.push(Host { url: m.base_url.clone() });
+            hosts.push(Host { url: m.base_url.clone(), name: m.name.clone() });
         }
         Ok(SignedList { hosts, serial })
     }
@@ -1127,13 +1148,19 @@ mod tests {
     fn measured(url: &str) -> Source {
         Source {
             url: Some(url.to_string()),
+            name: Some("was-called-this".to_string()),
             measured: Some(Measured { bytes_per_sec: Some(1), ..Measured::blank(1_000) }),
         }
     }
 
     /// `rebuild` takes what the signed list said; this builds one entry of it.
     fn host(url: &str) -> signed::Host {
-        signed::Host { url: url.to_string() }
+        named_host(url, "phx-test")
+    }
+
+    /// The same, when the test is about the NAME the document carries.
+    fn named_host(url: &str, name: &str) -> signed::Host {
+        signed::Host { url: url.to_string(), name: name.to_string() }
     }
 
     /// A refresh must not disturb the ranking, and must not throw away what it cost a real
@@ -1179,6 +1206,22 @@ mod tests {
         assert!(by_url("https://b").unwrap().measured.is_none(), "newly published: no answer yet");
         assert!(by_url("https://dropped").is_none(), "unpublished hosts leave");
         assert!(out.iter().any(Source::is_github), "and the built-in source is never in the list");
+    }
+
+    /// THE NAME IS THE DOCUMENT'S, ALWAYS — it is the only string the UI may call a host by, and a
+    /// host re-registered under a new one must reach the screen instead of being remembered forever
+    /// by the name it was first published under. Safe precisely because the name is not identity:
+    /// the merge is by URL, so the measurement that cost a real transfer survives the rename.
+    #[test]
+    fn rebuild_takes_the_published_name_and_keeps_merging_by_url() {
+        let existing = vec![Source::default(), measured("https://a")];
+        let out = rebuild(&existing, &[named_host("https://a", "phx-ca-1"), host("https://b")]);
+
+        let by_url = |u: &str| out.iter().find(|s| s.key() == Some(u)).cloned().unwrap();
+        assert_eq!(by_url("https://a").name.as_deref(), Some("phx-ca-1"), "renamed, not re-keyed");
+        assert!(by_url("https://a").measured.is_some(), "the same host, so the same measurement");
+        assert_eq!(by_url("https://b").name.as_deref(), Some("phx-test"), "a new one arrives named");
+        assert_eq!(out.iter().find(|s| s.is_github()).unwrap().name, None, "the UI names that one");
     }
 
     /// A base URL outside the `{http, https}` allowlist must be refused as an ordinary error, never

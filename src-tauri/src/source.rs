@@ -19,7 +19,7 @@
 //!   list, decide what is worth measuring, measure it, rank, persist. Then a scheduler keeps the
 //!   ranking honest for the rest of the process's life.
 //!
-//! The `Registry` is what the status block paints and what a walk starts from. It deliberately
+//! The `Registry` is what the sources report shows and what a walk starts from. It deliberately
 //! holds no cursor: a walk owns its own "already tried" set, which is what makes "each source is
 //! asked at most once per operation" structural rather than a rule somebody has to keep.
 
@@ -97,7 +97,7 @@ struct Registry {
     active: usize,
     /// Failed an operation in THIS process. Cleared by a completed measuring pass and by start.
     failed: HashSet<Option<String>>,
-    /// Being measured right now (the status block's third row state).
+    /// Being measured right now (the sources report's third row state).
     measuring: HashSet<Option<String>>,
     /// Why the published list could not be refreshed this launch. Never fatal.
     refresh_error: Option<String>,
@@ -141,7 +141,7 @@ fn notify() {
     }
 }
 
-/// The registry as the status block paints it, owned — nothing outside this module ever holds the
+/// The registry as the sources report shows it, owned — nothing outside this module ever holds the
 /// lock, and nothing outside it can hold a view that disagrees with the walk.
 pub struct Snapshot {
     pub sources: Vec<Source>,
@@ -200,7 +200,7 @@ fn next<'a>(ranking: &'a [Source], tried: &HashSet<Option<String>>) -> Option<&'
     ranking.iter().find(|s| !tried.contains(&s.url))
 }
 
-/// The source an operation just used. Moves the `active` marker the status block paints.
+/// The source an operation just used. Moves the `active` marker the sources report shows.
 pub fn report_active(key: Option<&str>) {
     mark(key, false);
 }
@@ -1018,7 +1018,11 @@ fn refresh_list_with(
         let attempt = fetch(&base.sources, source, floor);
         match &attempt.error {
             None => Ok(attempt),
-            Some(why) => Err(anyhow::anyhow!("{why}")),
+            // WHICH source failed is said here and only here, because this is the layer holding the
+            // `Source` — and therefore the published NAME, which is the one way a host may be named
+            // in a string that reaches the screen. A mirror is registered by address, so the fetch
+            // itself deliberately names nothing (see `mirror::fetch_list_from_mirror`).
+            Some(why) => Err(anyhow::anyhow!("{}: {why}", source.label())),
         }
     });
     match asked {
@@ -1070,7 +1074,7 @@ fn scheduler() {
     loop {
         std::thread::sleep(SCHEDULER_TICK);
         // THE REGISTRY, never the settings file. The registry is what every walk reads and what the
-        // status block paints; the file is a copy of it, and one that can legitimately be behind —
+        // sources report shows; the file is a copy of it, and one that can legitimately be behind —
         // `Refresh::persist` reports a failure (a read-only or full profile) up a stack that drops
         // it, and boot adopts its outcome regardless. Measuring the FILE's list and adopting the
         // result would then silently revert this launch's ranking, mirrors and measurements alike,
@@ -1184,7 +1188,7 @@ mod tests {
 
     /// RULE 3, both halves: a source that fails hands the operation to the next one, and the
     /// operation is RETRIED there rather than reported. The failure and the success both land in
-    /// the registry, so the status block and the download path cannot come to disagree about which
+    /// the registry, so the sources report and the download path cannot come to disagree about which
     /// source is in use.
     #[test]
     fn a_failed_source_hands_the_operation_to_the_next_and_the_operation_retries() {
@@ -1199,7 +1203,7 @@ mod tests {
         let snap = snapshot();
         assert!(snap.failed.contains(&sources[0].url), "A is reported failed");
         assert!(!snap.failed.contains(&sources[1].url));
-        assert_eq!(snap.active, 1, "B is what the block paints as in use");
+        assert_eq!(snap.active, 1, "B is what the report shows as in use");
     }
 
     /// Report; keep the last active; loop over nothing. And a network that came back needs no
@@ -1268,8 +1272,8 @@ mod tests {
     fn github_is_ranked_as_a_peer_and_nothing_prefers_it() {
         let at = |bps: u64| Some(Measured { bytes_per_sec: Some(bps), ..Measured::blank(1000) });
         let mut sources = vec![
-            Source { url: None, measured: at(1_000_000) },
-            Source { url: Some("https://fast.example".into()), measured: at(5_000_000) },
+            Source { url: None, name: None, measured: at(1_000_000) },
+            Source { url: Some("https://fast.example".into()), name: None, measured: at(5_000_000) },
         ];
         sort(&mut sources);
         assert_eq!(sources[0].url.as_deref(), Some("https://fast.example"));
@@ -1355,8 +1359,8 @@ mod tests {
         // reason to re-time the world: a stale healthy answer is still an answer.
         for age in [0, 3 * hour] {
             let all = vec![
-                Source { url: None, measured: healthy(now - age) },
-                Source { url: Some("https://a".into()), measured: healthy(now - age) },
+                Source { url: None, name: None, measured: healthy(now - age) },
+                Source { url: Some("https://a".into()), name: None, measured: healthy(now - age) },
             ];
             assert_eq!(launch_set(&all, now), None, "age {age}");
         }
@@ -1365,8 +1369,8 @@ mod tests {
         // ranking is a comparison and comparing a fresh number against a three-hour-old one is not
         // one. The fresh healthy source is left alone.
         let mixed = vec![
-            Source { url: None, measured: healthy(now) },
-            Source { url: Some("https://stale".into()), measured: healthy(now - 3 * hour) },
+            Source { url: None, name: None, measured: healthy(now) },
+            Source { url: Some("https://stale".into()), name: None, measured: healthy(now - 3 * hour) },
             Source::at("https://new"),
         ];
         let want = launch_set(&mixed, now).expect("an unmeasured source is due");
@@ -1377,7 +1381,8 @@ mod tests {
 
         // a FAILED measurement is not a settled answer: it becomes due again once it is old
         // enough, which is what stops one offline boot freezing the ranking with every row red.
-        let failed = |at: u64| Source { url: None, measured: Some(Measured::failed(at, "down")) };
+        let failed =
+            |at: u64| Source { url: None, name: None, measured: Some(Measured::failed(at, "down")) };
         assert_eq!(launch_set(&[failed(now)], now), None, "…but not before the TTL");
         let want = launch_set(&[failed(now - hour)], now).expect("an hour later it is");
         assert_eq!(want, HashSet::from([None]));
@@ -1399,8 +1404,8 @@ mod tests {
         let long = ALL_DEAD_RETRY;
 
         let one_works = vec![
-            Source { url: None, measured: healthy(now) },
-            Source { url: Some("https://a".into()), measured: dead(now) },
+            Source { url: None, name: None, measured: healthy(now) },
+            Source { url: Some("https://a".into()), name: None, measured: dead(now) },
         ];
         assert_eq!(
             timer_set(&one_works, now, long),
@@ -1409,8 +1414,8 @@ mod tests {
              running the all-dead interval at all, so the clock starts over"
         );
         let older = vec![
-            Source { url: None, measured: healthy(now) },
-            Source { url: Some("https://a".into()), measured: dead(now - hour) },
+            Source { url: None, name: None, measured: healthy(now) },
+            Source { url: Some("https://a".into()), name: None, measured: dead(now - hour) },
         ];
         assert_eq!(
             timer_set(&older, now, long),
@@ -1420,8 +1425,8 @@ mod tests {
 
         // nothing healthy anywhere: everything, on the short interval, and nothing in between
         let all_dead = vec![
-            Source { url: None, measured: dead(now) },
-            Source { url: Some("https://a".into()), measured: dead(now) },
+            Source { url: None, name: None, measured: dead(now) },
+            Source { url: Some("https://a".into()), name: None, measured: dead(now) },
         ];
         assert_eq!(
             timer_set(&all_dead, now, Duration::ZERO),
@@ -1490,7 +1495,7 @@ mod tests {
         });
         assert_eq!(out.sources, existing, "a refusal everywhere leaves the list exactly as it was");
         assert!(out.error.is_some());
-        assert!(snapshot().refresh_error.is_some(), "…and the status block says why");
+        assert!(snapshot().refresh_error.is_some(), "…and the sources report says why");
     }
 
     /// A pass settles only the sources it ASKED.
@@ -1584,7 +1589,7 @@ mod tests {
     #[test]
     fn a_clock_that_moved_backwards_measures_nothing() {
         let future = Some(Measured { bytes_per_sec: Some(1), ..Measured::blank(9_000_000) });
-        let sources = vec![Source { url: None, measured: future }];
+        let sources = vec![Source { url: None, name: None, measured: future }];
         assert_eq!(launch_set(&sources, 1_000), None);
         assert_eq!(timer_set(&sources, 1_000, ALL_DEAD_RETRY).0, None);
     }

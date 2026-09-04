@@ -49,6 +49,9 @@ window.addEventListener("load", () => {
     } else if (h === "options") {
       renderOptions();
       showView("options");
+    } else if (h === "sources") {
+      // the page behind main's one-liner: every source, named and never addressed
+      showView("sources");
     } else if (h.startsWith("whatsnew")) {
       openWhatsNew();
       setWnTab(h.split(":")[1] || "phoenix"); // whatsnew:phoenix | :launcher

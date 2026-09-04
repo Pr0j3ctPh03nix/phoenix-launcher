@@ -29,10 +29,10 @@ pub struct SettingsView {
     pub selections: serde_json::Value,
 }
 
-/// The download-source status block: the ranking, and what each row currently is.
+/// The download-source report: the ranking, and what each row currently is.
 ///
 /// It is a REPORT, not a form. Everything in it comes from `source::Registry` — the same value the
-/// download path walks — so the block cannot come to disagree with it about which source is in use,
+/// download path walks — so the report cannot come to disagree with it about which source is in use,
 /// which is exactly what a second, UI-side resolution used to be free to do.
 // `Clone` because Tauri's `emit` takes the payload by value and this same value is also returned
 // from `download_sources` — one shape, two ways to reach it (see `cmd::sources`).
@@ -51,9 +51,18 @@ pub struct SourcesView {
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceRowView {
-    /// `null` = the built-in source. The UI names it itself; WHICH repo it is is not the user's
-    /// concern here, and a sentinel URL would be a lie waiting to collide with a real mirror.
-    pub url: Option<String>,
+    /// The built-in source, which the UI names itself, in the user's language. WHICH repo it is is
+    /// not the user's concern here.
+    pub builtin: bool,
+    /// What the published list calls this mirror (`phx-ca-1`), rendered in caps and by itself.
+    /// `null` on the built-in row, and on a mirror carried over from a settings file written before
+    /// names were kept — the UI has a word for that, and the next refresh fills it in.
+    ///
+    /// NO ADDRESS CROSSES THIS WIRE. A mirror is registered by URL and those URLs are frequently
+    /// bare IPs, which are the launcher's business and not the screen's — and a field the webview
+    /// holds is one `title=` away from being on it. The frontend cannot render what it was never
+    /// sent; the debug CLI's `sources` command is where addresses are still printed.
+    pub name: Option<String>,
     pub active: bool,
     pub failed: bool,
     pub measuring: bool,
@@ -91,7 +100,8 @@ impl SourcesView {
                         range_ok: m.is_some_and(|m| m.range_ok),
                         measured_at: m.map(|m| m.at),
                         error: m.and_then(|m| m.error.clone()),
-                        url: s.url.clone(),
+                        builtin: s.is_github(),
+                        name: s.name.clone(),
                     }
                 })
                 .collect(),
@@ -974,7 +984,7 @@ mod source_view_tests {
     /// THE STATUS BLOCK IS THE REGISTRY, and nothing else.
     ///
     /// Order, "in use" and "failed" all come from `source::Registry` — the same value the download
-    /// path walks — so the block cannot come to disagree with it. It used to be resolved a second
+    /// path walks — so the report cannot come to disagree with it. It used to be resolved a second
     /// time, UI-side, from a list plus a pin; two resolutions of one question is exactly how a pane
     /// comes to name a source the installer is not using.
     #[test]
@@ -988,9 +998,17 @@ mod source_view_tests {
         };
         let snap = Snapshot {
             sources: vec![
-                Source { url: Some("https://fast".into()), measured: Some(healthy) },
+                Source {
+                    url: Some("https://fast".into()),
+                    name: Some("phx-fi-1".into()),
+                    measured: Some(healthy),
+                },
                 Source::default(),
-                Source { url: Some("https://dead".into()), measured: Some(Measured::failed(9, "down")) },
+                Source {
+                    url: Some("https://dead".into()),
+                    name: None,
+                    measured: Some(Measured::failed(9, "down")),
+                },
             ],
             active: 1,
             failed: [Some("https://dead".to_string())].into_iter().collect(),
@@ -1000,14 +1018,23 @@ mod source_view_tests {
         let v = SourcesView::of(snap);
 
         // ORDER is the registry's, verbatim — it is the order the walk uses
-        let urls: Vec<Option<&str>> = v.sources.iter().map(|r| r.url.as_deref()).collect();
-        assert_eq!(urls, [Some("https://fast"), None, Some("https://dead")]);
+        let names: Vec<(bool, Option<&str>)> =
+            v.sources.iter().map(|r| (r.builtin, r.name.as_deref())).collect();
+        assert_eq!(names, [(false, Some("phx-fi-1")), (true, None), (false, None)]);
+
+        // NO ADDRESS CROSSES THIS WIRE — a mirror is registered by URL and those URLs are commonly
+        // bare IPs. Asserted over the SERIALIZED rows rather than field by field, because the thing
+        // being guaranteed is about what the webview receives: a field added later carries an
+        // address just as well as the one that was removed. The rows only: `refresh_error` is a
+        // diagnosis built upstream, and GitHub's own errors legitimately quote a public API URL.
+        let wire = serde_json::to_string(&v.sources).expect("the rows serialize");
+        assert!(!wire.contains("://"), "an address reached the webview: {wire}");
 
         assert!(v.sources[1].active, "`active` is an INDEX into that same list, not a re-resolution");
         assert!(!v.sources[0].active && !v.sources[2].active);
         assert!(v.sources[2].failed && !v.sources[0].failed);
         assert!(v.sources[0].measuring && !v.sources[2].measuring);
-        assert!(v.measuring, "any source in flight makes the block say so");
+        assert!(v.measuring, "any source in flight makes the report say so");
 
         // the measurement is passed through, and `healthy` is derived HERE so the UI and the
         // ranking cannot come to mean different things by "usable"

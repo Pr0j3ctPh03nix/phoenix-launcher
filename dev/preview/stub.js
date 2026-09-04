@@ -133,12 +133,15 @@ const HANDLERS = {
     measuring: true,
     refreshError: null,
     sources: [
-      { url: "https://mirror.example/client-dist", active: true, failed: false, measuring: false, healthy: true, bytesPerSec: 7340032, latencyMs: 34, tag: "v1.2.1", rangeOk: true, measuredAt: NOW - 90, error: null },
-      { url: null, active: false, failed: false, measuring: false, healthy: true, bytesPerSec: 1258291, latencyMs: 620, tag: "v1.2.1", rangeOk: true, measuredAt: NOW - 90, error: null },
-      { url: "https://eu2.mirror.example/client-dist", active: false, failed: false, measuring: false, healthy: true, bytesPerSec: 389120, latencyMs: 210, tag: "v1.2.0", rangeOk: false, measuredAt: NOW - 4200, error: null },
-      { url: "https://new.mirror.example/client-dist", active: false, failed: false, measuring: true, healthy: false, bytesPerSec: null, latencyMs: null, tag: null, rangeOk: false, measuredAt: null, error: null },
-      { url: "https://down.mirror.example/client-dist", active: false, failed: true, measuring: false, healthy: false, bytesPerSec: null, latencyMs: null, tag: null, rangeOk: false, measuredAt: NOW - 300, error: "connection failed" },
-      { url: "https://slow.mirror.example/client-dist", active: false, failed: false, measuring: false, healthy: false, bytesPerSec: null, latencyMs: 180, tag: null, rangeOk: false, measuredAt: NOW - 300, error: "the transfer stalled after 16 KiB" },
+      // NO URLS: the backend does not send one (see `SourceRowView`), and a source is named by what
+      // the published list calls it. The last row is the pre-names settings file — the seconds
+      // before the launch's first list refresh, which the UI has a word for.
+      { builtin: false, name: "phx-ca-1", active: true, failed: false, measuring: false, healthy: true, bytesPerSec: 7340032, latencyMs: 34, tag: "v1.2.1", rangeOk: true, measuredAt: NOW - 90, error: null },
+      { builtin: true, name: null, active: false, failed: false, measuring: false, healthy: true, bytesPerSec: 1258291, latencyMs: 620, tag: "v1.2.1", rangeOk: true, measuredAt: NOW - 90, error: null },
+      { builtin: false, name: "phx-fi-1", active: false, failed: false, measuring: false, healthy: true, bytesPerSec: 389120, latencyMs: 210, tag: "v1.2.0", rangeOk: false, measuredAt: NOW - 4200, error: null },
+      { builtin: false, name: "phx-de-2", active: false, failed: false, measuring: true, healthy: false, bytesPerSec: null, latencyMs: null, tag: null, rangeOk: false, measuredAt: null, error: null },
+      { builtin: false, name: "phx-br-1", active: false, failed: true, measuring: false, healthy: false, bytesPerSec: null, latencyMs: null, tag: null, rangeOk: false, measuredAt: NOW - 300, error: "connection failed" },
+      { builtin: false, name: null, active: false, failed: false, measuring: false, healthy: false, bytesPerSec: null, latencyMs: 180, tag: null, rangeOk: false, measuredAt: NOW - 300, error: "the transfer stalled after 16 KiB" },
     ],
   }),
   open_url: () => null,

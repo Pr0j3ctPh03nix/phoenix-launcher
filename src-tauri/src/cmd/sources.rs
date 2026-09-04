@@ -1,4 +1,4 @@
-//! The download-source status block: one read-only command, and the view it hands the webview.
+//! The download-source report: one read-only command, and the view it hands the webview.
 //!
 //! There is nothing to write here. Sources are DISCOVERED from the published `mirrors.json` and
 //! ranked by a real measurement, so there is no setting to save, nothing to switch off and nothing
