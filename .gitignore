@@ -19,7 +19,6 @@
 /.tooling/
 
 # What a release attaches: the exe, its .sha256 and the seal request built from them (release.yml).
-# A local run of dev/gen_launcher_manifest.py lands here too.
 /staging/
 
 # Bytecode from running that tooling — written whenever CI, or a local dry run, imports one of

@@ -331,17 +331,14 @@ jobs:
           # and its absence is the only difference between a dry run and the real thing.
           notes=()
           [ -f release_body.md ] && notes=(--notes-file release_body.md)
-          # This repo's own discovery step (dev/): hashes the exe and builds ONE files[] entry
-          # through release-tooling's `phoenix_tooling`, which owns every format rule — schema,
-          # envelope shape, what a serial may be. This script only ever knows "hash an exe, name
-          # it". It hashes the STAGED copy, which is the file that is actually attached.
-          python dev/gen_launcher_manifest.py \
-            --version  "$TAG" \
-            --exe      phoenix-launcher.exe \
-            --exe-path staging/phoenix-launcher.exe \
+          # The tooling's own front door for a payload that is loose files. It hashes the STAGED
+          # exe — the copy that is actually attached — and names it as the one release asset.
+          python .tooling/phx.py manifest build \
+            --payload launcher \
+            --version "$TAG" \
             "${notes[@]}" \
-            --out      staging/manifest.json \
-            --tooling  .tooling
+            --out     staging/manifest.json \
+            staging/phoenix-launcher.exe
 
       # A run that publishes nothing asks nobody to sign anything: the authority seals a TAG, and
       # there is no release for the answer to land on. What it can still do is ask the same question
